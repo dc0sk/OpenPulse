@@ -20,9 +20,7 @@ use openpulse_core::station_id::StationIdTimer;
 use openpulse_core::trust_store_file::load_trust_store_from_file;
 use openpulse_modem::ModemEngine;
 use openpulse_qsy::session::QsyPolicy;
-use openpulse_radio::{
-    CatController, NoOpPtt, PttController, RigctldController, RigctldPtt, VoxPtt,
-};
+use openpulse_radio::{CatController, NoOpPtt, PttController, RigctldController, RigctldPtt};
 use openpulse_repeater::{CrossBandRepeater, RepeaterConfig};
 
 use bpsk_plugin::BpskPlugin;
@@ -1944,82 +1942,30 @@ fn build_ptt_controller(
     ptt_device: &str,
     ptt_gpio: u8,
 ) -> Option<Box<dyn PttController + Send>> {
-    match backend {
-        "none" => Some(Box::new(NoOpPtt::new())),
-        "vox" => Some(Box::new(VoxPtt::new())),
-        "rigctld" => match RigctldPtt::connect(rigctld_addr) {
-            Ok(ctrl) => Some(Box::new(ctrl)),
-            Err(e) => {
-                tracing::warn!(
-                    addr = %rigctld_addr,
-                    error = %e,
-                    "rigctld PTT connect failed; PTT commands will be no-ops"
-                );
-                None
-            }
-        },
-        "cm108" => match openpulse_radio::Cm108Ptt::open(ptt_device, ptt_gpio) {
-            Ok(ctrl) => Some(Box::new(ctrl)),
-            Err(e) => {
-                tracing::warn!(
-                    device = %ptt_device,
-                    gpio = ptt_gpio,
-                    error = %e,
-                    "CM108 PTT open failed; PTT commands will be no-ops"
-                );
-                None
-            }
-        },
-        "gpio" => match openpulse_radio::GpioPtt::open(ptt_device) {
-            Ok(ctrl) => Some(Box::new(ctrl)),
-            Err(e) => {
-                tracing::warn!(
-                    device = %ptt_device,
-                    error = %e,
-                    "GPIO PTT open failed; PTT commands will be no-ops"
-                );
-                None
-            }
-        },
-        "rts" | "dtr" => {
-            #[cfg(feature = "serial")]
-            {
-                use openpulse_radio::serial::{SerialPin, SerialRtsDtrPtt};
-                if ptt_device.is_empty() {
-                    tracing::warn!(
-                        backend,
-                        "serial PTT requires [modem] ptt_device (serial port path); PTT disabled"
-                    );
-                    return None;
-                }
-                let pin = if backend == "rts" {
-                    SerialPin::Rts
-                } else {
-                    SerialPin::Dtr
-                };
-                match SerialRtsDtrPtt::open(ptt_device, pin) {
-                    Ok(ctrl) => Some(Box::new(ctrl)),
-                    Err(e) => {
-                        tracing::warn!(
-                            device = %ptt_device,
-                            error = %e,
-                            "serial PTT open failed; PTT commands will be no-ops"
-                        );
-                        None
-                    }
-                }
-            }
-            #[cfg(not(feature = "serial"))]
-            {
-                tracing::warn!(
-                    backend,
-                    "serial PTT not compiled in (recompile with --features serial); PTT disabled"
-                );
-                None
-            }
-        }
-        other => {
-            tracing::warn!(backend = %other, "unknown PTT backend; PTT disabled");
+    // Thin adapter over the ONE builder (#1258, `openpulse_radio::ptt_builder`). This crate used to
+    // carry its own seven-arm match; ARDOP carried a three-arm one, the CLI an eight-arm one, and
+    // KISS none — which is how `rts`/`dtr`/`cm108`/`gpio` came to be silently unavailable on the
+    // TNCs while the config documents them as shared.
+    //
+    // Semantics are preserved EXACTLY: every failure still collapses to `None`, so this dedupe
+    // changes no behaviour. That collapse is itself a defect — it makes "the operator asked for no
+    // PTT" and "the PTT the operator asked for is unusable" the same state, so a mistyped
+    // `ptt_backend` starts a daemon that transmits into an unkeyed rig. Fixed in #1285, separately
+    // and on purpose: a deduplication must not quietly alter a caller's contract.
+    match openpulse_radio::ptt_builder::build_ptt(&openpulse_radio::ptt_builder::PttSpec {
+        backend,
+        rigctld_addr,
+        device: ptt_device,
+        gpio_pin: ptt_gpio,
+    }) {
+        // `"none"` mapped to `Some(NoOpPtt)` here before, NOT to `None` — and `SharedPtt` is handed
+        // the result, so the two are not interchangeable. Preserved deliberately; the daemon's own
+        // `none_and_vox_build_a_controller` test caught the drift when this adapter first returned
+        // the builder's `Ok(None)` straight through, which is what that test is for.
+        Ok(None) => Some(openpulse_radio::ptt_builder::no_ptt()),
+        Ok(ctrl) => ctrl,
+        Err(e) => {
+            tracing::warn!(backend, error = %e, "PTT unavailable; PTT commands will be no-ops");
             None
         }
     }

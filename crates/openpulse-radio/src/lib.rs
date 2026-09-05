@@ -6,6 +6,7 @@ pub mod error;
 pub mod generic_cat;
 pub mod gpio;
 pub mod noop;
+pub mod ptt_builder;
 pub mod rig_controller;
 pub mod rig_definition;
 pub mod rig_mode;

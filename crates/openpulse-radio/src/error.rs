@@ -8,6 +8,16 @@ pub enum PttError {
     Rigctld(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The configured backend cannot be honoured AT ALL — an unknown name, a feature that is not
+    /// compiled in, or a missing required device path.
+    ///
+    /// Distinct from `Serial`/`Rigctld`/`Io`, which mean "the backend is real and the attempt
+    /// failed". The distinction is the whole point: a config error is a typo the operator must fix
+    /// and the daemon refuses to start on it (#1285), while a connect failure may be a rig that is
+    /// simply not powered up yet. Collapsing both into `None` is what let a mistyped `ptt_backend`
+    /// start a daemon that then transmitted into an unkeyed rig.
+    #[error("PTT configuration error: {0}")]
+    Config(String),
 }
 
 /// Error type for full rig CAT control operations.
