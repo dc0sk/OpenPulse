@@ -1,6 +1,5 @@
 #[cfg(feature = "serial")]
 use crate::PttController;
-#[cfg(feature = "serial")]
 use crate::PttError;
 
 /// Serial RTS/DTR PTT controller. Requires the `serial` feature.
@@ -15,7 +14,11 @@ pub struct SerialRtsDtrPtt {
     asserted: bool,
 }
 
-#[cfg(feature = "serial")]
+/// Which serial control line drives PTT.
+///
+/// Unconditional: it is a plain two-variant enum with no dependency on `serialport`, and gating the
+/// TYPE on the feature meant a caller could not even name the pin in a build without it — which is
+/// why the feature-off `open` below could not be written until now.
 #[derive(Debug, Clone, Copy)]
 pub enum SerialPin {
     Rts,
@@ -73,10 +76,41 @@ impl PttController for SerialRtsDtrPtt {
     }
 }
 
-// Stub so the module compiles without the feature.
+// Stub so the module compiles without the feature. It carries an `open` that ERRORS rather than
+// not existing, mirroring `GpioPtt::open` — so callers need no `#[cfg]` of their own, and the
+// not-compiled-in path is reachable (and testable) in the default `--no-default-features` build
+// instead of being invisible to it.
 #[cfg(not(feature = "serial"))]
 pub struct SerialRtsDtrPtt {
     _priv: (),
+}
+
+#[cfg(not(feature = "serial"))]
+impl SerialRtsDtrPtt {
+    /// Always an error without the `serial` feature.
+    pub fn open(path: &str, pin: SerialPin) -> Result<Self, PttError> {
+        let _ = (path, pin);
+        Err(PttError::Config(
+            "serial PTT not compiled in; rebuild with --features serial".into(),
+        ))
+    }
+}
+
+// The stub satisfies the trait so callers need no `#[cfg]` of their own. Every method is
+// unreachable — `open` above is the only constructor and it always errors — but they return `Err`
+// rather than panicking, because this is a library production path and an `unreachable!()` here
+// would be a panic on runtime data if that ever stopped being true.
+#[cfg(not(feature = "serial"))]
+impl crate::PttController for SerialRtsDtrPtt {
+    fn assert_ptt(&mut self) -> Result<(), PttError> {
+        Err(PttError::Config("serial PTT not compiled in".into()))
+    }
+    fn release_ptt(&mut self) -> Result<(), PttError> {
+        Err(PttError::Config("serial PTT not compiled in".into()))
+    }
+    fn is_asserted(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(all(test, feature = "serial"))]

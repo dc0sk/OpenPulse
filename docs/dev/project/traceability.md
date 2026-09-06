@@ -9,6 +9,66 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-05 — One PTT builder, and the four documented backends ARDOP dropped (#1258)
+
+- **Requirement/change:** #1258. ARDOP's `build_ptt` accepted `vox`, `rigctld` and `none` only, so
+  `rts`, `dtr`, `cm108` and `gpio` — all documented in `[modem]`, captioned "shared by all TNC
+  binaries", and all supported by the daemon — fell through to `NoOpPtt`. An operator who validated
+  `ptt_backend = "cm108"` against the daemon and then started the TNC on the same config got an
+  unkeyed rig.
+- **My inventory was wrong twice, and the review caught both.** I reported three builders and seven
+  backends. There are **four**: I missed the cross-band repeater's `rig_b` PTT (`server.rs:330`,
+  rigctld-only, `NoOpPtt` on failure) because I grepped for `build_ptt_controller` and it carries no
+  such name. And the **CLI handles eight** — it alone has a `generic` arm
+  (`GenericSerialCat`, `cfg(all(unix, feature = "generic-serial"))`) that appears in no other site
+  and not in its own `--ptt` help. Committing the census-from-a-grep error *while fixing a defect
+  caused by duplication* is the part worth remembering.
+- **Design decision — `openpulse-radio`, not "reuse the daemon's".** Both issue bodies said reuse the
+  daemon's builder; that is the wrong home. Verified there is no layering problem **provided the
+  builder takes plain strings**: `openpulse-radio` depends on neither `openpulse-config` nor anything
+  modem-side, and adding that edge to get a typed field would invert the layering for no gain. Hence
+  `PttSpec`, flattened.
+- **Zero `#[cfg]` in the builder, which is the non-obvious half.** A `#[cfg(feature = "serial")]`
+  inside a function living in `openpulse-radio` resolves against **radio's** feature, so gating there
+  would put the switch in a crate whose feature every *caller* must forward. Instead
+  `SerialRtsDtrPtt` gained a feature-off `open` returning `PttError::Config`, matching `GpioPtt`, and
+  `SerialPin` became unconditional (a plain two-variant enum that never needed the feature — gating
+  the *type* is what made the feature-off `open` unwritable before). The not-compiled-in path is now
+  ordinary code that runs in the `--no-default-features` gate.
+- **The feature trap, measured:** `cargo check -p openpulse-kiss --features serial` failed with *"the
+  package does not contain this feature"* before this change and succeeds after. Forwarding is
+  **necessary and not sufficient** — no documented build recipe names `serial` or `gpio` for any
+  binary, the daemon included, so those backends are inert on every shipped recipe. Recorded, not
+  fixed here.
+- **`PttError::Config` added**, so "this backend cannot be honoured" (unknown name, feature absent,
+  missing device path) is distinguishable from "the backend is real and the attempt failed". No crate
+  outside `openpulse-radio` matches `PttError` exhaustively, so it is additive.
+- **Semantics preserved exactly, and a test caught me failing to.** The daemon's `"none"` arm
+  returned `Some(NoOpPtt)`, not `None`, and `SharedPtt` is handed the result — so the two are not
+  interchangeable. My first adapter passed the builder's `Ok(None)` straight through and
+  `none_and_vox_build_a_controller` failed, which is exactly what that test is for. A dedupe must not
+  quietly alter a caller's contract.
+- **Tests:** four in `ptt_builder` — only `"none"` yields `Ok(None)`; the four backends ARDOP dropped
+  are *recognised* (asserted as "not reported as unknown", so it tests the defect rather than
+  requiring the hardware); an unknown name is a `Config` error naming the alternatives; `rts` with no
+  device path is a config error rather than an open attempt on `""`.
+- **Test results:** 62 radio tests pass; the four-backend test **fails against the restored pre-fix
+  coverage** with `` `rts` is a documented backend and must not be reported as unknown ``, restored
+  by `sha256sum`. Daemon `ptt_selector` 4/4, ARDOP green, workspace clippy clean, `REACH: PASS`.
+  Full `scripts/gate.sh` verdict in the PR.
+- **Doc bug, by omission:** `ptt_backend`'s doc listed six of seven — `gpio` was missing. Traced:
+  #875 wrote that line for cm108, #876 added gpio and touched 15 files without touching
+  `openpulse-config`. Fixed, along with `ptt_device`'s missing `chip:line` spec and a
+  `(vox/rts/dtr)` aside.
+- **Split out:** #1285 — the daemon's fail-open on an unknown backend, with the maintainer's ruling
+  (refuse to start on a config error; keep warn-and-continue for a connect failure). Deliberately not
+  in this PR.
+- **The gate caught the new file before I did.** `TRACE: FAIL — NEW-ORPHAN:
+  `crates/openpulse-radio/src/ptt_builder.rs` is claimed by no capability`. Claimed under CAP-74
+  (PTT backends), which is what it is. Worth noting the checker's shape here: 2462 tests passed and
+  the gate still failed, because a new production file that no requirement claims is exactly the
+  membership hole #1268 was about — caught on the first file added after that landed.
+
 ## 2026-09-05 — Five front-end toggles were write-only; two displayed their opposite (#1276)
 
 - **Requirement/change:** #1276, split out of #1271's design review. `SetNotch`, `SetAgc`,

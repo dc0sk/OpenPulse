@@ -21,6 +21,13 @@ priority = "optional"
 [features]
 # Enable real CPAL audio hardware support in the TNC binary.
 cpal = ["openpulse-audio/cpal-backend"]
+# #1258: the serial (rts/dtr) and GPIO PTT backends. Without these forwards the shared builder
+# compiles their "not compiled in" arms, so `ptt_backend = "rts"` would refuse on a `-p` build of
+# this binary even though `[modem]` documents it as shared with the daemon. Forwarding is necessary
+# and not sufficient — no shipped build recipe names these features yet, for any binary.
+serial = ["openpulse-radio/serial"]
+generic-serial = ["openpulse-radio/generic-serial"]
+gpio = ["openpulse-radio/gpio"]
 
 [dependencies]
 openpulse-core.workspace = true

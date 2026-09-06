@@ -408,10 +408,15 @@ pub struct ModemConfig {
     /// Selects the SpeedLevel→mode ladder the rate controller and mode advisor use.
     /// See `SessionProfile::PROFILE_NAMES` in `openpulse-core`.
     pub profile: String,
-    /// PTT backend: `none`, `rts`, `dtr`, `vox`, `rigctld`, or `cm108`.
+    /// PTT backend: `none`, `rts`, `dtr`, `vox`, `rigctld`, `cm108`, or `gpio`.
+    ///
+    /// `gpio` was missing from this list until #1258: #876 added the backend and touched 15 files
+    /// without touching this one. `rts`/`dtr` need `--features serial` and `gpio` needs
+    /// `--features gpio` in the binary being built.
     pub ptt_backend: String,
     /// PTT device path for device-based backends. For `cm108`, a `/dev/hidrawN` path (empty =
-    /// auto-detect the first CM108-family device); for `rts`/`dtr`, the serial port path.
+    /// auto-detect the first CM108-family device); for `rts`/`dtr`, the serial port path; for
+    /// `gpio`, a `chip:line` spec (e.g. `gpiochip0:17`).
     pub ptt_device: String,
     /// CM108 GPIO pin driving PTT (1..=8); GPIO 3 is the near-universal default.
     pub ptt_gpio: u8,
@@ -1110,7 +1115,7 @@ agc_max_gain_db = 40.0
 # CAT (frequency/mode) backend: "rigctld" (default) or "none".
 # "none" runs with no CAT control — no rigctld connection is attempted — for a
 # TRX that Hamlib/rigctld does not support. Set frequency manually on the radio;
-# PTT still works via [modem] ptt_backend (vox/rts/dtr). Set-freq and QSY retune
+# PTT still works via [modem] ptt_backend (vox/rts/dtr/cm108/gpio/rigctld). Set-freq and QSY retune
 # are rejected while CAT is disabled.
 cat_backend = "rigctld"
 # rigctld TCP address for single-rig PTT-only use.
