@@ -573,6 +573,26 @@ fact for months.
 8. **Prompt for falsification, never for agreement.** Ask it to *test* the instinct rather than
    confirm it, and to flag anything wrong or unproven in the framing. A prompt that presents a
    conclusion gets a conclusion agreed with.
+9. **Three fields, before the prompt goes out — enforced by `scripts/check-review.sh`, not by
+   care.** A design artifact must carry `## Consumer`, `## Prior art` and `## Twins`, each non-empty
+   and each either an answer with the command that produced it or the literal word `UNCHECKED`.
+   - **Consumer** — who CALLS this in production, by `file:line`. #1271 proposed answering a query
+     from `GetConfig`, which runs on a task holding no engine; the design would have paid none of
+     the debt it claimed, and the consumer was never read.
+   - **Prior art** — the sweep for an existing mechanism, with its hits. #1268 proposed building a
+     ratchet that already existed (`NOT-GRANDFATHERED` in `trace.py`). One grep.
+   - **Twins** — the sibling paths sharing the shape. #1252 pinned the responder and left the
+     initiator open; #1177 and #1249 each needed a second arm.
+
+   `UNCHECKED` is legal on purpose. The goal is to turn an omission into a written claim, exactly as
+   `Review: none` does at tier 1 — a field that may not be empty but may say `UNCHECKED` bans a
+   construct, where "consider the consumer" would be an exhortation that cannot fail. **Added
+   2026-09-06 after a lessons review found that every overturned proposal in a ten-PR session was
+   missing exactly one of these, each one command away — the reviewer was doing the proposer's
+   falsification.** The same review falsified the tempting alternative: the rules were already
+   written in `measurement-integrity` and `second-opinion` (one added the same day it was violated),
+   and the transcript showed 92 `GATE:` lines with zero loads of the skill holding them. Adding text
+   was the one intervention the evidence ruled out.
 
 **What this does NOT replace.** Review is not the workspace gate and cannot be treated as one. The
 same session's review approved a design whose three regressions were caught only by

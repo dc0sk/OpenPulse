@@ -77,6 +77,40 @@ artifact_ok() {   # $1 = path ; echoes the reason it is bad, empty when good
     [ "$bytes" -lt "$MIN_ARTIFACT_BYTES" ] && { echo "only ${bytes}B; a review artifact under ${MIN_ARTIFACT_BYTES}B is a stub"; return; }
     grep -qiE '^##+[[:space:]]*prompt' "$path" || { echo "no '## Prompt' section — the artifact must record what was ASKED, or a reader cannot tell what was reviewed"; return; }
     grep -qiE '^##+[[:space:]]*verdict' "$path" || { echo "no '## Verdict' section — the artifact must record what came BACK"; return; }
+
+    # The three cheap checks that, when skipped, made the reviewer do the proposer's falsification
+    # (2026-09-06 lessons review). Every proposal overturned in that session was missing exactly one
+    # of these, and each was one command away:
+    #
+    #   Consumer  — who CALLS this in production, by file:line. #1271 proposed answering a query from
+    #               `GetConfig`, which runs on a task holding no engine; the design would have paid
+    #               none of the debt it claimed. The consumer was never read.
+    #   Prior art — the sweep for an existing mechanism, with its hits. #1268 proposed building a
+    #               ratchet that already existed (`NOT-GRANDFATHERED`, trace.py). One grep.
+    #   Twins     — the sibling paths that share the shape. #1252 pinned the responder and left the
+    #               initiator open; #1177 and #1249 each needed a second arm.
+    #
+    # `UNCHECKED` is a legal answer and deliberately so: the point is to make the omission an
+    # explicit written claim rather than an absence nobody can see, exactly as `Review: none` does at
+    # tier 1. A field that may not be empty but may say UNCHECKED bans a construct; "consider the
+    # consumer" would be an exhortation that cannot fail.
+    for field in Consumer 'Prior art' Twins; do
+        grep -qiE "^##+[[:space:]]*${field}" "$path" || {
+            echo "no '## ${field}' section — a design artifact must record it, or the word UNCHECKED"
+            return
+        }
+        # Non-empty: the heading alone is the omission wearing the fix's clothes.
+        body=$(awk -v f="$field" '
+            BEGIN { IGNORECASE = 1; want = "^##+[[:space:]]*" f }
+            $0 ~ want { on = 1; next }
+            on && /^##+[[:space:]]*/ { on = 0 }
+            on { print }
+        ' "$path" | tr -d '[:space:]')
+        [ -n "$body" ] || {
+            echo "'## ${field}' is empty — write what you found, or the word UNCHECKED"
+            return
+        }
+    done
     echo ""
 }
 
@@ -148,12 +182,59 @@ if [ "$SELF_TEST" -eq 1 ]; then
         echo "  ok: a well-formed 'none' accepted (positive control)"
     else echo "SELF-TEST FAIL: a well-formed message was rejected"; rc=1; fi
 
-    # positive control: a real artifact must pass
-    { echo "# Review"; echo "## Prompt"; head -c 900 /dev/urandom | base64; echo "## Verdict"; echo ok; } > "$tmp/real.md"
+    # positive control: a real artifact must pass. Note it carries the three proposal fields; if
+    # this fixture is ever "fixed" by deleting them, every probe below still passes and the fields
+    # stop being required — so the fixture IS part of the check.
+    write_artifact() {   # $1 = path, $2.. = extra lines appended before ## Verdict
+        {
+            echo "# Review"
+            echo "## Prompt"
+            head -c 900 /dev/urandom | base64
+            shift_done=0
+            for extra in "${@:2}"; do echo "$extra"; done
+            echo "## Verdict"
+            echo ok
+        } > "$1"
+    }
+    write_artifact "$tmp/real.md" \
+        "## Consumer" "server.rs:1052 — the main loop, which holds the engine" \
+        "## Prior art" "git grep -n NOT-GRANDFATHERED -> trace.py:684 (exists)" \
+        "## Twins" "responder and initiator paths; both pinned"
     printf 'body\n\nReview: %s\n' "$tmp/real.md" > "$tmp/m5"
     if lint_message "$(cat "$tmp/m5")" 1 >/dev/null 2>&1; then
         echo "  ok: a structured artifact accepted on design-class (positive control)"
     else echo "SELF-TEST FAIL: a valid artifact was rejected"; rc=1; fi
+
+    # 2026-09-06: each of the three proposal fields is required, and a HEADING ALONE does not
+    # satisfy it. The empty-section probe is the one that matters — a checker that only greps for
+    # the heading turns the requirement into a formatting rule the omission can wear.
+    for missing in Consumer "Prior art" Twins; do
+        args=()
+        for f in Consumer "Prior art" Twins; do
+            [ "$f" = "$missing" ] && continue
+            args+=("## $f" "checked: see above")
+        done
+        write_artifact "$tmp/miss.md" "${args[@]}"
+        printf 'body\n\nReview: %s\n' "$tmp/miss.md" > "$tmp/m_miss"
+        if lint_message "$(cat "$tmp/m_miss")" 1 >/dev/null 2>&1; then
+            echo "SELF-TEST FAIL: an artifact with no '## $missing' was accepted"; rc=1
+        else echo "  ok: missing '## $missing' rejected"; fi
+    done
+
+    write_artifact "$tmp/empty.md" \
+        "## Consumer" "" "## Prior art" "x" "## Twins" "y"
+    printf 'body\n\nReview: %s\n' "$tmp/empty.md" > "$tmp/m_empty"
+    if lint_message "$(cat "$tmp/m_empty")" 1 >/dev/null 2>&1; then
+        echo "SELF-TEST FAIL: an EMPTY '## Consumer' section was accepted — the heading is not the check"; rc=1
+    else echo "  ok: an empty proposal field rejected"; fi
+
+    # UNCHECKED is legal on purpose: the goal is an explicit written claim, not a forced answer.
+    write_artifact "$tmp/unchk.md" \
+        "## Consumer" "UNCHECKED" "## Prior art" "UNCHECKED" "## Twins" "UNCHECKED"
+    printf 'body\n\nReview: %s\n' "$tmp/unchk.md" > "$tmp/m_unchk"
+    if lint_message "$(cat "$tmp/m_unchk")" 1 >/dev/null 2>&1; then
+        echo "  ok: UNCHECKED accepted (an omission written down is the point)"
+    else echo "SELF-TEST FAIL: UNCHECKED was rejected; it must be a legal answer"; rc=1; fi
 
     # #1219: an unresolvable base must FAIL the lint, never classify as "ordinary change".
     # All three shapes below passed before that fix. The middle one is the subtle one: a
