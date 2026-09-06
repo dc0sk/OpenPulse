@@ -149,7 +149,38 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    KissServer::with_trust_and_relay(engine, config, trust_store, relay_forwarder)
+    // #1259: build the configured PTT controller. This binary declared `openpulse-radio` and never
+    // used it — no controller, `[modem] ptt_backend` unread, nothing logged — so an operator running
+    // the APRS path with `ptt_backend = "rigctld"` played audio into an unkeyed transceiver and only
+    // VOX worked. `[modem]` is captioned "shared by all TNC binaries".
+    let ptt =
+        match openpulse_radio::ptt_builder::build_ptt(&openpulse_radio::ptt_builder::PttSpec {
+            backend: &cfg.modem.ptt_backend,
+            rigctld_addr: &cfg.radio.rigctld_addr,
+            device: &cfg.modem.ptt_device,
+            gpio_pin: cfg.modem.ptt_gpio,
+        }) {
+            Ok(Some(ctrl)) => {
+                tracing::info!(backend = %cfg.modem.ptt_backend, "PTT controller ready");
+                Some(ctrl)
+            }
+            Ok(None) => {
+                tracing::info!("no PTT backend configured; relying on VOX or a manually keyed rig");
+                None
+            }
+            Err(e) => {
+                // Fail-open matches the other front-ends today. Whether an unusable backend should
+                // refuse startup is #1285, decided there rather than diverging here.
+                tracing::warn!(
+                    backend = %cfg.modem.ptt_backend,
+                    error = %e,
+                    "PTT unavailable; this TNC will transmit WITHOUT keying the rig"
+                );
+                None
+            }
+        };
+
+    KissServer::with_ptt(engine, config, trust_store, relay_forwarder, ptt)
         .run()
         .await?;
     Ok(())

@@ -9,6 +9,48 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-06 — The KISS TNC transmitted without keying the rig, silently (#1259)
+
+- **Requirement/change:** #1259. `openpulse-kiss` declared `openpulse-radio` in its `Cargo.toml` and
+  **never used it**: no `PttController` at all, `[modem] ptt_backend` unread, nothing logged. An
+  operator running the APRS path with `ptt_backend = "rigctld"` played audio into an unkeyed
+  transceiver — the TX counter incremented, no warning appeared, and only VOX worked. Same class as
+  #1250 (ARDOP) and #1251 (mesh), but **silent**, where ARDOP at least warned on an unknown backend.
+  Its own comment claimed "This TNC manages PTT and channel access itself", which was false for the
+  PTT half.
+- **Two corrections from the design review, both changing the tests rather than the fix.**
+  1. **The issue body was wrong that KISS carries a `StationIdTimer`.** It deliberately carries none —
+     AX.25 puts the source callsign in every frame's address field, satisfying §97.119 without a
+     separate ID cycle. That removes the **natural positive control** ARDOP's equivalent test had
+     (its ID path keyed before the fix, proving the spy was wired), so each test here keys the shared
+     PTT directly first, as `ptt_keys_every_daemon_transmit` does.
+  2. **The source scanner could not be copied.** Both existing ones match
+     `line.contains("engine.transmit")`; KISS writes multi-line chains where `engine` and
+     `.transmit(` are five lines apart, so a copied pattern would match **nothing** while its planted
+     single-line control still passed — a vacuous gate with a green self-check. The pattern is
+     `.transmit(` and the planted control is deliberately multi-line.
+- **And the scanner reproduced #1192 on its first run.** It flagged line 274 of `bridge.rs`, which is
+  a **doc comment** saying relay forwarding "must therefore call `engine.transmit(...)`" — prose read
+  as a call site, in a scanner written after #1192 fixed that exact class elsewhere. It now strips
+  comment lines, and says why.
+- **Design decision — guard placement.** ARDOP takes the engine lock *first*, then keys, so the guard
+  drops before the mutex releases and the RX poll that follows a data emission never runs against a
+  keyed rig. KISS wrote its `engine.lock()` as a statement temporary inside the `transmit`
+  expression, so a `let _guard` beside it would have outlived the lock; both sites now bind the lock
+  in a scope and pass it to `keyed_transmit`.
+- **#1263 does not block this** — its live bite is the daemon's manual `PttAssert` command, and KISS
+  has no host PTT command at all. Its two transmit sites are sequential in one worker thread, so
+  wiring it adds no nesting overlap. `observer = None`: KISS has no host response channel for PTT
+  edges, unlike ARDOP.
+- **Test results:** 2/2 in the new file, whole crate green (3 + 9 + 2). The scanner **fails against
+  the restored unkeyed transmit**, naming the line; restored by `sha256sum`. Workspace clippy clean,
+  `REACH: PASS`, `TRACE: PASS`. Full `scripts/gate.sh` verdict in the PR.
+- **Process lapse worth recording:** I began this work in the same checkout while #1258's gate was
+  running, which makes that verdict unattributable — the drift guard hashes the whole tree, and the
+  rule has no exception for "a different crate". Caught before quoting the verdict, but only after
+  ~20 minutes; the gate was killed and re-run on a clean tree. Concurrent work belongs in a
+  `git worktree`.
+
 ## 2026-09-05 — One PTT builder, and the four documented backends ARDOP dropped (#1258)
 
 - **Requirement/change:** #1258. ARDOP's `build_ptt` accepted `vox`, `rigctld` and `none` only, so

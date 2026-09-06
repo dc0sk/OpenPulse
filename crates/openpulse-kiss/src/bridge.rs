@@ -8,6 +8,8 @@ use tokio::sync::broadcast;
 use openpulse_core::handshake::InMemoryTrustStore;
 use openpulse_core::relay::RelayForwarder;
 use openpulse_modem::ModemEngine;
+use openpulse_radio::shared_ptt::{SharedPtt, DEFAULT_PTT_MAX};
+use openpulse_radio::PttController;
 
 /// KissBridge configuration.
 #[derive(Debug, Clone)]
@@ -49,6 +51,13 @@ pub struct KissBridge {
     pub trust_store: Arc<InMemoryTrustStore>,
     /// Present when relay is enabled in the config; enforces hop-limit and dedup.
     pub relay_forwarder: Option<Arc<std::sync::Mutex<RelayForwarder>>>,
+    /// Keys the rig for every emission (#1259).
+    ///
+    /// This crate declared `openpulse-radio` and never used it: it built no `PttController` at all,
+    /// never read `[modem] ptt_backend`, and logged nothing to say so — so an operator running the
+    /// APRS path with `ptt_backend = "rigctld"` played audio into an unkeyed transceiver. Only VOX
+    /// worked, silently, while `[modem]` is captioned "shared by all TNC binaries".
+    pub ptt: SharedPtt,
 }
 
 impl KissBridge {
@@ -67,6 +76,21 @@ impl KissBridge {
         trust_store: InMemoryTrustStore,
         relay_forwarder: Option<RelayForwarder>,
     ) -> (Arc<Self>, std::sync::mpsc::Receiver<Vec<u8>>) {
+        Self::with_ptt(engine, mode, loopback, trust_store, relay_forwarder, None)
+    }
+
+    /// As [`Self::with_trust_and_relay`], with the PTT controller the binary built (#1259).
+    ///
+    /// `None` means no PTT — VOX or a manually keyed rig. It is NOT the same as "the configured
+    /// backend failed", which the binary reports separately; see #1285.
+    pub fn with_ptt(
+        engine: ModemEngine,
+        mode: String,
+        loopback: bool,
+        trust_store: InMemoryTrustStore,
+        relay_forwarder: Option<RelayForwarder>,
+        ptt: Option<Box<dyn PttController + Send>>,
+    ) -> (Arc<Self>, std::sync::mpsc::Receiver<Vec<u8>>) {
         let (rx_data_tx, _) = broadcast::channel(32);
         let (tx_data_tx, tx_data_rx) = std::sync::mpsc::sync_channel(64);
         let bridge = Arc::new(Self {
@@ -78,8 +102,45 @@ impl KissBridge {
             loopback,
             trust_store: Arc::new(trust_store),
             relay_forwarder: relay_forwarder.map(|f| Arc::new(std::sync::Mutex::new(f))),
+            ptt: SharedPtt::new(ptt, DEFAULT_PTT_MAX),
         });
         (bridge, tx_data_rx)
+    }
+}
+
+/// Key the rig, emit, and release — the only way this TNC transmits (#1259).
+///
+/// Modelled on ARDOP's `keyed_transmit`. Two properties, both load-bearing:
+///
+/// * The **engine lock is taken by the caller and passed in**, so the guard drops before the caller
+///   releases the mutex and the RX poll that follows a data emission never runs against a keyed rig.
+///   KISS wrote its `engine.lock()` as a statement temporary inside the `transmit` expression, so a
+///   `let _guard` beside it would have outlived the lock instead.
+/// * A PTT assert failure **skips the emission**. Transmitting anyway is the defect this closes:
+///   audio into an unkeyed transceiver.
+///
+/// `transmit` blocks to end-of-audio, so a guard dropped when it returns releases after the last
+/// sample.
+fn keyed_transmit(
+    ptt: &SharedPtt,
+    engine: &mut ModemEngine,
+    what: &str,
+    data: &[u8],
+    mode: &str,
+) -> bool {
+    let _guard = match ptt.keyed(None) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(what, error = %e, "PTT assert failed; skipping transmission");
+            return false;
+        }
+    };
+    match engine.transmit(data, mode, None) {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(what, error = %e, "modem TX error");
+            false
+        }
     }
 }
 
@@ -95,9 +156,14 @@ impl KissBridge {
     }
 }
 
-/// Apply a KISS control frame (any non-`DATA` type byte). This TNC manages PTT and channel access
-/// itself, so most control frames are advisory no-ops here: TXDELAY/TXtail are PTT keying delays with no
-/// PTT-keying layer, P/SlotTime are CSMA-persistence/slot hints, and SetHardware is TNC-specific. The one
+/// Apply a KISS control frame (any non-`DATA` type byte). Most are advisory no-ops here: TXDELAY and
+/// TXtail are host-specified keying delays that this TNC does not honour (it keys and releases around
+/// each emission itself — see [`KissBridge::ptt`]), P/SlotTime are CSMA-persistence/slot hints, and
+/// SetHardware is TNC-specific.
+///
+/// This comment used to say "This TNC manages PTT and channel access itself", which was **false for
+/// PTT** until #1259 — there was no PTT layer at all. The CSMA half was always true (`main.rs`
+/// enables carrier sense, the only shipping front-end that does). The one
 /// that maps to this TNC's real channel access is **FullDuplex** (0x05): a non-zero value selects full
 /// duplex (no carrier-sense deferral → engine CSMA off); a zero value re-enables CSMA.
 pub(crate) fn apply_kiss_control_frame(cmd: u8, value: &[u8], bridge: &KissBridge) {
@@ -158,14 +224,11 @@ fn worker_loop(bridge: Arc<KissBridge>, tx_data_rx: std::sync::mpsc::Receiver<Ve
                     "refusing on-air TX: AX.25 source callsign missing or invalid (§97.119)"
                 );
             } else {
-                match bridge
-                    .engine
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .transmit(&data, &mode, None)
                 {
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("modem TX error: {e}"),
+                    // Scoped so the guard inside `keyed_transmit` — and this lock — are both
+                    // released before the RX poll below.
+                    let mut engine = bridge.engine.lock().unwrap_or_else(|e| e.into_inner());
+                    keyed_transmit(&bridge.ptt, &mut engine, "data", &data, &mode);
                 }
                 if let Ok(received) = bridge
                     .engine
@@ -238,13 +301,9 @@ fn maybe_relay_forward(bridge: &KissBridge, payload: &[u8], mode: &str) {
     match forwarded {
         Ok(out_envelope) => {
             if let Ok(out_bytes) = out_envelope.encode() {
-                if let Err(e) = bridge
-                    .engine
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .transmit(&out_bytes, mode, None)
                 {
-                    tracing::warn!("relay TX error: {e}");
+                    let mut engine = bridge.engine.lock().unwrap_or_else(|e| e.into_inner());
+                    keyed_transmit(&bridge.ptt, &mut engine, "relay", &out_bytes, mode);
                 }
                 tracing::debug!(
                     session_id = out_envelope.session_id,
