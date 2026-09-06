@@ -1042,6 +1042,7 @@ capabilities:
   CAP-74:
     code:
     - crates/openpulse-radio/src/cm108.rs
+    - crates/openpulse-radio/src/ptt_builder.rs
     - crates/openpulse-radio/src/gpio.rs
     - crates/openpulse-radio/src/rigctld.rs
     name: PTT backends
@@ -1051,6 +1052,7 @@ capabilities:
     - REQ-PTT-03
     tests:
     - crates/openpulse-radio/src/cm108.rs
+    - crates/openpulse-radio/src/ptt_builder.rs
     - crates/openpulse-radio/src/gpio.rs
     - crates/openpulse-radio/tests/rigctld_integration.rs
     traceability: baseline

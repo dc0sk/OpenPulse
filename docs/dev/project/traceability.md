@@ -63,6 +63,11 @@ and the actually-observed results per change.
 - **Split out:** #1285 — the daemon's fail-open on an unknown backend, with the maintainer's ruling
   (refuse to start on a config error; keep warn-and-continue for a connect failure). Deliberately not
   in this PR.
+- **The gate caught the new file before I did.** `TRACE: FAIL — NEW-ORPHAN:
+  `crates/openpulse-radio/src/ptt_builder.rs` is claimed by no capability`. Claimed under CAP-74
+  (PTT backends), which is what it is. Worth noting the checker's shape here: 2462 tests passed and
+  the gate still failed, because a new production file that no requirement claims is exactly the
+  membership hole #1268 was about — caught on the first file added after that landed.
 
 ## 2026-09-05 — Five front-end toggles were write-only; two displayed their opposite (#1276)
 
