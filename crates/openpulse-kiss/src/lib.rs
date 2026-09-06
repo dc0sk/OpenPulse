@@ -47,12 +47,24 @@ impl KissServer {
         trust_store: openpulse_core::handshake::InMemoryTrustStore,
         relay_forwarder: Option<openpulse_core::relay::RelayForwarder>,
     ) -> Self {
-        let (bridge, tx_data_rx) = KissBridge::with_trust_and_relay(
+        Self::with_ptt(engine, config, trust_store, relay_forwarder, None)
+    }
+
+    /// As [`Self::with_trust_and_relay`], with the PTT controller the binary built (#1259).
+    pub fn with_ptt(
+        engine: ModemEngine,
+        config: KissConfig,
+        trust_store: openpulse_core::handshake::InMemoryTrustStore,
+        relay_forwarder: Option<openpulse_core::relay::RelayForwarder>,
+        ptt: Option<Box<dyn openpulse_radio::PttController + Send>>,
+    ) -> Self {
+        let (bridge, tx_data_rx) = KissBridge::with_ptt(
             engine,
             config.mode.clone(),
             config.loopback,
             trust_store,
             relay_forwarder,
+            ptt,
         );
         Self {
             bridge,
