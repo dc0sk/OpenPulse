@@ -9,6 +9,45 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-06 — A design proposal must name its consumer, prior art and twins
+
+- **Requirement/change:** maintainer decision, from a lessons review of a ten-PR session in which
+  **every** design proposal sent to review was overturned. Each was missing exactly one cheap check
+  that would have killed it, and each was one command away — so the reviewer was doing the
+  *proposer's* falsification. That works only while the error is in something a reviewer re-derives;
+  a census presented as a fact is the shape that gets **confirmed** instead, which is how #1252's
+  false "every QSY frame is signed" claim survived a dedicated code review for months.
+- **The tempting fix was falsified first, and that is the more useful half.** My diagnosis was that
+  the rules already exist (`measurement-integrity` bans grep-censuses and reading an absence from a
+  filter; `second-opinion` says to read the consumer before proposing) and that the fix was their
+  *trigger* — the skills had not loaded. The review tested it against the transcript: since
+  2026-09-02 there are **92 `GATE:` lines, 81 cargo verdicts and 20 `gh pr create`, with zero loads
+  of `measurement-integrity`**. A wrong-trigger hypothesis predicts loads during the activities the
+  trigger *does* name; they did not happen. Worse, three rules were violated the same day they were
+  written — the "grep the skill before adding a rule" line went into global `CLAUDE.md` at 09:06 and
+  #1268 broke it at 12:29. **Adding or re-scoping text was the one intervention the evidence ruled
+  out.**
+- **Design decision:** `scripts/check-review.sh` now requires `## Consumer`, `## Prior art` and
+  `## Twins` in a design artifact, each **non-empty**, each either an answer with its command or the
+  literal `UNCHECKED`. `UNCHECKED` is legal deliberately: the goal is to convert an omission into a
+  written claim, as `Review: none` already does at tier 1. A field that may say `UNCHECKED` bans a
+  construct; "consider the consumer" is an exhortation that cannot fail.
+- **Tests:** five new self-test probes — each of the three fields missing is rejected by name, an
+  **empty section** is rejected (a checker that only greps for the heading turns the requirement into
+  a formatting rule the omission can wear), and `UNCHECKED` is accepted. The positive-control fixture
+  now carries the fields, so "fixing" the fixture by deleting them would silently un-require them —
+  the fixture is part of the check.
+- **Test results:** `REVIEW-LINT-SELF-TEST: PASS`, 13 probes including two positive controls. Full
+  `scripts/gate.sh` verdict in the PR.
+- **A leak fixed on the way:** five `SKILL.md` files carrying lessons from 2026-09-01..06 had never
+  been committed. They loaded locally through the `~/.claude/skills` symlinks, so the working tree
+  behaved as intended — but a skill's whole claim is that it changes how work is done *everywhere*,
+  and uncommitted it changed nothing anywhere else. The lesson pipeline was leaking at its last step.
+- **Corrections to my own numbers, both caught by the review:** the reachability baseline went
+  **459 → 566**, not the 456 → 511 I reported, and **+61 of that landed on 2026-08-25 as #1192
+  itself** — a stricter scanner reclassifying, not debt growing. And "every proposal was overturned"
+  is a census stated without N/N.
+
 ## 2026-09-06 — The KISS TNC transmitted without keying the rig, silently (#1259)
 
 - **Requirement/change:** #1259. `openpulse-kiss` declared `openpulse-radio` in its `Cargo.toml` and
