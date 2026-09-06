@@ -58,6 +58,19 @@ struct PttInner {
     /// Set once when the watchdog's force-release fails on a stuck rig, so the 100 ms retry loop logs
     /// the stuck transmitter once instead of every tick. Cleared on the next successful key/release.
     stuck_warned: bool,
+    /// Bumped on every key. A [`PttKeyGuard`] records the value it acquired, and its release is a
+    /// no-op once they differ (#1263).
+    ///
+    /// **The owner is the guard.** Not a thread id — ARDOP's `PTT TRUE` and `PTT FALSE` each run on a
+    /// different `spawn_blocking` pool thread, so an operator could not release their own key, and the
+    /// daemon's task migrates across tokio workers between awaits. Not a caller-supplied enum either:
+    /// that is a label any site can claim, which is the same "only as good as every call site" hole
+    /// the first design had. Holding a live guard IS ownership and this counter IS the identity.
+    ///
+    /// Without it, a guard that outlives the deadline — a hung transmit, released by the watchdog —
+    /// drops later and releases whoever keyed in the meantime. That is the #1263 defect in its most
+    /// damaging form, and it is present under every nesting policy, so the token comes first.
+    generation: u64,
 }
 
 /// PTT hardware + watchdog deadline behind a shared lock. Cheap to `clone` (shares the same lock).
@@ -72,6 +85,7 @@ impl SharedPtt {
             asserted_at: None,
             max_duration,
             stuck_warned: false,
+            generation: 0,
         })))
     }
 
@@ -89,12 +103,38 @@ impl SharedPtt {
         }
         g.asserted_at = Some(Instant::now());
         g.stuck_warned = false;
+        g.generation = g.generation.wrapping_add(1);
         // Notify under the lock so a concurrent watchdog force-release can't interleave its `false`
         // between this arm and its `true` (which would show unkeyed during a live keyed burst).
         if let Some(obs) = observer {
             obs.ptt_changed(true);
         }
         Ok(())
+    }
+
+    /// The current key generation — the identity a [`PttKeyGuard`] holds (#1263).
+    fn generation(&self) -> u64 {
+        self.lock().generation
+    }
+
+    /// Release only if `generation` is still the live one; otherwise do nothing.
+    ///
+    /// This is what a guard's `Drop` calls. A guard whose key the watchdog already force-released, or
+    /// which some other holder has superseded, must not release the transmitter somebody else is
+    /// using — and must not emit a `false` for a transition it did not make.
+    fn unkey_owned(
+        &self,
+        observer: Option<&Arc<dyn PttObserver>>,
+        generation: u64,
+    ) -> UnkeyOutcome {
+        // Check and act under ONE lock acquisition: a check-then-release across two would race the
+        // watchdog thread, which is the one thing that can preempt a live key at any instant.
+        let g = self.lock();
+        if g.generation != generation || g.asserted_at.is_none() {
+            return UnkeyOutcome::NotKeyed;
+        }
+        drop(g);
+        self.unkey(observer)
     }
 
     /// Release the transmitter and disarm the watchdog. A failed hardware release leaves the watchdog
@@ -132,6 +172,7 @@ impl SharedPtt {
             ptt: self.clone(),
             observer: observer.cloned(),
             released: false,
+            generation: self.generation(),
         })
     }
 
@@ -222,6 +263,12 @@ impl SharedPtt {
         }
         g.asserted_at = None;
         g.stuck_warned = false;
+        // End the key's identity too (#1263). Clearing `asserted_at` already makes a stale guard's
+        // release a no-op, since ownership is "my generation is live AND the deadline is armed" —
+        // there is deliberately no separate owner field to go stale, which is what would otherwise
+        // let a released key keep refusing later ones while the rig sits idle. Bumping as well
+        // states the invariant positively: the key you held is over.
+        g.generation = g.generation.wrapping_add(1);
         tracing::warn!(
             max_secs = g.max_duration.as_secs(),
             "PTT watchdog fired — transmitter keyed beyond max duration; released"
@@ -262,6 +309,9 @@ pub struct PttKeyGuard {
     ptt: SharedPtt,
     observer: Option<Arc<dyn PttObserver>>,
     released: bool,
+    /// The key generation this guard acquired (#1263). Its release applies only while this is still
+    /// the live one — see [`SharedPtt::unkey_owned`].
+    generation: u64,
 }
 
 impl PttKeyGuard {
@@ -283,7 +333,22 @@ impl PttKeyGuard {
             return UnkeyOutcome::NotKeyed;
         }
         self.released = true;
-        self.ptt.unkey(self.observer.as_ref())
+        // Generation-scoped (#1263): release only the key this guard took. A guard that outlived its
+        // key — the watchdog force-released a hung transmit, or another holder has since keyed —
+        // must not drop a transmitter somebody else is using, and must not emit a `false` for a
+        // transition it did not make.
+        self.ptt
+            .unkey_owned(self.observer.as_ref(), self.generation)
+    }
+
+    /// Whether this guard still owns the live key (#1263).
+    ///
+    /// Generation match **and** an armed deadline: a guard whose key the watchdog force-released
+    /// matches on neither, and a caller that treats a dead guard as a live hold would refuse to key
+    /// while the transmitter sits idle.
+    pub fn is_live(&self) -> bool {
+        let g = self.ptt.lock();
+        !self.released && g.generation == self.generation && g.asserted_at.is_some()
     }
 }
 
@@ -660,5 +725,120 @@ mod tests {
             1,
             "explicit release + the moved guard's Drop release once total"
         );
+    }
+}
+
+/// A guard releases only the key it took (#1263).
+#[cfg(test)]
+mod ownership_token_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Counting {
+        asserted: bool,
+        asserts: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+
+    impl PttController for Counting {
+        fn assert_ptt(&mut self) -> Result<(), PttError> {
+            self.asserted = true;
+            self.asserts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn release_ptt(&mut self) -> Result<(), PttError> {
+            self.asserted = false;
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn is_asserted(&self) -> bool {
+            self.asserted
+        }
+    }
+
+    fn ptt(max: Duration) -> (SharedPtt, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let asserts = Arc::new(AtomicUsize::new(0));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let ctrl = Counting {
+            asserted: false,
+            asserts: asserts.clone(),
+            releases: releases.clone(),
+        };
+        (SharedPtt::new(Some(Box::new(ctrl)), max), asserts, releases)
+    }
+
+    /// The #1263 defect in its most damaging form: a guard that outlived its key must not drop a
+    /// transmitter somebody else is now using.
+    #[test]
+    fn a_guard_whose_key_the_watchdog_ended_does_not_release_a_later_key() {
+        let (p, _asserts, releases) = ptt(Duration::from_nanos(1));
+        let stale = p.keyed(None).expect("first key");
+
+        // The watchdog force-releases the hung burst.
+        assert!(p.force_release_if_expired(None), "deadline already elapsed");
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(!p.is_keyed());
+        assert!(!stale.is_live(), "the guard no longer owns anything");
+
+        // Somebody else keys.
+        p.set_max_duration(Duration::from_secs(180));
+        let _live = p.keyed(None).expect("second key");
+        assert!(p.is_keyed());
+
+        // The stale guard drops. Before #1263 this released the SECOND key's transmitter.
+        drop(stale);
+        assert!(
+            p.is_keyed(),
+            "a stale guard released a key it did not take — the transmitter of whoever keyed second \
+             was dropped out from under them"
+        );
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "the stale drop must not touch the hardware at all"
+        );
+    }
+
+    /// A live guard still releases normally — without this, the test above would also pass in a
+    /// build where guards had stopped releasing anything.
+    #[test]
+    fn a_live_guard_still_releases() {
+        let (p, _a, releases) = ptt(Duration::from_secs(180));
+        {
+            let g = p.keyed(None).expect("key");
+            assert!(g.is_live());
+            assert!(p.is_keyed());
+        }
+        assert!(!p.is_keyed(), "control: a live guard must release on drop");
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    /// `is_live` needs BOTH conditions: a matching generation is not enough once the deadline is gone.
+    #[test]
+    fn is_live_requires_an_armed_deadline_not_just_a_matching_generation() {
+        let (p, _a, _r) = ptt(Duration::from_nanos(1));
+        let g = p.keyed(None).expect("key");
+        assert!(g.is_live());
+        assert!(p.force_release_if_expired(None));
+        assert!(
+            !g.is_live(),
+            "after the watchdog released it, the guard owns nothing — a caller that read this as a \
+             live hold would refuse to key while the transmitter sits idle (#1263 F1)"
+        );
+    }
+
+    /// An explicit `release()` is still generation-scoped, not only the `Drop`.
+    #[test]
+    fn an_explicit_release_is_also_scoped() {
+        let (p, _a, releases) = ptt(Duration::from_nanos(1));
+        let stale = p.keyed(None).expect("first key");
+        assert!(p.force_release_if_expired(None));
+        p.set_max_duration(Duration::from_secs(180));
+        let _live = p.keyed(None).expect("second key");
+
+        assert_eq!(stale.release(), UnkeyOutcome::NotKeyed);
+        assert!(p.is_keyed(), "release() must be scoped exactly as Drop is");
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 }
