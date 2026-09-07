@@ -9,6 +9,50 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-06 — A PTT guard releases only the key it took (#1263, PR-1)
+
+- **Requirement/change:** #1263 part 1 — the ownership token. `unkey()` released the hardware and
+  `take()`d the deadline **regardless of who keyed**, so a guard that outlived its key dropped the
+  transmitter of whoever keyed next, and that holder's own release became a `NotKeyed` no-op. Present
+  under every nesting policy, which is why the token comes first and the policy second.
+- **Design decision — the owner is the GUARD**, settled across two review passes
+  (`docs/dev/reviews/2026-09-06-1263-ptt-nesting.md`). Not a thread id: ARDOP's `PTT TRUE` and
+  `PTT FALSE` run on *different* `spawn_blocking` pool threads, so an operator could not release
+  their own key, and the daemon's task migrates across tokio workers between awaits. Not a
+  caller-supplied enum: that is a label any site can claim, which is the same "only as good as every
+  call site" hole the first proposal had. Holding a live guard **is** ownership; the generation
+  counter **is** the identity.
+- **My first proposal was REJECTED, and the reason is worth keeping.** I proposed that a nested
+  `keyed()` refuse. Two defects: (1) `keyed()` is a thin wrapper, so the manual paths — ARDOP's
+  `key(None)`, the daemon's `hw_assert` + `arm` — never pass through it, and the rule would have left
+  every path it was written for outside itself; (2) it would have caused a **§97.119 miss**, verified
+  in code rather than argued: `id_timer.mark_identified(now_ms)` is called *"Advance regardless of PTT
+  success"* and clears both `last_id_ms` and `tx_since_id`, so a refused station ID skips a whole
+  interval. A fix for a UX defect would have created a regulatory one.
+- **F1 is avoided by construction, not by a patch.** The review's worst case was a stale *owner
+  record* deferring the ID forever with the rig unkeyed. There is deliberately **no separate owner
+  field**: ownership is "my generation is live AND `asserted_at.is_some()`", so every existing release
+  path already ends it. The watchdog additionally bumps the generation, which states the invariant
+  positively rather than relying on it.
+- **The watchdog stays generation-blind**, and that is the safety property: a guard sets
+  `released = true` and never retries, so on `UnkeyOutcome::Failed` only the 100 ms watchdog can clear
+  a stuck rig. `unkey_owned` checks and acts under **one** lock acquisition — a check-then-release
+  across two would race the one thread that can preempt a live key at any instant.
+- **Tests:** four in `ownership_token_tests` — a guard whose key the watchdog ended does not release a
+  later key (asserting on the hardware release count, not just `is_keyed`); a live guard still
+  releases (the control, without which the first would pass in a build where guards released
+  nothing); `is_live` needs an armed deadline and not merely a matching generation; and `release()` is
+  scoped exactly as `Drop` is.
+- **Test results:** 4/4 pass. **Two fail against the restored unconditional release** — the #1263
+  defect — with `a stale guard released a key it did not take`, while both controls keep passing, so
+  the failure is attributable. Restored by `sha256sum`. Radio 45 + 11, daemon lib 136, ARDOP 7 + 24,
+  workspace clippy clean. Full `scripts/gate.sh` verdict in the PR.
+- **Deferred to PR-2, deliberately:** `AlreadyKeyed`, the three-way `KeyedTxError`, ID-outranks-manual
+  at the acquisition point, deferral scoped to `AlreadyKeyed` **only** (blanket deferral would hammer
+  a faulted rig's serial line at 20 Hz for 180 s — the "advance regardless" comment is load-bearing),
+  the manual guard slots, `PttRelease` force semantics, and the panel. Both before #1260, which would
+  otherwise be built on the `key`/`unkey` surface PR-2 removes.
+
 ## 2026-09-06 — A design proposal must name its consumer, prior art and twins
 
 - **Requirement/change:** maintainer decision, from a lessons review of a ten-PR session in which
