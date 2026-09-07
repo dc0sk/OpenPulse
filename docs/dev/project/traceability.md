@@ -9,6 +9,82 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — #1062: a probe that measured the wrong sequence, and the assertion that now prevents it
+
+- **Requirement/change:** #1062 (the alternating preamble's time-bandwidth). The issue names its own
+  first deliverable — run a synthetic PN template through the existing probe — and **that was already
+  done** by `f7_duration_is_the_lever`, which I re-ran first-hand (4438 s) rather than quote from
+  `CLAUDE.md`. Confirmed: at comparable duration a **29× occupancy increase makes ρ′ slightly WORSE**
+  (0.431 → 0.468 at 500 Hz), while doubling duration drops it 0.735× — near the 1/√2 the model
+  predicts. Spreading buys onset placement and interferer refusal; only length buys noise-floor
+  margin.
+- **The untested premise.** `f7` varies duration only *within* PN, so #1062's central claim — that
+  the **alternating** sequence gains nothing from length because its time-bandwidth is O(1) — had
+  never been measured. That is what a wire-format change rests on, so I wrote `f12` for it.
+- **`f12` measured the wrong sequence, and the numbers are WITHDRAWN.** It fed `pn_template` a
+  hand-written `+1,-1,+1,…` chip run under a doc comment calling that "the shipped sync word's
+  structure". The shipped preamble is alternating **bits**; NRZI flips phase only on a `1`, so the
+  symbols are `--++` — period **four**, not two. Measured correlation between what f12 used and what
+  the modem transmits: **0.035**. Its lines sat at fc ± baud/2 rather than fc ± baud/4 — which is
+  also why the "3 % retention through a 500 Hz filter" I was about to build a reframing on had
+  nothing to do with filter edges: the lines were outside the mask entirely.
+- **This is CLAUDE.md's banned construct, committed verbatim by me**: *"A doc-comment fidelity claim
+  with hand-transcribed parameters is banned — a comment cannot fail."* The comment claimed the
+  fixture reproduced the shipped artifact; nothing checked it, and the result was a table I was ready
+  to reframe a wire-format issue around. It was caught by review, on the one point I had flagged as
+  least certain — which is the argument for flagging them.
+- **The fix is structural, not a correction.** `shipped_preamble_symbols` derives from
+  `bpsk_plugin::modulate::preamble_bits` **by reference** — the same generator the modulator, the
+  template and the demodulator's expected-symbol table all use — and
+  `f12_synthesised_template_matches_the_shipped_one` asserts ρ > 0.999 against the shipped template
+  **in the default gate**, not under `--ignored`. A research probe that measures the wrong artifact is
+  worse than no probe, because it produces numbers that look like evidence.
+- **Test results:** the assertion passes (ρ ≈ 1.000) and **fails at ρ = 0.0349 against the restored
+  wrong generator**, independently reproducing the reviewer's 0.040. Restored by `sha256sum`.
+- **The corrected measurement, from the reviewer's independent harness** (BPSK250 shipped `--++`,
+  32 vs 64 symbols, same machinery/seeds; positive control: its 32-symbol cells reproduce `f7`'s
+  shipped row, SSB 0.204 vs 0.205):
+
+  | band | 32 sym (124 ms) | 64 sym (252 ms) | ratio | retention |
+  |---|---|---|---|---|
+  | ssb 300–2700 | 0.204 | 0.139 | **0.681** | 1.000 |
+  | filter 1250–1750 | 0.415 | 0.301 | **0.725** | 0.998 |
+
+  Against 1/√2 = 0.707 and PN's own 0.71–0.74. **So one sentence of #1062 is retracted** — that a
+  longer periodic preamble buys no noise-floor margin because its time-bandwidth is O(1).
+- **And it is the textbook null, not a discovery.** Template time-bandwidth governs onset ambiguity
+  and interferer rejection; the in-band noise floor is set by the NOISE's time-bandwidth in the
+  correlator window, so **every** template obeys 1/√T there — a pure tone included. #1062's error was
+  conflating the two.
+- **Three things I wanted to conclude and cannot**, each refuted specifically:
+  1. *"No wire change."* False. `PREAMBLE_SYMS` is consumed by the receiver in at least six places
+     (data-symbol start, range start and the 4×PREAMBLE_SYMS AFC window; `frame_geometry`; the
+     engine's step geometry; `ScanPlanner`'s 33-symbol minimum; #1142's SNR lock over "the first 32
+     symbols"). An old receiver demodulates the extra symbols as data and reports invalid magic —
+     the same class of break as PN, carrying PN's validation cost too.
+  2. *"A cheap fix for #1060."* #1060 is **closed** (#1157). The live residual is the CFAR
+     stand-down at narrow filters, and whether 2× keeps it armed depends on the **delivered-frame ρ
+     at 252 ms on a fade — unmeasured**, since `DELIVERED_FRAME_RHO_BOUND = 0.50` was derived at
+     124 ms. Part of the noise-side margin is spent on the signal side and nobody has measured how
+     much.
+  3. *"It changes #1062's direction."* It retracts one bullet and leaves the two naming the open
+     defects, both duration-independent: onset placement (peak sidelobe 0.997 vs PN's 0.234) and a
+     steady tone scoring ρ ≈ 0.70 on a line at any grid width. A longer `--++` is a candidate
+     *inside* #1062's design space, tied with PN on the noise floor and behind it on both.
+- **A second fixture defect in the corrected probe**, caught in the same pass: re-pointing the
+  sequence was not enough, because it still ran at **BPSK1000**, where the shipped structure's lines
+  sit at ±250 Hz — exactly the 1250–1750 brick-wall edges. Those cells would have measured edge
+  leakage. It now runs at **BPSK250, 32 vs 64**, the only mode publishing a template, whose ±62.5 Hz
+  lines retain 0.998 / 0.980 through 500 / 200 Hz.
+- **Retention is the criterion that makes "ALT beats PN at 500 Hz" unsupportable**, and it is
+  mechanical rather than a judgement call: a veto threshold must sit between ρ_signal and ρ_noise in
+  ABSOLUTE terms, and ρ_signal ≤ retention even at infinite SNR — so a cell whose retention is below
+  the 0.40 floor cannot be armed at any SNR. The withdrawn cells had retention 0.031 / 0.014.
+- **A process failure of mine in the same commit:** `git add -A` swept the reviewer's untracked
+  scratch probe (291 lines) into `a53f2e9b`, and it was **not** `#[ignore]`d, so as committed it ran
+  in every gate. Amended out. Two standing rules touched — scratch output must not ride `git add -A`,
+  and nothing should be committed in a checkout while someone else's probes are running in it.
+
 ## 2026-09-07 — Spectral subtraction REJECTED for frame detection, measured (side-task)
 
 - **Requirement/change:** maintainer side-task — assess spectral-subtraction noise reduction for
