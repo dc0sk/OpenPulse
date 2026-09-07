@@ -1834,3 +1834,183 @@ fn f11_does_spectral_subtraction_lower_rho_prime() {
         "Keep criterion: rho' falls by ~0.7x — what doubling the preamble duration buys (f7).\n"
     );
 }
+
+// ── F12: does LENGTH help the ALTERNATING preamble? (#1062's untested premise) ─────────────────
+//
+// **STATUS 2026-09-07: the first run of this probe MEASURED THE WRONG SEQUENCE and its numbers are
+// withdrawn.** It fed `pn_template` a hand-written `+1,-1,+1,…` chip run described in a comment as
+// "the shipped sync word's structure". The shipped preamble is alternating **bits**; NRZI flips
+// phase only on a `1`, so the symbols are `--++` — period four. Correlation between what it measured
+// and what the modem transmits: **0.035**. Its lines sat at fc ± baud/2, not fc ± baud/4, which is
+// also why its "3 % retention through a 500 Hz filter" had nothing to do with filter edges — the
+// lines were simply outside the mask entirely.
+//
+// `shipped_preamble_symbols` now derives from `preamble_bits` by reference and
+// `f12_synthesised_template_matches_the_shipped_one` asserts the equality in the DEFAULT gate. Any
+// figure quoted from this probe must postdate that assertion.
+//
+// #1062's central claim is that the alternating sync word has **O(1) time-bandwidth regardless of
+// duration**, so "lengthening it adds energy but no spreading, and the correlation gain against band
+// noise does not improve the way template length suggests." Everything the issue proposes — a PN or
+// chirp successor, i.e. a WIRE-FORMAT change — rests on that.
+//
+// **It has never been measured.** `f7` varies duration only *within* PN (PN-110 → PN-220) and
+// compares the shipped alternating template at one length. So the tree shows that spreading at fixed
+// duration buys nothing, and that duration works *for PN* — but not whether duration works for the
+// sequence we actually ship.
+//
+// This is the controlled version: the SAME `pn_template` machinery, the same baud, the same
+// durations as f7's PN rows, the same bands and the same five seeds — only the sequence differs.
+// Read the two tables side by side.
+//
+// **Run at BPSK250, 32 vs 64 symbols** — deliberately, not the BPSK1000 the first version used.
+// BPSK250 is the only mode that publishes a template (`DERIVED_FOR`), and its lines at ±62.5 Hz
+// retain 0.998 / 0.980 through 500 / 200 Hz masks. At BPSK1000 the shipped structure's lines sit at
+// ±250 Hz — exactly the 1250–1750 brick-wall edges — so those cells would measure edge leakage
+// rather than the deployed mode. Retention is the criterion: a veto threshold must sit between
+// ρ_signal and ρ_noise in ABSOLUTE terms, and ρ_signal ≤ retention even at infinite SNR, so a cell
+// whose retention is below the 0.40 floor cannot be armed at any SNR.
+//
+// **What a fall of ~1/√2 does and does not mean.** It refutes exactly one sentence: that a longer
+// periodic preamble buys no noise-floor margin because its time-bandwidth is O(1). Template
+// time-bandwidth governs ONSET AMBIGUITY and INTERFERER REJECTION; the in-band noise floor is set by
+// the NOISE's time-bandwidth in the correlator window, which is why every template obeys 1/√T there
+// — a pure tone included. So it is the textbook null rather than a discovery, and it is **not**:
+//
+// * *a way to avoid a wire change* — `PREAMBLE_SYMS` is consumed by the receiver in at least six
+//   places (data-symbol start, range start and the 4×PREAMBLE_SYMS AFC window in `demodulate.rs`;
+//   `frame_geometry`; the engine's step geometry; `ScanPlanner`'s 33-symbol minimum; #1142's SNR
+//   lock over "the first 32 symbols"). An old receiver demodulates the extra symbols as data and
+//   reports invalid magic — the same class of break as PN.
+// * *a fix for #1060* — closed by #1157. The live residual is the CFAR STAND-DOWN at narrow filters,
+//   and whether 2× keeps it armed depends on the DELIVERED-FRAME ρ at 252 ms on a fade, which is
+//   unmeasured (`DELIVERED_FRAME_RHO_BOUND = 0.50` was derived at 124 ms).
+// * *a change of direction for #1062* — it retracts one bullet and leaves the two that name the open
+//   defects, both duration-independent: onset placement (peak sidelobe 0.997 vs PN's 0.234) and a
+//   steady tone scoring ρ ≈ 0.70 on a line at any grid width.
+//
+// Either way the PN case must then rest on what f7 already showed it buys — onset placement (peak
+// sidelobe 0.997 → 0.234) and interferer refusal — rather than on noise-floor margin, because at
+// comparable duration a 29× occupancy increase made ρ′ slightly WORSE (0.431 → 0.468 at 500 Hz).
+
+/// The SHIPPED preamble's symbols, `n` of them, derived from `preamble_bits` BY REFERENCE.
+///
+/// **This function exists because the first version of f12 measured the wrong sequence.** It used a
+/// hand-written `+1, -1, +1, …` chip run under a doc comment asserting that was "the shipped sync
+/// word's structure". It is not: the shipped preamble is alternating **bits**, and NRZI flips phase
+/// only on a `1`, so the **symbols** are `--++` repeating — period four, not period two. Normalised
+/// correlation between the two templates is **0.040**, and f12's lines sat at fc ± baud/2 rather
+/// than fc ± baud/4. Every number that version produced was about a template this modem never
+/// transmits.
+///
+/// That is CLAUDE.md's banned construct verbatim: *"A doc-comment fidelity claim with
+/// hand-transcribed parameters is banned — a comment cannot fail."* The comment claimed fidelity and
+/// nothing checked it. `f12_synthesised_template_matches_the_shipped_one` is the check, and it runs
+/// in the DEFAULT gate rather than only under `--ignored`, so the claim cannot rot again.
+fn shipped_preamble_symbols(n: usize) -> Vec<f32> {
+    // NRZI: start at +1, flip on every `1`. `pn_template` inverts this exactly
+    // (`bits.push(c != prev)`), so feeding these symbols back reproduces `preamble_bits`.
+    let mut sym = 1.0f32;
+    bpsk_plugin::modulate::preamble_bits(n)
+        .into_iter()
+        .map(|b| {
+            if b {
+                sym = -sym;
+            }
+            sym
+        })
+        .collect()
+}
+
+/// The synthesised template IS the shipped one at the shipped length — asserted, not claimed in prose.
+///
+/// Deliberately NOT `#[ignore]`d. A research probe measuring the wrong artifact is worse than no
+/// probe, because it produces numbers that look like evidence; this one produced a table I was ready
+/// to reframe a wire-format issue around.
+#[test]
+fn f12_synthesised_template_matches_the_shipped_one() {
+    let shipped = plugin_template("BPSK250")
+        .expect("BPSK250 publishes a template")
+        .0;
+    let built = pn_template(
+        "BPSK250",
+        &shipped_preamble_symbols(bpsk_plugin::modulate::PREAMBLE_SYMS),
+    )
+    .expect("synthesised template");
+    assert_eq!(
+        built.len(),
+        shipped.len(),
+        "synthesised template is a different length from the shipped one"
+    );
+    // `rho_of` needs a window strictly longer than the template (it searches lags), so pad the
+    // shipped template with silence rather than comparing equal lengths.
+    let mut window = shipped.clone();
+    window.extend(std::iter::repeat_n(0.0f32, 64));
+    let r = rho_of(&built, &window, 0.0).expect("correlation");
+    assert!(
+        r > 0.999,
+        "the synthesised template does not reproduce the shipped preamble (rho = {r:.4}). The first \
+         version of f12 scored 0.040 here — it measured alternating SYMBOLS while the wire carries \
+         alternating BITS, which NRZI turns into a period-four `--++` run."
+    );
+}
+
+#[test]
+#[ignore = "verification (#1062): does length help the ALTERNATING preamble, or only PN?"]
+fn f12_does_length_help_the_alternating_preamble() {
+    let alt32 = pn_template("BPSK250", &shipped_preamble_symbols(32)).expect("alt32");
+    let alt64 = pn_template("BPSK250", &shipped_preamble_symbols(64)).expect("alt64");
+
+    let cases: [(&str, &[f32]); 2] = [
+        ("BPSK250 shipped --++ 32 sym (124 ms)", &alt32),
+        ("BPSK250 shipped --++ 64 sym (252 ms)", &alt64),
+    ];
+    // Identical to f7's bands and seeds ON PURPOSE — the comparison is against f7's PN rows, and a
+    // different seed set or band list would make the two tables incomparable.
+    let bands = [
+        ("ssb 300-2700", 300.0f32, 2_700.0),
+        ("filter 1250-1750", 1_250.0, 1_750.0),
+        ("filter 1400-1600", 1_400.0, 1_600.0),
+    ];
+    let seeds: [u64; 5] = [12345, 777, 90210, 31337, 424242];
+    let per_seed = 120_000usize;
+
+    println!(
+        "\nF12: does length help the ALTERNATING preamble? same machinery as F7, {} seeds",
+        seeds.len()
+    );
+    println!(
+        "compare against F7's PN-110 -> PN-220, which fell 0.735x (500 Hz) and 0.723x (200 Hz)."
+    );
+    for (name, t) in cases {
+        println!(
+            "\n{name}: {} samples, {:.0} ms, occupancy {:.3}",
+            t.len(),
+            t.len() as f32 / FS * 1000.0,
+            band_occupancy(t)
+        );
+        println!(
+            "  {:<18} {:>12} {:>12} {:>10} {:>12}",
+            "band", "NOISE max", "NOISE med", "SIGNAL", "ratio rho'"
+        );
+        for (bname, lo, hi) in bands {
+            let mut peaks: Vec<f32> = seeds
+                .iter()
+                .map(|&sd| peak_rho_equalised(t, &band_noise(per_seed, lo, hi, sd)))
+                .collect();
+            peaks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (mx, med) = (peaks[peaks.len() - 1], peaks[peaks.len() / 2]);
+            let filtered = band_limit(t, lo, hi);
+            let w = (t.len() + F7_LAG_BOUND).min(filtered.len());
+            let sig = rho_of(t, &filtered[..w], 20.0).unwrap_or(f32::NAN);
+            println!(
+                "  {bname:<18} {mx:>12.3} {med:>12.3} {sig:>10.3} {:>12.3}",
+                med / sig
+            );
+        }
+    }
+    println!("\n  A ratio near 1/sqrt(2) = 0.707 retracts ONE sentence — that a longer periodic");
+    println!("  preamble buys no noise-floor margin. It is NOT a way around a wire change, NOT a");
+    println!("  fix for #1060 (closed by #1157), and does not touch the onset-placement or");
+    println!("  tone-on-a-line halves of #1062, which are duration-independent.");
+}
