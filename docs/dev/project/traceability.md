@@ -9,6 +9,37 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — The OTA send stops on a PTT fault WITHOUT claiming delivery (#1295)
+
+- **Requirement/change:** #1295, split out of #1285 and closed immediately because that change made
+  it far more reachable. `ota_send_with_ptt` mapped a keying failure to `OtaAttempt::Delivered`.
+  **Stopping is right** — a rig that cannot be keyed will not be keyed by trying again, and burning
+  the retry budget only delays the operator finding out — **but `Delivered` is a lie**: it is
+  consumed as "the peer has it", so the session advances and the rate controller records a success
+  for a frame that never went out.
+- **Why #1285 sharpened it.** Before that change an unreachable backend collapsed to `None`, and
+  `SharedPtt::key` with no controller **succeeds** — so this arm was almost unreachable; the daemon
+  transmitted unkeyed and the session failed later on a missing ACK. #1285 made every emission
+  against a dead rig refuse, so every OTA attempt now lands here. The fix improved one failure and
+  sharpened another; closing the second while the context was live is cheaper than inheriting it.
+- **Implementation:** `OtaAttempt::PttFault` and `OtaSendStop::PttFault` — distinct from `Delivered`
+  because the frame did not arrive, and distinct from `Nack` because a hardware fault is not
+  transient the way a busy rig is. The neighbouring case was already right and stays: `AlreadyKeyed`
+  returns `Nack`, because a busy rig *is* transient (#1263).
+- **Surfaced at `error`, not `warn`** — deliberately louder than its two neighbours. `PeerSilent` and
+  `RetriesExhausted` describe the **far end**, which the operator cannot fix; this one is **this
+  station's transmitter**, and it is actionable. It also emits a `CommandError`, since the give-up
+  path's own comment says it exists "so the operator isn't left thinking the message sent" — which is
+  exactly the property `Delivered` violated.
+- **Tests:** a PTT fault stops with its own reason and does not burn the retry budget, plus a control
+  that a real ACK **still** reports `Delivered` — without which the first test would pass in a build
+  where the driver had stopped reporting delivery at all.
+- **Test results:** 7/7 in `ota_retry_tests`. The new test **fails against the restored
+  report-Delivered behaviour** while the real-ACK control keeps passing, so the failure is
+  attributable to the fault path rather than to delivery reporting generally. Restored by
+  `sha256sum`. Daemon green, workspace clippy clean, `REACH`/`TRACE` pass. Full `scripts/gate.sh`
+  verdict in the PR.
+
 ## 2026-09-07 — An unusable PTT backend refuses every emission and keeps retrying (#1285)
 
 - **Requirement/change:** #1285. The root defect was **not** the refuse-vs-warn policy question the
