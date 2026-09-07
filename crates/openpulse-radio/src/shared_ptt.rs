@@ -162,6 +162,22 @@ impl SharedPtt {
         self.unkey(observer)
     }
 
+    /// Re-stamp the deadline of the key `generation` owns, so the watchdog measures **silence since
+    /// the last transmission** rather than session length. Returns whether it extended.
+    ///
+    /// Owner-scoped on purpose (#1260). `arm()` would do the same re-stamping, but it is callable by
+    /// anyone and cannot tell a liveness signal from the holder apart from an unrelated re-assert —
+    /// #1263 closed exactly that on the manual path, where re-asserting every 170 s would have
+    /// defeated the 180 s watchdog. Only the live holder can extend, and a hung holder cannot.
+    fn extend_owned(&self, generation: u64) -> bool {
+        let mut g = self.lock();
+        if g.generation != generation || g.asserted_at.is_none() {
+            return false;
+        }
+        g.asserted_at = Some(Instant::now());
+        true
+    }
+
     /// Release the transmitter and disarm the watchdog. A failed hardware release leaves the watchdog
     /// **armed** (so it force-releases later) and returns [`UnkeyOutcome::Failed`]. The `false` edge is
     /// emitted only on a real transition (so a burst whose deadline the watchdog already fired emits
@@ -429,6 +445,16 @@ impl PttKeyGuard {
         let g = self.ptt.lock();
         !self.released && g.generation == self.generation && g.asserted_at.is_some()
     }
+
+    /// Re-stamp this guard's deadline, turning the watchdog into a silence timer (#1260).
+    ///
+    /// For a holder that legitimately keeps the transmitter up across many emissions — the
+    /// full-duplex cross-band repeater — where a fixed session deadline would force-release working
+    /// traffic and no deadline would leave rig_b keyed for the life of the process. Returns `false`
+    /// on a guard that no longer owns the live key, which is the caller's signal to re-key.
+    pub fn extend(&self) -> bool {
+        !self.released && self.ptt.extend_owned(self.generation)
+    }
 }
 
 impl Drop for PttKeyGuard {
@@ -506,6 +532,78 @@ mod tests {
     fn spy() -> (Arc<dyn PttObserver>, Arc<SpyObserver>) {
         let s = Arc::new(SpyObserver::default());
         (s.clone() as Arc<dyn PttObserver>, s)
+    }
+
+    /// #1260: a live holder's extend re-stamps the deadline, so the watchdog measures silence since
+    /// the last transmission rather than the length of the session.
+    #[test]
+    fn a_live_guard_extends_its_deadline_and_survives_the_watchdog() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let ptt = SharedPtt::new(
+            Some(Box::new(FakePtt {
+                releases: releases.clone(),
+                ..Default::default()
+            })),
+            Duration::from_millis(60),
+        );
+        let guard = ptt.keyed(None).expect("key");
+
+        // Past the deadline without extending, the watchdog would force-release. Extend inside it.
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(guard.extend(), "the live holder must be able to extend");
+        assert!(
+            !ptt.force_release_if_expired(None),
+            "the re-stamped deadline has not elapsed, so the watchdog must not fire"
+        );
+        assert!(guard.is_live(), "extending must not disturb ownership");
+
+        // And the deadline is a real bound, not removed: stop extending and it fires.
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            ptt.force_release_if_expired(None),
+            "extend must re-stamp the deadline, never disarm it — silence has to end the key"
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(
+            !guard.is_live(),
+            "the force-released holder must see its guard go dead so it can re-key"
+        );
+    }
+
+    /// The whole reason `extend` is owner-scoped rather than `arm()` (#1263): a holder whose key the
+    /// watchdog already took must not be able to keep the transmitter up.
+    #[test]
+    fn a_stale_guard_cannot_extend_the_key_that_displaced_it() {
+        let ptt = SharedPtt::new(
+            Some(Box::new(FakePtt::default())),
+            Duration::from_millis(20),
+        );
+        let stale = ptt.keyed(None).expect("key");
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(ptt.force_release_if_expired(None), "watchdog fires");
+
+        // Somebody else now owns the transmitter.
+        let live = ptt.keyed(None).expect("re-key");
+        assert!(
+            !stale.extend(),
+            "a stale guard extending would hold a transmitter another caller is using"
+        );
+        assert!(live.extend(), "the live holder is unaffected");
+    }
+
+    /// An explicitly released guard is finished; extend must not resurrect the deadline.
+    #[test]
+    fn a_released_guard_cannot_extend() {
+        let ptt = SharedPtt::new(Some(Box::new(FakePtt::default())), Duration::from_secs(5));
+        let guard = ptt.keyed(None).expect("key");
+        assert_eq!(guard.release(), UnkeyOutcome::Released);
+        assert!(!ptt.is_keyed());
+        // `release()` consumes the guard, so the reachable form of this is a guard whose key ended
+        // some other way; assert the underlying rule directly.
+        assert!(
+            !ptt.extend_owned(0),
+            "extend must refuse when nothing is armed"
+        );
     }
 
     #[test]

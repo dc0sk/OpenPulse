@@ -22,7 +22,12 @@ backend = "rigctld"
 serial_port = ""
 rig_file = ""
 
-# Uncomment for cross-band repeater operation.
+# Uncomment for cross-band repeater operation. rigctld_addr must differ from [radio]
+# rigctld_addr above: rig_b is a SECOND transmitter, and pointing both at one rigctld
+# makes each side key and release the other's PTT. The daemon refuses to start on that
+# collision when repeater.enabled = true (#1260) — and note that leaving the address
+# line commented out while uncommenting the header produces exactly that collision,
+# since the default is the main rig's address.
 # [radio.rig_b]
 # rigctld_addr = "127.0.0.1:4533"
 # backend = "rigctld"
@@ -33,6 +38,9 @@ rig_file = ""
 enabled = false
 mode = "BPSK250"
 tx_hang_ms = 500
+# true = hold PTT ACROSS relayed frames rather than dropping it between them. The key is
+# taken on the first frame, extended by each subsequent one, and released after 180 s of
+# silence — not held from session start (#1260).
 full_duplex = false
 
 [ardop]

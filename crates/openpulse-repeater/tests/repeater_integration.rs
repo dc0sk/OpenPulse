@@ -143,9 +143,11 @@ impl openpulse_radio::PttController for LoggingPtt {
 
 #[test]
 fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
-    // Audit #6: rig_b is an automatically-controlled station (§97.221) and must ID per §97.119. In
-    // half-duplex the ID keys its own PTT, so a relay whose interval has elapsed shows an *extra*
-    // assert/release pair (the relayed frame's, plus the ID's) versus a plain relay.
+    // #1260: this used to assert the PTT edge sequence `["assert","assert","release","release"]` —
+    // a proxy for "an ID went out", and the proxy is what let the double-key ship as a pass. The
+    // second assert was `maybe_identify` keying *underneath* the frame's still-live key, and its
+    // release dropped rig_b mid-scope. Assert the ID's BYTES on the transmit side instead, and
+    // require exactly ONE keying pair covering frame and ID together.
     fn feed_frame(lb: &LoopbackBackend) {
         let mut src = ModemEngine::new(Box::new(lb.clone_shared()));
         src.register_plugin(Box::new(BpskPlugin::new()))
@@ -153,8 +155,29 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
         src.transmit(b"relay frame", "BPSK250", None).expect("tx");
     }
 
+    /// Audio length of one BPSK250 transmission of `payload`, measured rather than assumed — it is
+    /// what splits the two-transmission capture below into its frame and its ID.
+    fn audio_len_of(payload: &[u8]) -> usize {
+        let lb = LoopbackBackend::new();
+        let mut e = ModemEngine::new(Box::new(lb.clone_shared()));
+        e.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register");
+        e.transmit(payload, "BPSK250", None).expect("tx");
+        lb.drain_samples().len()
+    }
+
+    /// Decode one BPSK250 transmission out of `samples`.
+    fn decode(samples: &[f32]) -> String {
+        let lb = LoopbackBackend::new();
+        let mut e = ModemEngine::new(Box::new(lb.clone_shared()));
+        e.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register");
+        lb.fill_samples(samples);
+        String::from_utf8_lossy(&e.receive("BPSK250", None).expect("decode")).into_owned()
+    }
+
     let (engine_rx, lb_rx) = make_engine_with_plugin();
-    let (engine_tx, _lb_tx) = make_engine_with_plugin();
+    let (engine_tx, lb_tx) = make_engine_with_plugin();
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let rig_b = LoggingPtt {
         log: log.clone(),
@@ -181,8 +204,13 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
         vec!["assert", "release"],
         "a plain relay keys once; no ID before the interval"
     );
+    assert_eq!(
+        decode(&lb_tx.drain_samples()),
+        "relay frame",
+        "the relayed frame must reach the transmitting rig"
+    );
 
-    // Second relay at t = 601 s: the interval has elapsed → the ID keys a second time within the call.
+    // Second relay at t = 601 s: the interval has elapsed, so the ID goes out under the SAME key.
     log.lock().unwrap().clear();
     feed_frame(&lb_rx);
     repeater
@@ -191,8 +219,28 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
         .expect("Some");
     assert_eq!(
         *log.lock().unwrap(),
-        vec!["assert", "assert", "release", "release"],
-        "the ID keys its own PTT after the interval elapses"
+        vec!["assert", "release"],
+        "the ID must ride the frame's key — a second assert underneath a live key releases rig_b \
+         mid-scope, and would be refused outright by the #1263 rule"
+    );
+
+    let captured = lb_tx.drain_samples();
+    let frame_len = audio_len_of(b"relay frame");
+    assert!(
+        captured.len() > frame_len,
+        "only one transmission reached rig_b, so no ID was sent (captured {} samples, one frame is {})",
+        captured.len(),
+        frame_len
+    );
+    assert_eq!(
+        decode(&captured[..frame_len]),
+        "relay frame",
+        "the traffic must precede the ID that identifies it"
+    );
+    assert_eq!(
+        decode(&captured[frame_len..]),
+        "DE N0CALL",
+        "§97.119: the transmitting rig must actually send its callsign, not merely key twice"
     );
 }
 
@@ -225,8 +273,11 @@ fn relay_empty_buffer_returns_none() {
 }
 
 #[test]
-fn full_duplex_ptt_released_on_early_stop() {
-    // stop is pre-set to true → run_full_duplex returns Ok(0) immediately after assert+release.
+fn full_duplex_idle_session_never_keys_and_a_held_key_is_released_at_session_end() {
+    // #1260 behaviour change: full duplex no longer keys eagerly at session start. The watchdog is
+    // in-process, so an unbounded deliberate hold does not mean "a hung repeater keys forever" — it
+    // means a *dead daemon* leaves rig_b keyed, since nothing releases PTT on shutdown and
+    // `RigctldPtt` has no `Drop`. Keying eagerly made that the state of an IDLE repeater.
     let (engine_rx, _lb_rx) = make_engine_with_plugin();
     let (engine_tx, _lb_tx) = make_engine_with_plugin();
 
@@ -238,7 +289,7 @@ fn full_duplex_ptt_released_on_early_stop() {
     let config = RepeaterConfig {
         enabled: true,
         mode: "BPSK250".into(),
-        tx_hang_ms: 500, // should be ignored in full-duplex
+        tx_hang_ms: 500, // ignored in full-duplex
         full_duplex: true,
         ..Default::default()
     };
@@ -248,11 +299,59 @@ fn full_duplex_ptt_released_on_early_stop() {
     let count = repeater.run_full_duplex(stop).expect("no error");
     assert_eq!(count, 0);
 
-    let log = ptt_log.lock().unwrap();
+    assert!(
+        ptt_log.lock().unwrap().is_empty(),
+        "a full-duplex session that relayed nothing must not have keyed the transmitter"
+    );
+}
+
+#[test]
+fn full_duplex_holds_one_key_across_frames_and_releases_it_at_session_end() {
+    let (engine_rx, lb_rx) = make_engine_with_plugin();
+    let (engine_tx, _lb_tx) = make_engine_with_plugin();
+
+    let feed = |lb: &LoopbackBackend| {
+        let mut src = ModemEngine::new(Box::new(lb.clone_shared()));
+        src.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register");
+        src.transmit(b"fd frame", "BPSK250", None).expect("tx");
+    };
+
+    let ptt_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mock_addr = spawn_mock_rigctld_with_ptt_log(ptt_log.clone());
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
+
+    let config = RepeaterConfig {
+        enabled: true,
+        mode: "BPSK250".into(),
+        tx_hang_ms: 0,
+        full_duplex: true,
+        ..Default::default()
+    };
+    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
+
+    for t in [0u64, 1_000] {
+        feed(&lb_rx);
+        repeater
+            .relay_one_frame_at(t)
+            .expect("relay")
+            .expect("Some");
+    }
     assert_eq!(
-        *log,
+        *ptt_log.lock().unwrap(),
+        vec!["T 1"],
+        "full duplex must key ONCE and hold the key across frames — that is what the flag buys"
+    );
+
+    // Session end releases whatever is still held, on the stop path as well as the error path.
+    repeater
+        .run_full_duplex(Arc::new(AtomicBool::new(true)))
+        .expect("no error");
+    assert_eq!(
+        *ptt_log.lock().unwrap(),
         vec!["T 1", "T 0"],
-        "PTT must be asserted then released"
+        "the held key must be released when the session ends"
     );
 }
 
@@ -285,9 +384,10 @@ fn full_duplex_disabled_returns_zero_immediately() {
 }
 
 #[test]
-fn full_duplex_relay_one_frame_skips_ptt() {
-    // In full_duplex mode, relay_one_frame() must not assert/release PTT.
-    // We inject a frame, call relay_one_frame(), and verify PTT log is empty.
+fn full_duplex_relay_one_frame_keys_rather_than_transmitting_into_an_unkeyed_rig() {
+    // Was `full_duplex_relay_one_frame_skips_ptt`, which asserted an EMPTY PTT log for a call that
+    // transmits. That was correct only because `run_full_duplex` keyed eagerly first; called on its
+    // own — as it is public and as the test itself calls it — it played audio into an unkeyed rig.
     let (engine_rx, lb_rx) = make_engine_with_plugin();
     let (engine_tx, _lb_tx) = make_engine_with_plugin();
 
@@ -315,10 +415,9 @@ fn full_duplex_relay_one_frame_skips_ptt() {
 
     let result = repeater.relay_one_frame().expect("relay");
     assert!(result.is_some(), "expected a frame to relay");
-
-    let log = ptt_log.lock().unwrap();
-    assert!(
-        log.is_empty(),
-        "relay_one_frame must not touch PTT in full_duplex mode"
+    assert_eq!(
+        *ptt_log.lock().unwrap(),
+        vec!["T 1"],
+        "a full-duplex relay must key before transmitting, and hold rather than release"
     );
 }

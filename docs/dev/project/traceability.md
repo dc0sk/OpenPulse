@@ -9,6 +9,97 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — The cross-band repeater onto `SharedPtt`, and what reading it turned up (#1260)
+
+- **Requirement/change:** #1260 — `relay_one_frame` asserted PTT then `?`-returned past its own
+  release on any transmit or ID error, leaving rig_b keyed with no watchdog in the crate to take it
+  back (`RigctldPtt` has no `Drop`). The issue also flagged that the obvious fix does not fit: the
+  deliberate full-duplex hold would be force-released every 180 s by the default watchdog.
+
+- **Design decision (reviewed by Fable before implementing).** Four things the review changed or
+  added, each of which came from evidence outside the code under change:
+
+  1. **Hoist the key; do not give the ID its own.** The repeater already **double-keys**:
+    `maybe_identify` asserts a second time while the caller's key is live, and its release drops
+    rig_b *before* the caller's. The comment at `lib.rs:101` asserts the opposite ("in half-duplex
+    PTT is released per-frame, so the ID keys its own PTT") and is false about its own code — the
+    release comes after. A mechanical port to #1263 guards would therefore have made the refusal
+    rule **reject the station ID**, turning a leak fix into a §97.119 failure. One guard now covers
+    frame and ID; §97.119 requires the call sign, not a separate keying, and an ID under the
+    traffic's own carrier is the ordinary practice.
+  2. **Full duplex is a hang time, and the deadline must measure SILENCE.** "No watchdog" is worse
+    than the issue framed it: the watchdog is *in-process*, so an unbounded hold does not bound the
+    case that matters — a **dead daemon** leaves rig_b keyed (on rigctld/CM108/GPIO; `rts`/`dtr`
+    drop with the fd), since there is no shutdown release anywhere in `server.rs` and process exit
+    runs no `Drop` on a spawned thread's stack. So the session no longer keys eagerly at start —
+    which reverses a written-down intent, since the deleted doc said the session-long carrier "is
+    what the flag means, and … is intended" (the audit-#2 fix). The key is taken on the
+    first frame and each relayed frame re-stamps the deadline via a new owner-scoped
+    `PttKeyGuard::extend()`. `SharedPtt::arm()` could not do this: it is callable by anyone and
+    cannot tell a holder's liveness signal from an unrelated re-assert — which is exactly what
+    #1263 closed on the manual path, where re-asserting every 170 s would have defeated the 180 s
+    watchdog.
+  3. **The alias case is the DEFAULT, not a corner.** `RigConfig::default().rigctld_addr` and
+    `RadioConfig::default().rigctld_addr` are both `127.0.0.1:4532`, and `rig_b` is
+    `#[serde(default)]` — so writing a `[radio.rig_b]` header without an address, or uncommenting
+    the header but not the template's address line, points rig_b at the **same rigctld** as the
+    main rig. Two controllers then each own one transmitter and release each other's key, and
+    #1263's refusal rule protects only *within* one `SharedPtt` — so the construction site refuses,
+    when the repeater is enabled at startup (otherwise it warns and builds no repeater). Review
+    corrected the predicate twice over: the shared thing is the **rigctld endpoint**, which the main
+    rig reaches for CAT as well as PTT, so `cat_backend = "rigctld"` (the default) collides by
+    itself even with `ptt_backend = "vox"` — and my first test asserted that false premise as a
+    passing case. It stays a string comparison, which catches the shipped defaults and not
+    `localhost:4532` against `127.0.0.1:4532`.
+  4. **rig_b still had the fail-open the main rig lost in #1285:** a failed `RigctldPtt::connect`
+    fell back to `NoOpPtt` and logged "repeater TX will be silent". It is not silent — it transmits
+    unkeyed. Routed through `ptt_builder::build_ptt` + `RetryingPtt` like the main rig.
+
+- **Implementation:** `crates/openpulse-radio/src/shared_ptt.rs` — `SharedPtt::extend_owned` +
+  `PttKeyGuard::extend()`, generation-scoped under one lock. `crates/openpulse-repeater/src/lib.rs`
+  — `rig_b: Box<dyn PttController>` → `ptt: SharedPtt` with `spawn_watchdog(None)` (no observer:
+  `PttChanged` carries no rig identity, #1298) plus a `session_guard`; `acquire_key()` reuses and
+  extends a live full-duplex key; `maybe_identify` no longer keys; a capture that does not
+  demodulate is `Ok(None)`, not a fault (#1297). `crates/openpulse-daemon/src/server.rs` —
+  `repeater_rig_b_config_error()` + refusal, rig_b through `build_ptt_controller`, `repeater`
+  becomes `Option`. Two consequences of the `Ok(None)` change that were not in the first draft: the
+  relay loop now reaches its idle arm continuously instead of never, so it sleeps `IDLE_POLL_MS`
+  rather than busy-waiting a core and re-opening a cpal input stream thousands of times a second
+  (bounded, not fixed — the fix is #1297); and `RigConfig`'s `backend`/`serial_port` doc comments,
+  which said "**Reserved** … unread", are now true only of `rig_a`.
+
+- **Tests:** `openpulse-radio --lib shared_ptt` — `a_live_guard_extends_its_deadline_and_survives_the_watchdog`,
+  `a_stale_guard_cannot_extend_the_key_that_displaced_it`, `a_released_guard_cannot_extend`.
+  `openpulse-repeater` — `a_failed_relay_transmit_does_not_leave_the_transmitter_keyed` (the #1260
+  gate), `full_duplex_idle_session_does_not_hold_ptt_either`,
+  `full_duplex_holds_one_key_across_frames_and_releases_it_at_session_end`,
+  `full_duplex_relay_one_frame_keys_rather_than_transmitting_into_an_unkeyed_rig`, and
+  `transmitting_rig_is_station_identified_when_the_interval_elapses` **rewritten** to decode
+  `DE N0CALL` off the transmit loopback. Its old assertion was the edge sequence
+  `["assert","assert","release","release"]` — a proxy for "an ID went out", and the proxy is
+  precisely what let the double-key ship as a pass. The split offset is *measured* from a control
+  transmission, not transcribed. `openpulse-daemon --lib repeater_rig_b_tests`.
+
+- **Test results:** `openpulse-radio` shared_ptt 23 passed. `openpulse-repeater` 12 passed across
+  both integration binaries. `openpulse-daemon` 143 + suites, 0 failed. Sabotage-verified in both
+  directions: reinstating the leak (`ManuallyDrop` on the guard) fails
+  `a_failed_relay_transmit_does_not_leave_the_transmitter_keyed`; making `extend_owned` ignore the
+  generation fails both owner-scoping tests; suppressing the ID fails the §97.119 gate with
+  "only one transmission reached rig_b, so no ID was sent (captured 6656 samples, one frame is
+  6656)". Full workspace gate on the code as merged: `GATE: PASS bd82ff30 clean` — 325 suites,
+  2494 passed, 0 failed, fmt/clippy/trace/reachability/ledger all ok. The first run of it read
+  `GATE: FAIL` on the **requirements-trailer lint** alone (no `Implements:` on the commit) with the
+  same 2494/0 test result; the trailer is now `Implements: REQ-PTT-01, REQ-REG-10`. The only edit
+  after the PASS is this sentence recording it.
+
+- **Filed, not fixed here:** #1297 (the repeater's RX window is one 10 ms poll of a freshly
+  allocated buffer, so on CPAL it is structurally incapable of containing a frame — the #1118 shape;
+  it means everything in #1260 is loopback-tier evidence and the feature has never relayed on a rig)
+  #1299 (the Twins claim "this was the last hand-rolled keying path" was **false** — `openpulse-kiss`
+  builds a `SharedPtt` and never starts its watchdog, and `openpulse-cli` still keys a bare
+  `PttController` at three sites) and #1298 (a dead repeater thread is reported as enabled forever, and re-enabling emits
+  `RepeaterChanged { enabled: true }` with no repeater; plus `PttChanged` carrying no rig identity).
+
 ## 2026-09-07 — The OTA send stops on a PTT fault WITHOUT claiming delivery (#1295)
 
 - **Requirement/change:** #1295, split out of #1285 and closed immediately because that change made

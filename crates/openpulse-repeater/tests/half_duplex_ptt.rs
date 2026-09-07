@@ -66,10 +66,10 @@ fn engine() -> ModemEngine {
 
 /// Run a repeater session briefly, then stop it, and return the observed PTT edges.
 ///
-/// The session's return value is deliberately ignored: on an idle loopback `relay_one_frame` errors
-/// ("signal too short") and the loop exits early. That is incidental here — the question this file
-/// asks is whether the transmitter was keyed *at session start*, which happens before any relaying,
-/// and whether it was left keyed afterwards. Both hold however the session ends.
+/// The session's return value is deliberately ignored. Since #1297 an idle loopback no longer ends
+/// the session — a capture that does not demodulate is silence, not a fault — so the loop simply
+/// spins until `stop`. The question this file asks is whether the transmitter came up at all with
+/// nothing to relay, and whether it was left keyed afterwards.
 fn run_session(full_duplex: bool) -> SpyPtt {
     let spy = SpyPtt::default();
     let config = RepeaterConfig {
@@ -110,20 +110,69 @@ fn half_duplex_session_does_not_hold_ptt() {
     );
 }
 
-/// Control: `full_duplex = true` must still hold PTT for the session, as its doc comment promises,
-/// and must release it at the end. Without this the fix could simply disable the feature.
+/// With `full_duplex = true` an idle session must not key either — changed in #1260.
+///
+/// The flag means "hold the key *across frames*", not "hold it from session start". The watchdog is
+/// in-process, so an eager unbounded hold is not merely a hung-repeater risk: a daemon that dies
+/// leaves rig_b keyed with nothing to release it (no shutdown handler, and `RigctldPtt` has no
+/// `Drop`), and eager keying made that the resting state of an idle unattended §97.221 station.
+/// That full duplex still holds one key across real traffic is pinned in
+/// `repeater_integration::full_duplex_holds_one_key_across_frames_and_releases_it_at_session_end`.
 #[test]
-fn full_duplex_session_holds_then_releases_ptt() {
+fn full_duplex_idle_session_does_not_hold_ptt_either() {
     let spy = run_session(true);
 
     assert_eq!(
         spy.edges(),
-        vec!["assert", "release"],
-        "full-duplex must key once for the session and release once at the end"
+        Vec::<&str>::new(),
+        "a full-duplex session with nothing to relay keyed the transmitter"
     );
     assert!(
         !spy.is_asserted(),
         "transmitter left keyed after a full-duplex session"
+    );
+}
+
+/// THE #1260 GATE: a transmit failure mid-relay must not leave rig_b keyed.
+///
+/// `relay_one_frame` asserted, then `?`-returned past its own release on any transmit or ID error.
+/// With a real `RigctldPtt` on `[radio.rig_b]` — which has no `Drop` — that left the cross-band rig
+/// keyed indefinitely, with no watchdog in this crate to take it back.
+#[test]
+fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
+    let spy = SpyPtt::default();
+    let config = RepeaterConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    // RX decodes; TX has no plugin registered, so `transmit` fails after the key is taken.
+    let engine_tx = ModemEngine::new(Box::new(LoopbackBackend::new()));
+    let (engine_rx, lb_rx) = {
+        let lb = LoopbackBackend::new();
+        let mut e = ModemEngine::new(Box::new(lb.clone_shared()));
+        e.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register");
+        (e, lb)
+    };
+    let mut src = ModemEngine::new(Box::new(lb_rx.clone_shared()));
+    src.register_plugin(Box::new(BpskPlugin::new()))
+        .expect("register src");
+    src.transmit(b"relay frame", "BPSK250", None).expect("tx");
+
+    let mut rp = CrossBandRepeater::new(Box::new(spy.clone()), engine_rx, engine_tx, config);
+    let err = rp
+        .relay_one_frame()
+        .expect_err("the tx engine has no plugin, so the relay must fail");
+
+    assert!(
+        !spy.is_asserted(),
+        "the transmitter is still keyed after a failed relay ({err}) — this is the stuck-carrier \
+         path #1260 was filed for"
+    );
+    assert_eq!(
+        spy.edges(),
+        vec!["assert", "release"],
+        "the key must be taken and then released exactly once on the error path"
     );
 }
 
