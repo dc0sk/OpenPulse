@@ -1726,6 +1726,12 @@ enum OtaAttempt {
     Nack,
     /// No ACK arrived within the window: the peer is silent this round.
     Timeout,
+    /// The transmitter could not be keyed: nothing went out and retrying will not help (#1295).
+    ///
+    /// Distinct from `Delivered` because the frame did NOT reach the peer, and distinct from `Nack`
+    /// because a hardware PTT fault is not transient the way a busy rig is — retrying just spends
+    /// cycles while the operator learns nothing.
+    PttFault,
 }
 
 /// Max data retransmissions after the first send (so up to `MAX_RETRIES + 1` sends) when the peer is
@@ -1749,6 +1755,8 @@ enum OtaSendStop {
     RetriesExhausted,
     /// No active OTA session to send under.
     NoSession,
+    /// The transmitter could not be keyed — abandoned, and NOT delivered (#1295).
+    PttFault,
 }
 
 /// Drive the OTA send/ACK retry loop, invoking `attempt` (transmit + ACK-wait, with its own side
@@ -1762,6 +1770,7 @@ fn run_ota_retry(mut attempt: impl FnMut() -> Option<OtaAttempt>) -> OtaSendStop
         match attempt() {
             None => return OtaSendStop::NoSession,
             Some(OtaAttempt::Delivered) => return OtaSendStop::Delivered,
+            Some(OtaAttempt::PttFault) => return OtaSendStop::PttFault,
             Some(OtaAttempt::Nack) => consecutive_timeouts = 0,
             Some(OtaAttempt::Timeout) => {
                 consecutive_timeouts += 1;
@@ -1826,7 +1835,12 @@ fn ota_send_with_ptt(
             tokio::task::block_in_place(|| engine.transmit_with_fec_mode(body, &mode, fec, None))
         }) {
             Ok(()) => Ok(()),
-            Err(crate::KeyedTxError::Assert) => return Some(OtaAttempt::Delivered),
+            // #1295: NOT `Delivered`. Stopping is right — a rig that cannot be keyed will not be
+            // keyed by trying again — but `Delivered` is consumed as "the peer has it": the session
+            // advances and the rate controller sees a success, for a frame that never went out.
+            // Before #1285 this arm was rarely reached, because an unreachable backend collapsed to
+            // `None` and keying then SUCCEEDED; now every attempt against a dead rig lands here.
+            Err(crate::KeyedTxError::Assert) => return Some(OtaAttempt::PttFault),
             // Busy, not broken (#1263): nothing went out, but the condition is transient, so retry
             // the data frame rather than stopping as an assert fault does.
             Err(crate::KeyedTxError::AlreadyKeyed) => return Some(OtaAttempt::Nack),
@@ -1873,6 +1887,20 @@ fn ota_send_with_ptt(
         }
         OtaSendStop::RetriesExhausted => {
             tracing::warn!(peer = %peer, "OTA send: retries exhausted (peer kept NACKing)");
+            let _ = event_tx.send(ota_status_event(engine));
+        }
+        OtaSendStop::PttFault => {
+            // Surfaced at `error`, not `warn`: the other two give-ups describe the far end, which the
+            // operator cannot fix. This one is THIS station's transmitter, and it is actionable.
+            tracing::error!(
+                peer = %peer,
+                "OTA send abandoned: the transmitter could not be keyed — nothing was radiated. \
+                 Check [modem] ptt_backend and the rig; the daemon keeps retrying the connection"
+            );
+            let _ = event_tx.send(crate::protocol::ControlEvent::CommandError {
+                command: "ota_send".to_string(),
+                reason: "PTT could not be keyed; the message was NOT transmitted".to_string(),
+            });
             let _ = event_tx.send(ota_status_event(engine));
         }
         OtaSendStop::Delivered | OtaSendStop::NoSession => {}
@@ -2159,6 +2187,41 @@ mod ota_retry_tests {
         let (attempts, stop) = drive(&[Some(OtaAttempt::Delivered)]);
         assert_eq!(stop, OtaSendStop::Delivered);
         assert_eq!(attempts, 1);
+    }
+
+    /// A PTT fault stops the send WITHOUT claiming delivery (#1295).
+    ///
+    /// The two halves are the point. Stopping is right — a rig that cannot be keyed will not be
+    /// keyed by trying again, and burning the retry budget only delays the operator finding out. But
+    /// `Delivered` is consumed as "the peer has it": the session advances and the rate controller
+    /// records a success for a frame that never went out.
+    ///
+    /// Before #1285 this arm was almost unreachable, because an unreachable backend collapsed to
+    /// `None` and `SharedPtt::key` with no controller SUCCEEDS — the daemon transmitted unkeyed and
+    /// the session failed later, on a missing ACK. Now every attempt against a dead rig lands here,
+    /// which is why the outcome had to stop being a lie.
+    #[test]
+    fn a_ptt_fault_stops_the_send_without_claiming_delivery() {
+        let (attempts, stop) = drive(&[Some(OtaAttempt::PttFault)]);
+        assert_eq!(
+            stop,
+            OtaSendStop::PttFault,
+            "a keying failure must be its own stop reason"
+        );
+        assert_ne!(
+            stop,
+            OtaSendStop::Delivered,
+            "reporting Delivered for a frame that was never radiated advances the session and              records a rate-controller success on nothing"
+        );
+        assert_eq!(attempts, 1, "and it must not burn the retry budget");
+    }
+
+    /// Control: a real ACK still reports delivery, so the test above is not passing because the
+    /// driver stopped reporting delivery at all.
+    #[test]
+    fn a_real_ack_still_reports_delivered() {
+        let (_, stop) = drive(&[Some(OtaAttempt::Delivered)]);
+        assert_eq!(stop, OtaSendStop::Delivered);
     }
 
     #[test]
