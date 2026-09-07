@@ -71,6 +71,10 @@ struct PttInner {
     /// drops later and releases whoever keyed in the meantime. That is the #1263 defect in its most
     /// damaging form, and it is present under every nesting policy, so the token comes first.
     generation: u64,
+    /// Diagnostic label for whoever holds the current key (#1263). Never used to DECIDE anything —
+    /// the owner is the guard and the identity is the generation. A caller-supplied label that
+    /// decided access would be a claim any site could make, which is the hole the first design had.
+    held_by: &'static str,
 }
 
 /// PTT hardware + watchdog deadline behind a shared lock. Cheap to `clone` (shares the same lock).
@@ -86,6 +90,7 @@ impl SharedPtt {
             max_duration,
             stuck_warned: false,
             generation: 0,
+            held_by: "nobody",
         })))
     }
 
@@ -97,10 +102,30 @@ impl SharedPtt {
     /// event is emitted (the caller skips the burst). `observer = None` keys silently (the beacon path,
     /// which historically emits no change event).
     pub fn key(&self, observer: Option<&Arc<dyn PttObserver>>) -> Result<(), PttError> {
+        self.key_as("automatic", observer)
+    }
+
+    /// As [`Self::key`], labelling the holder for diagnostics (#1263).
+    ///
+    /// **Refuses while anyone holds a live key.** The check and the assert happen under ONE lock
+    /// acquisition: a check-then-key across two would race the watchdog thread, the one thing that
+    /// can preempt a live key at any instant.
+    ///
+    /// A refusal touches no hardware and emits no `PttChanged` — a caller that saw an event for a
+    /// key it never got would leave a client's indicator stuck on.
+    pub fn key_as(
+        &self,
+        who: &'static str,
+        observer: Option<&Arc<dyn PttObserver>>,
+    ) -> Result<(), PttError> {
         let mut g = self.lock();
+        if g.asserted_at.is_some() {
+            return Err(PttError::AlreadyKeyed { held_by: g.held_by });
+        }
         if let Some(ptt) = g.controller.as_mut() {
             ptt.assert_ptt()?;
         }
+        g.held_by = who;
         g.asserted_at = Some(Instant::now());
         g.stuck_warned = false;
         g.generation = g.generation.wrapping_add(1);
@@ -150,6 +175,7 @@ impl SharedPtt {
             }
         }
         g.stuck_warned = false;
+        g.held_by = "nobody";
         if g.asserted_at.take().is_some() {
             // Notify under the lock (see `key`) so this `false` is ordered against any concurrent key.
             if let Some(obs) = observer {
@@ -205,6 +231,58 @@ impl SharedPtt {
     /// Disarm the watchdog deadline (deadline only, no hardware). For a manual release command.
     pub fn disarm(&self) {
         self.lock().asserted_at = None;
+    }
+
+    /// Release the transmitter whoever holds it — the control operator's hard override (#1263).
+    ///
+    /// Kept at the maintainer's decision. `PttRelease` has always dropped the hardware regardless of
+    /// who keyed, and that is a control point: without it an operator watching a runaway automatic
+    /// burst would have to wait out the 180 s watchdog. Making the manual key an owned guard would
+    /// otherwise have turned `PttRelease` into a no-op during an automatic burst — a UI defect traded
+    /// for a lost control point.
+    ///
+    /// Bumps the generation, so the displaced holder's guard becomes stale and its later `Drop` is a
+    /// no-op rather than releasing whoever keyed next.
+    pub fn force_release(&self, observer: Option<&Arc<dyn PttObserver>>) -> UnkeyOutcome {
+        let mut g = self.lock();
+        // The hardware release is attempted UNCONDITIONALLY — deliberately, and unlike `unkey`.
+        // This is the operator's override, and it must not be gated on the daemon's BELIEF about the
+        // state: that belief can be wrong (a rig left keyed by VOX, by a previous process, or by a
+        // release this daemon thinks succeeded), which is the same reason the watchdog exists. An
+        // override that only works when we already agree the rig is keyed is not an override.
+        let armed = g.asserted_at.is_some();
+        if let Some(ptt) = g.controller.as_mut() {
+            if let Err(e) = ptt.release_ptt() {
+                tracing::warn!(error = %e, "forced PTT release failed; leaving the watchdog armed");
+                return UnkeyOutcome::Failed;
+            }
+        }
+        let displaced = g.held_by;
+        g.asserted_at = None;
+        g.stuck_warned = false;
+        g.generation = g.generation.wrapping_add(1);
+        g.held_by = "nobody";
+        if !armed {
+            // The hardware was released anyway (see above), but there was no logical transition, so
+            // no event — emitting `false` for a state nobody was in is the spurious-edge class #836
+            // exists to prevent.
+            return UnkeyOutcome::NotKeyed;
+        }
+        if displaced != "manual" {
+            tracing::warn!(
+                displaced,
+                "PTT force-released by the operator while an automatic emission held it"
+            );
+        }
+        if let Some(obs) = observer {
+            obs.ptt_changed(false);
+        }
+        UnkeyOutcome::Released
+    }
+
+    /// Who currently holds the key, for diagnostics and for deciding whether a force is a takeover.
+    pub fn held_by(&self) -> &'static str {
+        self.lock().held_by
     }
 
     /// Whether the transmitter is currently considered keyed (the watchdog is armed).
@@ -263,6 +341,7 @@ impl SharedPtt {
         }
         g.asserted_at = None;
         g.stuck_warned = false;
+        g.held_by = "nobody";
         // End the key's identity too (#1263). Clearing `asserted_at` already makes a stale guard's
         // release a no-op, since ownership is "my generation is live AND the deadline is armed" —
         // there is deliberately no separate owner field to go stale, which is what would otherwise
@@ -826,6 +905,144 @@ mod ownership_token_tests {
             "after the watchdog released it, the guard owns nothing — a caller that read this as a \
              live hold would refuse to key while the transmitter sits idle (#1263 F1)"
         );
+    }
+
+    /// A second key is REFUSED while somebody holds a live one (#1263), and touches nothing.
+    #[test]
+    fn a_second_key_is_refused_and_touches_no_hardware() {
+        let (p, asserts, releases) = ptt(Duration::from_secs(180));
+        let _held = p.keyed(None).expect("first key");
+        assert_eq!(asserts.load(Ordering::SeqCst), 1);
+
+        let refused = p.keyed(None);
+        assert!(
+            matches!(refused, Err(PttError::AlreadyKeyed { .. })),
+            "a second key must be refused, not silently adopt the first one's deadline"
+        );
+        assert_eq!(
+            asserts.load(Ordering::SeqCst),
+            1,
+            "a refusal must not touch the hardware"
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert!(p.is_keyed(), "the first holder still has it");
+    }
+
+    /// A refusal emits no `PttChanged` — an event for a key that was never granted would leave a
+    /// client's indicator stuck on.
+    #[test]
+    fn a_refused_key_emits_no_event() {
+        struct Counting(Arc<AtomicUsize>);
+        impl PttObserver for Counting {
+            fn ptt_changed(&self, _active: bool) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (p, _a, _r) = ptt(Duration::from_secs(180));
+        let events = Arc::new(AtomicUsize::new(0));
+        let obs: Arc<dyn PttObserver> = Arc::new(Counting(events.clone()));
+
+        let _held = p.keyed(Some(&obs)).expect("first key");
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            1,
+            "the granted key emitted true"
+        );
+
+        assert!(p.keyed(Some(&obs)).is_err());
+        assert_eq!(
+            events.load(Ordering::SeqCst),
+            1,
+            "a refused key must emit nothing at all"
+        );
+    }
+
+    /// The operator's hard override survives (maintainer decision, #1263).
+    ///
+    /// `PttRelease` has always dropped the hardware regardless of who keyed. Without this an
+    /// operator watching a runaway automatic burst would wait out the full 180 s watchdog.
+    #[test]
+    fn a_force_release_takes_the_key_from_an_automatic_holder() {
+        let (p, _a, releases) = ptt(Duration::from_secs(180));
+        let automatic = p.keyed(None).expect("automatic key");
+        assert!(p.is_keyed());
+
+        assert_eq!(p.force_release(None), UnkeyOutcome::Released);
+        assert!(!p.is_keyed(), "the operator's override drops the rig");
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        // And the displaced guard is now stale, so its later drop cannot release a NEW key.
+        let _next = p.keyed(None).expect("somebody keys again");
+        drop(automatic);
+        assert!(
+            p.is_keyed(),
+            "the force-displaced guard released a later key — the force path must bump the              generation, or the override trades one defect for another"
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+    }
+
+    /// Forcing an idle transmitter still hits the hardware, but reports no transition.
+    ///
+    /// The two halves are deliberate and pull in opposite directions:
+    ///
+    /// * **The hardware release is unconditional**, because the daemon's belief about the state can
+    ///   be WRONG — a rig left keyed by VOX, by a previous process, or by a release this daemon
+    ///   thinks succeeded. That is the same reason the watchdog exists, and an override that only
+    ///   works when we already agree the rig is keyed is not an override.
+    /// * **No event and `NotKeyed`**, because there was no logical transition, and emitting `false`
+    ///   for a state nobody was in is the spurious-edge class #836 exists to prevent.
+    ///
+    /// This test asserted the opposite when first written (no hardware call at all). It was changed
+    /// deliberately after the daemon's `ptt_command_guard_reports_hardware_failure_to_skip_dispatch`
+    /// showed that gating the override on our own state model silently dropped the "a failed release
+    /// reports hard failure" contract — a changed intent, not a test bent to fit.
+    #[test]
+    fn a_force_release_with_nothing_keyed_still_releases_the_hardware() {
+        let (p, _a, releases) = ptt(Duration::from_secs(180));
+        assert_eq!(
+            p.force_release(None),
+            UnkeyOutcome::NotKeyed,
+            "no logical transition, so no event"
+        );
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "the hardware release must be attempted anyway — the operator's override cannot be              gated on the daemon believing the rig is keyed"
+        );
+    }
+
+    /// After any release the holder label is cleared, so nothing can be "held by" a finished key.
+    ///
+    /// This is failure mode F1 from the review: a stale holder record would refuse every later key
+    /// while the transmitter sat idle, deferring the station ID indefinitely and silently.
+    #[test]
+    fn every_release_path_clears_the_holder() {
+        for release in ["guard", "watchdog", "force"] {
+            let (p, _a, _r) = ptt(Duration::from_nanos(1));
+            let g = p.keyed(None).expect("key");
+            assert_eq!(p.held_by(), "automatic");
+            match release {
+                "guard" => drop(g),
+                "watchdog" => {
+                    assert!(p.force_release_if_expired(None));
+                    drop(g);
+                }
+                _ => {
+                    p.force_release(None);
+                    drop(g);
+                }
+            }
+            assert_eq!(
+                p.held_by(),
+                "nobody",
+                "after a {release} release nothing may still be recorded as holding the key"
+            );
+            p.set_max_duration(Duration::from_secs(180));
+            assert!(
+                p.keyed(None).is_ok(),
+                "a later key was refused after a {release} release — F1: the station ID would                  defer forever with the transmitter idle"
+            );
+        }
     }
 
     /// An explicit `release()` is still generation-scoped, not only the `Drop`.
