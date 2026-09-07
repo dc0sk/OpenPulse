@@ -448,11 +448,29 @@ is visible in the transcript rather than indistinguishable from compliance.
    `grep`/`jq`/a log pattern — "0 occurrences", "never fires" — show the same filter matching a
    known-present instance, or write **"my filter found nothing"**, which is a different sentence
    from "there is nothing". A too-narrow trace filter nearly became a published finding.
-5. **Reproduction harnesses share constants by reference.** A harness claiming to reproduce gate X
-   takes X's parameters (mode, FEC, step, channel) from the same `const`/module X uses, or asserts
-   equality at startup and aborts on mismatch. **A doc-comment fidelity claim with hand-transcribed
-   parameters is banned — a comment cannot fail**, and one claiming to reproduce a QPSK500 gate
-   while defaulting to QPSK1000 inverts the conclusion drawn from it.
+5. **Reproduction harnesses share their inputs by reference — parameters AND sequences.** A harness
+   claiming to reproduce gate X, or to stand in for something the product ships, takes it from the
+   same `const`/generator/module the product uses, or **asserts equality against that generator in
+   the DEFAULT test run** — not under `#[ignore]`, not in a comment. **A doc-comment fidelity claim
+   is banned — a comment cannot fail**; one claiming to reproduce a QPSK500 gate while defaulting to
+   QPSK1000 inverts the conclusion drawn from it.
+   - **"Parameters" was too narrow, and the gap cost a wire-format argument (2026-09-07).** `f12`
+     fed its correlator a hand-written alternating `+-+-` chip run under a comment calling that "the
+     shipped sync word's structure". The wire carries alternating *bits*, which NRZI turns into
+     `--++` — period **four**, not two; correlation between the measured template and the transmitted
+     one was **0.035**, and its spectral lines sat at twice the right offset, so a *second*
+     conclusion (about energy lost at a receive-filter edge) was also about a template that does not
+     exist. Both reached a written argument for changing the wire format before a reviewer caught
+     them. The fix is one assertion that runs by default:
+     `f12_synthesised_template_matches_the_shipped_one` requires ρ > 0.999 and fails at 0.035
+     against the original.
+   - **Re-pointing the fixture is not enough if the REGIME is still wrong.** The corrected probe
+     still ran at BPSK1000, where the now-correct template's lines fall exactly on the 1250–1750
+     mask edges, so those cells measured leakage rather than the deployed mode. Ask what the fixture
+     reproduces *and* what conditions it runs under — BPSK250 is the only mode publishing a template.
+   - A probe that measures the wrong artifact is worse than no probe: it produces numbers that look
+     like evidence, and they get quoted in issues and design decisions long before anyone re-derives
+     them.
 6. **Before `gh pr create`**, print `git log --oneline origin/main..HEAD` and `git diff --stat
    origin/main...HEAD`, and confirm both match the PR description. A PR labelled "docs-only" merged
    `engine.rs` because the branch was cut while standing on a code branch.
