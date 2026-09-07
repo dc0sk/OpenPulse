@@ -9,6 +9,58 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — Spectral subtraction REJECTED for frame detection, measured (side-task)
+
+- **Requirement/change:** maintainer side-task — assess spectral-subtraction noise reduction for
+  acquisition and data extraction, and create requirements **if the results are promising**. They are
+  not. **No requirements created.**
+- **Declined for the DEMOD path on mechanism, without measurement.** Under white Gaussian noise the
+  matched filter already computes the sufficient statistic, and a half-wave-rectified per-bin gain is
+  non-invertible — by data processing it cannot improve detection or SER there. Any gain would need
+  non-white noise, whose remedies are a *linear* whitening filter (coloured) or a time-domain blanker
+  (impulsive); neither is spectral subtraction. And a per-bin per-frame gain is a fast bin-wise AGC:
+  a milder version already flipped SCFDMA52-16QAM and -32QAM from 2/2 pass to 2/2 fail.
+- **Measured for the DETECTOR path, because a real counter-mechanism existed** (a weak preamble's few
+  spectral lines might survive while off-line noise is suppressed). `f11` in
+  `preamble_rho_fade_and_filter_probe.rs`, sharing `rho_engine`/`win_len`/`plugin_template` with every
+  other row **by reference** so the numbers are comparable rather than produced by a re-transcribed
+  correlator.
+
+  | capture | baseline ρ′ | best ρ′ after | Δ |
+  |---|---|---|---|
+  | `ic9700-idle-wide-500hz-control` | 0.241 | 0.269 | **+0.027** |
+  | `ic9700-idle-500hz` | 0.438 | 0.498 | **+0.059** |
+  | `ic9700-idle-250hz` | 0.615 | 0.681 | **+0.067** |
+
+  **12 of 12 cells worse**, both kill criteria firing: ρ′ rises AND peak ρ_noise rises with it
+  (0.413 → 0.524 at 500 Hz). More over-subtraction is monotonically worse.
+- **The metric was chosen in advance and it mattered.** ρ′ = ρ_noise/ρ_signal, never ρ_noise alone —
+  ρ is a ratio, and three prior in-repo measurements show that removing energy *raises* ρ on a
+  noise-only capture (the DDC lowpass "raises ρ for signal and noise alike, the noise by more";
+  a narrower rig filter moves idle ρ 0.227 → 0.413 → 0.579; notching a birdie out of an idle capture
+  raised it). A probe quoting an absolute ρ improvement would have been measuring the wrong thing.
+- **The mechanism is visible in the numbers**, which is what makes this an explanation rather than a
+  result: `ρ_signal` barely moves (0.941 → 0.936 at worst), so the whole effect is on the noise side.
+  Rectification keeps the exponential tail and **sparsifies broadband noise into tone-like
+  survivors**; one landing on the alternating preamble's few spectral lines spikes ρ — the same
+  reason a lone tone already scores ρ ≈ 0.70 against this template (#1062). Subtraction manufactures
+  the one input this detector is worst against.
+- **Scope of the elimination, stated narrowly on purpose** (a wrong elimination closes a door
+  permanently and silently): what is refuted is *magnitude spectral subtraction as a pre-detector
+  stage for the alternating BPSK preamble, on these three rig captures*. NOT refuted: linear
+  pre-whitening; a time-domain blanker for impulsive QRN, which this probe says nothing about; or
+  **WSJT-X-style successive cancellation of already-DECODED signals**, an unrelated technique sharing
+  only the word "subtraction" and worth its own assessment.
+- **Five corrections to my framing, from the assessment:** the notch is *not* FFT-domain removal (it
+  detects spectrally, removes with time-domain IIR biquads, and structurally refuses the passband);
+  `noise_floor.rs` yields a **scalar**, not the per-bin PSD subtraction needs; there is no in-repo
+  prior art (the SC-FDMA "Wiener" is a channel estimator); the LLR failure would be one of *shape*
+  rather than scale, caught by `llr_reliability` but **not** by `llr_calibration`; and the tree
+  already carries an operator rule pointing the same way — rig DSP NR is set **off** on both rigs
+  ("distorts BPSK signal") and cleared by CAT before every on-air run.
+- **Test results:** `f11` is `#[ignore]`d (research harness, asserts nothing) with the table in its
+  docstring, so the elimination travels with the apparatus that produced it. Run: 1217 s.
+
 ## 2026-09-07 — A second key is refused, and a busy rig defers the station ID (#1263, PR-2)
 
 - **Requirement/change:** #1263 part 2 — the policy on top of PR-1's ownership token. `key()` now
