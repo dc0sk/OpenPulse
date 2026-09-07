@@ -1593,10 +1593,18 @@ fn now_ms() -> u64 {
 /// modem fault (`warn`) — so collapsing them into one `Option` would delete audit-derived
 /// diagnostics (audit 2026-07-19, #8).
 pub(crate) enum KeyedTxError {
-    /// The transmitter could not be keyed; nothing was emitted. The underlying `PttError` is logged
-    /// at the failure site rather than carried — no caller branches on which PTT fault occurred, and
-    /// carrying it made the variant a dead field.
+    /// The transmitter could not be keyed by a HARDWARE fault; nothing was emitted. The underlying
+    /// `PttError` is logged at the failure site rather than carried — no caller branches on which
+    /// PTT fault occurred, and carrying it made the variant a dead field.
     Assert,
+    /// Somebody else holds a live key; nothing was emitted, and nothing is wrong (#1263).
+    ///
+    /// **A third variant is mandatory, not cosmetic.** Callers must be able to tell "the rig is
+    /// busy" from "the rig is broken", because the station ID treats them oppositely: it DEFERS on
+    /// this (keeps its due flag, sends after the holder releases) and MARKS on `Assert`. Overloading
+    /// `Assert` would put the hardware-fault path onto the defer path, and a faulted rig would then
+    /// get a key attempt every 50 ms tick for the whole 180 s watchdog window.
+    AlreadyKeyed,
     /// Keyed successfully, but the emission itself failed.
     Transmit(openpulse_core::error::ModemError),
 }
@@ -1609,6 +1617,12 @@ pub(crate) fn keyed_transmit<T>(
 ) -> Result<T, KeyedTxError> {
     let _guard = match ptt.keyed(event_tx) {
         Ok(g) => g,
+        // Busy is not broken (#1263): log it at debug and hand back a variant the caller can defer
+        // on, rather than the hardware-fault variant it must mark on.
+        Err(openpulse_radio::PttError::AlreadyKeyed { held_by }) => {
+            tracing::debug!(what, held_by, "PTT held by another emission; skipped");
+            return Err(KeyedTxError::AlreadyKeyed);
+        }
         Err(e) => {
             tracing::warn!(what, error = %e, "PTT assert failed; emission skipped");
             return Err(KeyedTxError::Assert);
@@ -6149,5 +6163,82 @@ mod handshake_rf_tests {
             rx.try_recv(),
             Ok(ControlEvent::StationList { stations }) if stations.is_empty()
         ));
+    }
+}
+
+/// A station ID refused because the rig was BUSY defers; one refused by a FAULT does not (#1263).
+///
+/// This is the property my first #1263 design would have broken. `mark_identified` was called
+/// "Advance regardless of PTT success" and clears both `last_id_ms` and `tx_since_id`, so refusing a
+/// station ID without distinguishing busy from broken skips a whole §97.119 interval.
+///
+/// The asymmetry is why `KeyedTxError::AlreadyKeyed` is a third variant rather than an overload of
+/// `Assert`: deferring on a hardware fault too would key-attempt a faulted rig at the 50 ms tick
+/// rate for the entire 180 s watchdog window.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod station_id_deferral_tests {
+    use super::*;
+    use openpulse_core::station_id::StationIdTimer;
+
+    const TEN_MIN: u64 = 600_000;
+
+    fn timer() -> StationIdTimer {
+        StationIdTimer::new(TEN_MIN, 0)
+    }
+
+    /// The decision the rx-tick makes, isolated: mark on success and on fault, defer on busy.
+    fn mark_unless_busy(t: &mut StationIdTimer, outcome: Result<(), KeyedTxError>, now_ms: u64) {
+        if !matches!(outcome, Err(KeyedTxError::AlreadyKeyed)) {
+            t.mark_identified(now_ms);
+        }
+    }
+
+    #[test]
+    fn a_busy_rig_defers_the_id_instead_of_skipping_an_interval() {
+        let mut t = timer();
+        t.note_tx(0);
+        assert!(t.id_due(TEN_MIN), "precondition: an ID is due");
+
+        mark_unless_busy(&mut t, Err(KeyedTxError::AlreadyKeyed), TEN_MIN);
+        assert!(
+            t.id_due(TEN_MIN),
+            "a station ID refused because another emission held the key must stay DUE — marking it \
+             skips a full §97.119 interval, which is what the first #1263 design would have done"
+        );
+
+        // It goes out on the next tick after the holder releases.
+        mark_unless_busy(&mut t, Ok(()), TEN_MIN + 50);
+        assert!(
+            !t.id_due(TEN_MIN + 50),
+            "and is cleared once it actually goes"
+        );
+    }
+
+    #[test]
+    fn a_hardware_fault_still_marks_so_a_faulted_rig_is_not_hammered() {
+        let mut t = timer();
+        t.note_tx(0);
+        assert!(t.id_due(TEN_MIN));
+
+        mark_unless_busy(&mut t, Err(KeyedTxError::Assert), TEN_MIN);
+        assert!(
+            !t.id_due(TEN_MIN),
+            "an assert FAULT must still advance the timer — deferring on it would retry a broken \
+             rig every 50 ms tick for the whole 180 s watchdog window"
+        );
+    }
+
+    #[test]
+    fn a_transmit_error_also_marks() {
+        let mut t = timer();
+        t.note_tx(0);
+        mark_unless_busy(
+            &mut t,
+            Err(KeyedTxError::Transmit(
+                openpulse_core::error::ModemError::Frame("probe".into()),
+            )),
+            TEN_MIN,
+        );
+        assert!(!t.id_due(TEN_MIN), "a modem fault is not a busy rig either");
     }
 }

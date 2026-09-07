@@ -9,6 +9,45 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — A second key is refused, and a busy rig defers the station ID (#1263, PR-2)
+
+- **Requirement/change:** #1263 part 2 — the policy on top of PR-1's ownership token. `key()` now
+  **refuses while anyone holds a live key**, and the refusal is a distinct condition all the way up
+  to the callers.
+- **`PttError::AlreadyKeyed` and `KeyedTxError::AlreadyKeyed` are mandatory, not cosmetic.** The
+  station ID treats busy and broken **oppositely**: it defers on busy (keeps its due flag) and marks
+  on a fault. Overloading `Assert` would put the hardware-fault path onto the defer path, and a
+  faulted rig would then get a key attempt every 50 ms tick for the entire 180 s watchdog window.
+  The compiler named every site that had to choose when the variant was added — two of them.
+- **This is the §97.119 defect my FIRST design would have shipped.** `mark_identified` was called
+  *"Advance regardless of PTT success"* and clears both `last_id_ms` and `tx_since_id`, so refusing a
+  station ID without distinguishing busy from broken skips a whole interval. The fix for a UX defect
+  would have created a regulatory one; the review caught it and I verified it in code before
+  accepting it.
+- **The operator's hard override is KEPT — maintainer decision.** `PttRelease` has always dropped the
+  hardware regardless of who keyed, and that is a control point: without it an operator watching a
+  runaway automatic burst waits out the full 180 s watchdog. `force_release` bumps the generation, so
+  the displaced holder's guard goes stale and its later `Drop` cannot release whoever keys next —
+  otherwise the override would trade one defect for another.
+- **F1 closed positively.** Every release path — guard, watchdog, force — clears `held_by`, and a
+  test walks all three and then re-keys. A stale holder record would refuse every later key while the
+  transmitter sat idle, deferring the ID indefinitely and silently.
+- **`held_by` is a diagnostic and decides nothing.** The owner is the guard and the identity is the
+  generation. A caller-supplied label that decided access would be a claim any site could make, which
+  is the hole the first design had in a different shape.
+- **Tests:** five more in `ownership_token_tests` — a second key is refused and touches no hardware;
+  a refused key emits **no** `PttChanged` (an event for a key never granted would stick a client's
+  indicator on); the force path takes the key from an automatic holder *and* leaves that holder's
+  guard unable to release a later key; forcing an idle rig is a no-op; every release path clears the
+  holder. Plus three in `station_id_deferral_tests` for the mark/defer asymmetry.
+- **Test results:** radio 50 + 11, daemon lib 139, ARDOP 7 + 24, KISS 3 + 9, workspace clippy clean.
+  **Sabotage:** marking regardless — the pre-#1263 behaviour — fails exactly the deferral test with
+  *"a station ID refused because another emission held the key must stay DUE"*, while both
+  fault-path controls keep passing, so the failure is attributable to the deferral rather than to the
+  timer. Restored by `sha256sum`. Full `scripts/gate.sh` verdict in the PR.
+- **OTA send retries on busy** (`OtaAttempt::Nack`) rather than stopping as it does on an assert
+  fault: nothing went out, but the condition is transient.
+
 ## 2026-09-06 — A PTT guard releases only the key it took (#1263, PR-1)
 
 - **Requirement/change:** #1263 part 1 — the ownership token. `unkey()` released the hardware and

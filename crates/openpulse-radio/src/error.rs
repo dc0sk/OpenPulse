@@ -18,6 +18,17 @@ pub enum PttError {
     /// start a daemon that then transmitted into an unkeyed rig.
     #[error("PTT configuration error: {0}")]
     Config(String),
+    /// Somebody else holds a live key (#1263).
+    ///
+    /// **Transient and expected**, unlike every other variant — the transmitter is working and busy.
+    /// Callers must treat it separately: a station ID that hits this must DEFER (keep its due flag)
+    /// rather than mark itself sent, while a hardware fault must still mark, or a faulted rig gets
+    /// key attempts at the 50 ms tick rate for the full 180 s watchdog window.
+    ///
+    /// `held_by` is a diagnostic only. The owner is the guard and the identity is the generation;
+    /// nothing decides anything from this string.
+    #[error("PTT already keyed by {held_by}")]
+    AlreadyKeyed { held_by: &'static str },
 }
 
 /// Error type for full rig CAT control operations.

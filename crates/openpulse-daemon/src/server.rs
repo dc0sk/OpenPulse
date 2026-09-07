@@ -709,6 +709,10 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
         && !id_callsign.is_empty()
         && !id_callsign.eq_ignore_ascii_case("N0CALL");
     let mut tx_frames_seen = engine.frames_transmitted();
+    // When the station ID was first deferred because another emission held the key (#1263).
+    // `Some` means a deferral is in progress; it logs once on entry and once on release, rather than
+    // every 50 ms tick.
+    let mut id_deferred_at: Option<u64> = None;
     if auto_id_active {
         tracing::info!(
             interval_s = cfg.station.auto_id_interval_secs,
@@ -1108,7 +1112,7 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                         // A skipped station ID is a §97.119 obligation not met, so it is logged at
                         // `error`: the operator has to know the station is transmitting without
                         // identifying, and this was previously silent (audit 2026-07-19, #8).
-                        match crate::keyed_transmit(
+                        let deferred = match crate::keyed_transmit(
                             &ptt,
                             Some(&handle.event_tx),
                             "station-id",
@@ -1118,28 +1122,63 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                                 })
                             },
                         ) {
-                            Ok(()) => tracing::info!(
-                                callsign = %id_callsign,
-                                mode = %id_mode,
-                                kind = reason,
-                                "transmitted station ID"
-                            ),
+                            Ok(()) => {
+                                tracing::info!(
+                                    callsign = %id_callsign,
+                                    mode = %id_mode,
+                                    kind = reason,
+                                    "transmitted station ID"
+                                );
+                                false
+                            }
                             // A refused assert is a §97.119 obligation NOT met — error, not warn.
-                            Err(crate::KeyedTxError::Assert) => tracing::error!(
-                                callsign = %id_callsign,
-                                kind = reason,
-                                "station ID NOT transmitted — PTT assert failed; §97.119 \
-                                 identification has not gone out"
-                            ),
-                            Err(crate::KeyedTxError::Transmit(e)) => tracing::warn!(
-                                error = %e, mode = %id_mode, "station-ID transmit failed"
-                            ),
+                            Err(crate::KeyedTxError::Assert) => {
+                                tracing::error!(
+                                    callsign = %id_callsign,
+                                    kind = reason,
+                                    "station ID NOT transmitted — PTT assert failed; §97.119 \
+                                     identification has not gone out"
+                                );
+                                false
+                            }
+                            Err(crate::KeyedTxError::Transmit(e)) => {
+                                tracing::warn!(
+                                    error = %e, mode = %id_mode, "station-ID transmit failed"
+                                );
+                                false
+                            }
+                            // Busy, not broken (#1263).
+                            Err(crate::KeyedTxError::AlreadyKeyed) => true,
+                        };
+
+                        // Advance on success and on FAULT — a persistent hardware fault is surfaced
+                        // by the error above, not by per-tick retry spam — but DEFER when the rig was
+                        // merely BUSY, or a station ID refused while another emission held the key
+                        // would skip a whole interval and the §97.119 obligation with it (#1263).
+                        //
+                        // The asymmetry is the point, and it is why `AlreadyKeyed` had to be its own
+                        // variant: deferring on `Assert` too would key-attempt a faulted rig at the
+                        // 50 ms tick rate for the entire 180 s watchdog window.
+                        if deferred {
+                            if id_deferred_at.is_none() {
+                                id_deferred_at = Some(now_ms);
+                                tracing::warn!(
+                                    callsign = %id_callsign,
+                                    kind = reason,
+                                    "station ID deferred — the transmitter is held by another \
+                                     emission; it goes out when the key is released"
+                                );
+                            }
+                        } else {
+                            if let Some(since) = id_deferred_at.take() {
+                                tracing::info!(
+                                    deferred_ms = now_ms.saturating_sub(since),
+                                    "deferred station ID transmitted"
+                                );
+                            }
+                            id_timer.mark_identified(now_ms);
+                            tx_frames_seen = engine.frames_transmitted();
                         }
-                        // Advance regardless of PTT success (a persistent hardware fault is surfaced by
-                        // the warning above, not by per-tick retry spam), and exclude the just-sent ID
-                        // frame from arming the next ID.
-                        id_timer.mark_identified(now_ms);
-                        tx_frames_seen = engine.frames_transmitted();
                     }
                 }
             }
@@ -1720,6 +1759,9 @@ fn ota_send_with_ptt(
         }) {
             Ok(()) => Ok(()),
             Err(crate::KeyedTxError::Assert) => return Some(OtaAttempt::Delivered),
+            // Busy, not broken (#1263): nothing went out, but the condition is transient, so retry
+            // the data frame rather than stopping as an assert fault does.
+            Err(crate::KeyedTxError::AlreadyKeyed) => return Some(OtaAttempt::Nack),
             Err(crate::KeyedTxError::Transmit(e)) => Err(e),
         };
 
