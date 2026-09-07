@@ -9,6 +9,56 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — #1062: doubling the preamble costs almost nothing on a fade (f13)
+
+- **Requirement/change:** #1062's unmeasured half. f7/f12 measured what length **buys** — the
+  idle-noise ρ ceiling falls ×0.68–0.73, matching 1/√T. This is the other side of the subtraction: a
+  longer **coherent** template spans more of the fade, so it scores delivered frames lower, and part
+  of the margin is spent before it can be banked. `DELIVERED_FRAME_RHO_BOUND = 0.50` was derived at
+  124 ms.
+- **Design decision — a construction with no premise to prove.** My first design was two channel
+  passes on the same seed, which needs "same seed ⇒ same fade" to hold across two waveform lengths.
+  The review established that it DOES hold for `moderate_f1` within a power-of-two bracket
+  (`continuous: false` → one-shot path; `doppler_envelope` draws `fft_size` Gaussians in the same
+  order; the 512-bin bracket holds n ≤ 81 600 at 8 kHz/1 Hz) — but a construction that needs no such
+  premise is better than one that has to prove it. f13 fades **one** buffer once and reads two
+  windows out of it.
+- **Same-END alignment, not same-start.** On a real 64-symbol wire the preamble *ends* where the data
+  begins, so the windows are `[L−1024, L+1024)` and `[L, L+1024)`. My same-start version would have
+  let the 64 window overlap a span the 32 never saw — biasing the comparison toward the template
+  under test.
+- **Result (400 seeds, 30 dB, 67 s):**
+
+  | template | min | p01 | p10 | median | miss rate, θ 0.40–0.55 |
+  |---|---|---|---|---|---|
+  | 32 sym (124 ms) | 0.665 | 0.693 | 0.870 | 0.965 | **0.000** everywhere |
+  | 64 sym (252 ms) | 0.630 | 0.679 | 0.794 | 0.950 | **0.000** everywhere |
+
+  The fade cost is **real but small, and lives in the tail exactly as the mechanism predicts** —
+  median −1.5 %, p10 −9 %, min −5 %, consistent with an in-window phase rotation costing coherence at
+  any SNR while a flat null costs ρ only through local SNR. It reaches **no** threshold the CFAR
+  stand-down uses: the worst window in 400 seeds still scores 0.630 against a top candidate of 0.55.
+- **The cheap arm was decisive, which is the process point.** The review's ordering put an
+  envelope-only arm before an f8-style unconditioned run before the conditioned decode sweep, on the
+  reasoning that unconditioned is the **pessimistic** side (it includes null windows no receiver
+  delivers). 0/400 upper-bounds the conditioned miss rate at 3/400 = 0.75 % (95 %), so the 1–1.5 h
+  decode sweep is confirmation rather than discovery. 67 seconds answered it.
+- **Scope, narrow on purpose:** envelope-only. It says nothing about whether a 64-symbol *receiver*
+  acquires correctly — only what the correlation would score — and it runs at 30 dB deliberately, to
+  isolate the coherence penalty from the noise penalty f7/f12 already measured in the other
+  direction.
+- **Fixture discipline applied to the NEW fixture rather than inherited.**
+  `f13_the_64_symbol_template_extends_the_shipped_one` runs in the default gate and asserts the
+  n = 64 template's first 31 symbols reproduce the shipped one (ρ > 0.999), that it yields
+  `PREAMBLE_SYMS − 1` symbols' worth per `bpsk_preamble_template`'s convention, and that at 2016
+  samples it stays **under** `MAX_PREAMBLE_CORRELATION_SAMPLES` — 32 samples of headroom, past which
+  the engine flips to the decimated DDC arm and the probe's ρ stops being the engine's ρ.
+- **A false doc-comment corrected in place.** `FadeThenFilter` claimed bit-identical samples were
+  needed because "the two signals differ in length, so the fade they see differs". That is false for
+  this channel within a bracket, and the ledger already carried the counter-evidence: f8 (52 480
+  samples) and veto-off f9 (66 560) both report min 0.618 in the same cell. The real reasons — the
+  whole-buffer Hilbert transform and RMS-scaled `noise_sigma` — are now stated instead.
+
 ## 2026-09-07 — #1062: a probe that measured the wrong sequence, and the assertion that now prevents it
 
 - **Requirement/change:** #1062 (the alternating preamble's time-bandwidth). The issue names its own

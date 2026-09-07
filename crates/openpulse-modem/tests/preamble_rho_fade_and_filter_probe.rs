@@ -1248,7 +1248,21 @@ fn f8_faded_frame_rho_tail() {
 /// Composing them here rather than filtering afterwards is what lets ρ and the decode verdict come
 /// from **bit-identical samples**: `route_tapped` returns the very buffer it hands the receiver.
 /// Measuring ρ on one realisation and decoding another seeded the same way is not the same
-/// experiment — the two signals differ in length, so the fade they see differs.
+/// experiment.
+///
+/// **CORRECTED 2026-09-07: the reason given here was wrong, and it would have misled the next
+/// design — it nearly misled mine.** It said "the two signals differ in length, so the fade they
+/// see differs". For `moderate_f1` that is false within a power-of-two bracket: `continuous: false`
+/// takes the one-shot path, and `doppler_envelope` draws `fft_size` complex Gaussians where
+/// `fft_size` is a power of two of `ceil(n/160)+2`, so two lengths in the same bracket consume the
+/// same draws in the same order and see an **identical** envelope from index 0. At 8 kHz / 1 Hz the
+/// 512-bin bracket holds n ≤ 81 600 (10.2 s); a 200-B RS frame is 66 560. The ledger already carried
+/// the evidence: `f8` (uncoded, 52 480 samples) and the veto-off `f9` (RS, 66 560) both report min
+/// **0.618** in the 1250–1750 cell — two different waveforms, same seeds, same preamble-window fade.
+///
+/// Bit-identical samples remain the right discipline, for the reasons that actually hold: the
+/// Hilbert transform is a whole-buffer FFT so the outputs differ everywhere once the inputs do, and
+/// `noise_sigma` is scaled by whole-buffer RMS, so padding one arm silently moves its SNR.
 struct FadeThenFilter {
     inner: WattersonChannel,
     lo: f32,
@@ -2013,4 +2027,196 @@ fn f12_does_length_help_the_alternating_preamble() {
     println!("  preamble buys no noise-floor margin. It is NOT a way around a wire change, NOT a");
     println!("  fix for #1060 (closed by #1157), and does not touch the onset-placement or");
     println!("  tone-on-a-line halves of #1062, which are duration-independent.");
+}
+
+// ── F13: what does DOUBLING the preamble cost on a fade? (#1062, the unmeasured half) ─────────
+//
+// f7/f12 measured what length BUYS: the idle-noise ρ ceiling falls ×0.68–0.73, matching 1/√T. This
+// is the other side of the subtraction, and without it the buy is arithmetic on one column: a longer
+// COHERENT template spans more of the fade, so it scores DELIVERED frames lower, and part of the
+// noise-side margin is spent before anyone can bank it. `DELIVERED_FRAME_RHO_BOUND = 0.50` was
+// derived at 124 ms.
+//
+// **The cheap arm, run first on purpose.** No modem, no decode, no receive timeout — fade the two
+// templates themselves at high SNR over many seeds and look at the ρ64/ρ32 ratio. Two reasons this
+// can settle it without the expensive conditioned run:
+//
+// * The mean penalty is derivable and small: with Gaussian shaping `R(τ) = exp(−(πστ)²)` at σ = 1 Hz
+//   gives R(0.124) = 0.86 and R(0.252) = 0.53, so the mean coherent-sum factor goes 0.975 → 0.907 —
+//   a 3.5 % amplitude penalty. **That is not the question.** The bound is set by a low quantile, and
+//   ρ is scale-normalised, so a flat null costs ρ only through local SNR while an in-window PHASE
+//   ROTATION costs coherence at any SNR. The rotation is the new mechanism at 252 ms, and it lives
+//   in the tail, not the mean.
+// * Unconditioned is the PESSIMISTIC side — it includes null frames no receiver would deliver — so
+//   a miss rate near zero here is an upper bound on the conditioned one and ends the question.
+//
+// **RESULT, 2026-09-07 (400 seeds, 30 dB, 67 s — not the 1–1.5 h a conditioned decode run costs):**
+//
+// ```text
+// template   n     min     p01     p10   median      miss rate at theta 0.40 .. 0.55
+// 32 sym   400   0.665   0.693   0.870   0.965      0.000 everywhere
+// 64 sym   400   0.630   0.679   0.794   0.950      0.000 everywhere
+// ```
+//
+// The fade cost of doubling is **real but small, and it lives in the tail exactly as the mechanism
+// predicts**: median −1.5 %, p10 −9 %, min −5 %. It reaches no threshold the stand-down decision
+// uses — the worst window in 400 seeds still scores 0.630 against a top candidate of 0.55.
+//
+// **Scope, stated narrowly.** Unconditioned is the pessimistic side, so 0/400 upper-bounds the
+// conditioned miss rate at 3/400 = 0.75 % (95 %), and the expensive decode run is confirmation
+// rather than discovery. But this is envelope-only: it says nothing about whether a 64-symbol
+// RECEIVER acquires correctly, only what the correlation would score. And it runs at 30 dB on
+// purpose, to isolate the COHERENCE penalty — the noise penalty is the other column, measured by
+// f7/f12, and it moves the other way.
+//
+// Same-END alignment, not same-start: on a real 64-symbol wire the preamble ENDS where the data
+// begins, so the 64 window is `[L−1024, L+1024)` against the 32's `[L, L+1024)`. Same start would
+// have let the 64 window overlap a span the 32 never saw, biasing the comparison toward it.
+
+/// The `--++` template for `n` preamble symbols, built by hand.
+///
+/// `bpsk_preamble_template` hardcodes `PREAMBLE_SYMS - 1`, so it cannot express n = 64; this takes
+/// the last `n-1` symbols' worth of a synthesised run, matching that function's convention.
+fn alt_template_n(mode: &str, n: usize) -> Vec<f32> {
+    let full = pn_template(mode, &shipped_preamble_symbols(n)).expect("template");
+    let per_sym = full.len() / n;
+    full[..per_sym * (n - 1)].to_vec()
+}
+
+/// Mechanical checks on the n=64 template, mirroring the n=32 assertion (#1062).
+///
+/// Not `#[ignore]`d: f12 measured a template the modem never transmits, and the lesson was that the
+/// fixture's fidelity has to be asserted where it runs by default. n=64 is a *new* fixture and gets
+/// the same treatment rather than inheriting trust from n=32.
+#[test]
+fn f13_the_64_symbol_template_extends_the_shipped_one() {
+    let t32 = alt_template_n("BPSK250", 32);
+    let t64 = alt_template_n("BPSK250", 64);
+    let per_sym = t32.len() / 31;
+
+    // The shipped run is period-4 and 32 bits leave the NRZI state where it started, so the second
+    // 32 symbols repeat the first — a 64-symbol preamble really is "32 more of the same".
+    let head = &t64[..per_sym * 31];
+    let r = rho_of(
+        &t32,
+        &{
+            let mut w = head.to_vec();
+            w.extend(std::iter::repeat_n(0.0f32, 64));
+            w
+        },
+        0.0,
+    )
+    .expect("correlation");
+    assert!(
+        r > 0.999,
+        "the 64-symbol template's first 31 symbols are not the shipped template (rho = {r:.4})"
+    );
+    assert_eq!(
+        t64.len(),
+        per_sym * 63,
+        "n=64 must yield 63 symbols' worth, matching bpsk_preamble_template's PREAMBLE_SYMS-1"
+    );
+    // 63 x 32 = 2016 sits 32 UNDER MAX_PREAMBLE_CORRELATION_SAMPLES (2048), so the engine still runs
+    // the passband correlator on it and this probe's rho remains the engine's rho. Anything longer
+    // flips it to the decimated DDC arm and the two stop being comparable.
+    assert!(
+        t64.len() < 2048,
+        "a 64-symbol template ({} samples) would cross MAX_PREAMBLE_CORRELATION_SAMPLES and change \
+         which correlator the engine uses",
+        t64.len()
+    );
+}
+
+#[test]
+#[ignore = "verification (#1062): the fade cost of doubling the preamble, envelope-only"]
+fn f13_fade_cost_of_doubling_the_preamble() {
+    let t32 = alt_template_n("BPSK250", 32);
+    let t64 = alt_template_n("BPSK250", 64);
+    let seeds: u64 = std::env::var("F13_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let snr: f32 = std::env::var("F13_SNR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30.0);
+
+    println!("\nF13: fade cost of 32 -> 64 preamble symbols, {seeds} seeds @ {snr} dB, same-END alignment");
+    println!(
+        "  unconditioned = the PESSIMISTIC side: it includes null windows no receiver delivers."
+    );
+
+    let lead = t64.len() - t32.len(); // the extra span the 64 template reaches back over
+    let mut r32: Vec<f32> = Vec::new();
+    let mut r64: Vec<f32> = Vec::new();
+    for seed in 0..seeds {
+        // ONE buffer, ONE fade: the 64 window is [0, len64) and the 32 window is [lead, len64), so
+        // they share an end and one noise realisation. Two passes would need "same seed => same
+        // fade" as a premise; this construction has no premise to prove.
+        let mut clean = t64.clone();
+        clean.extend(std::iter::repeat_n(0.0f32, 64)); // lag room for the correlator
+        let mut c = WattersonConfig::moderate_f1(Some(seed));
+        c.snr_db = snr;
+        let faded = WattersonChannel::new(c).expect("channel").apply(&clean);
+
+        if let Some(v) = rho_of(&t64, &faded, 20.0) {
+            r64.push(v);
+        }
+        if let Some(v) = rho_of(&t32, &faded[lead..], 20.0) {
+            r32.push(v);
+        }
+    }
+
+    let q = |v: &mut Vec<f32>, p: f32| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v[((v.len() as f32 - 1.0) * p).round() as usize]
+    };
+    let (mut a, mut b) = (r32.clone(), r64.clone());
+    println!(
+        "  {:<8} {:>6} {:>8} {:>8} {:>8} {:>8}",
+        "template", "n", "min", "p01", "p10", "median"
+    );
+    for (name, v) in [("32 sym", &mut a), ("64 sym", &mut b)] {
+        println!(
+            "  {name:<8} {:>6} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            v.len(),
+            q(v, 0.0),
+            q(v, 0.01),
+            q(v, 0.10),
+            q(v, 0.50)
+        );
+    }
+    // The decision input is a MISS RATE at a candidate threshold, not a ceiling: `stands_down` is
+    // `derived > bound`, and the bound is a level delivered frames exceed with a bounded miss rate.
+    println!("\n  miss rate at candidate bound theta (fraction of windows scoring BELOW it):");
+    println!(
+        "  {:<8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "template", "0.40", "0.44", "0.46", "0.48", "0.50", "0.55"
+    );
+    for (name, v) in [("32 sym", &r32), ("64 sym", &r64)] {
+        let miss = |t: f32| v.iter().filter(|&&x| x < t).count() as f32 / v.len().max(1) as f32;
+        println!(
+            "  {name:<8} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3}",
+            miss(0.40),
+            miss(0.44),
+            miss(0.46),
+            miss(0.48),
+            miss(0.50),
+            miss(0.55)
+        );
+    }
+    println!(
+        "\n  If the 64 miss rate at ~0.46 is ~0 here, the conditioned run is confirmation, not"
+    );
+    println!(
+        "  discovery — unconditioned already includes the null windows a receiver never delivers."
+    );
+    println!(
+        "\n  RESULT (400 seeds, 30 dB, 67 s): miss rate 0.000 at EVERY theta 0.40..0.55, both"
+    );
+    println!(
+        "  templates. Worst 64-sym window 0.630. The fade cost is real but small and lives in"
+    );
+    println!("  the tail as predicted (min -5%, p10 -9%, median -1.5%) — it does not reach the");
+    println!("  thresholds the CFAR stand-down decision uses.");
 }
