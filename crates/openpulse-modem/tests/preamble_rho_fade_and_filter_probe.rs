@@ -1642,3 +1642,195 @@ fn f10_skirt_sweep() {
     println!("  arrive, fit their effective shape factor and read the curve at that point — that");
     println!("  is what makes the model and the hardware the same axis instead of two facts.");
 }
+
+// ── F11: does spectral subtraction help frame DETECTION? (side-task, 2026-09-07) ──────────────
+//
+// The maintainer asked whether spectral-subtraction noise reduction could improve acquisition and
+// data extraction. The assessment declined it for the demod path on mechanism — under white Gaussian
+// noise the matched filter already computes the sufficient statistic and a half-wave-rectified
+// per-bin gain is non-invertible, so by data processing it cannot improve detection or SER there;
+// and for the amplitude-bearing rungs it is a fast bin-wise AGC, which this repo has already
+// measured flipping SCFDMA52-16QAM from 2/2 pass to 2/2 fail.
+//
+// The DETECTOR path was left open, because a real counter-mechanism exists: a weak preamble's few
+// spectral lines might survive while off-line noise is suppressed. This probe settles it.
+//
+// **The metric is ρ′ = ρ_noise / ρ_signal, never ρ_noise alone.** Three measurements in this repo
+// show that removing energy raises ρ on a noise-only capture — the DDC lowpass "raises ρ for signal
+// and noise alike, the noise by more" (`acquisition.rs`), a narrower rig filter moves idle ρ
+// 0.227 → 0.413 → 0.579 (#1060), and notching a birdie out of an idle capture RAISED ρ. ρ is a
+// ratio, so shrinking the denominator of a noise-only window flatters it. Anything that quotes an
+// absolute ρ improvement here is measuring the wrong thing, and the CFAR calibration (#1157)
+// absorbs a shift in ρ_noise anyway — only ρ′ can matter.
+//
+// Research harness: `#[ignore]`, asserts nothing, prints a table. It shares `rho_engine`,
+// `win_len` and `plugin_template` with every row above by reference, so its numbers are directly
+// comparable rather than produced by a re-transcribed correlator.
+
+/// Textbook magnitude spectral subtraction over an STFT, resynthesised by overlap-add.
+///
+/// `alpha` = over-subtraction factor, `beta` = spectral floor. Noise PSD is the per-bin 25th
+/// percentile across frames — the same estimator `noise_floor.rs` uses across bins, applied per bin,
+/// which is precisely the input the shipped scalar floor cannot provide.
+fn spectral_subtract(samples: &[f32], alpha: f32, beta: f32) -> Vec<f32> {
+    use rustfft::{num_complex::Complex32, FftPlanner};
+    const N: usize = 512;
+    const HOP: usize = N / 2;
+    if samples.len() < N {
+        return samples.to_vec();
+    }
+    let win: Vec<f32> = (0..N)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / N as f32).cos())
+        .collect();
+    let mut planner = FftPlanner::<f32>::new();
+    let fwd = planner.plan_fft_forward(N);
+    let inv = planner.plan_fft_inverse(N);
+
+    // Pass 1: per-bin magnitude history.
+    let frames: Vec<Vec<Complex32>> = (0..)
+        .map(|k| k * HOP)
+        .take_while(|&s| s + N <= samples.len())
+        .map(|s| {
+            let mut buf: Vec<Complex32> = (0..N)
+                .map(|i| Complex32::new(samples[s + i] * win[i], 0.0))
+                .collect();
+            fwd.process(&mut buf);
+            buf
+        })
+        .collect();
+    let mut noise_mag = vec![0.0f32; N];
+    for (bin, nm) in noise_mag.iter_mut().enumerate() {
+        let mut col: Vec<f32> = frames.iter().map(|f| f[bin].norm()).collect();
+        col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        *nm = col[col.len() / 4]; // 25th percentile
+    }
+
+    // Pass 2: subtract, floor, resynthesise.
+    let mut out = vec![0.0f32; samples.len()];
+    let mut wsum = vec![0.0f32; samples.len()];
+    for (k, f) in frames.iter().enumerate() {
+        let s = k * HOP;
+        let mut buf: Vec<Complex32> = f
+            .iter()
+            .enumerate()
+            .map(|(bin, c)| {
+                let mag = c.norm();
+                let kept = (mag - alpha * noise_mag[bin]).max(beta * mag);
+                if mag > 1e-12 {
+                    c * (kept / mag)
+                } else {
+                    *c
+                }
+            })
+            .collect();
+        inv.process(&mut buf);
+        for i in 0..N {
+            out[s + i] += buf[i].re / N as f32 * win[i];
+            wsum[s + i] += win[i] * win[i];
+        }
+    }
+    for (o, w) in out.iter_mut().zip(wsum.iter()) {
+        if *w > 1e-6 {
+            *o /= *w;
+        }
+    }
+    out
+}
+
+/// **RESULT, measured 2026-09-07 — spectral subtraction makes detection WORSE. 12 of 12 cells.**
+///
+/// ```text
+/// capture                     baseline rho'   best rho' after   delta
+/// ic9700-idle-wide-500hz       0.241           0.269            +0.027
+/// ic9700-idle-500hz            0.438           0.498            +0.059
+/// ic9700-idle-250hz            0.615           0.681            +0.067
+/// ```
+///
+/// Both kill criteria fire on every capture and every (alpha, beta): rho' RISES, and peak rho_noise
+/// rises with it (0.413 -> 0.524 at 500 Hz; 0.579 -> 0.648 at 250 Hz). More over-subtraction is
+/// monotonically worse (alpha=2 beats alpha=1 nowhere).
+///
+/// **The mechanism is in the numbers.** `rho_signal` barely moves (0.941 -> 0.936 at worst), so the
+/// entire effect is on the noise side. Half-wave rectification keeps the exponential tail and
+/// sparsifies broadband noise into tone-like survivors; when one lands on the alternating preamble's
+/// few spectral lines, rho jumps — the same reason a lone tone already scores rho ~0.70 against this
+/// template (#1062). Subtraction MANUFACTURES tones out of noise, which is precisely the input this
+/// detector is worst against.
+///
+/// **Scope of the elimination — do not over-read it.** What is refuted is *magnitude spectral
+/// subtraction as a pre-detector stage for the alternating BPSK preamble, on these three rig
+/// captures*. It is NOT a refutation of: noise reduction in general; a *linear* pre-whitening filter
+/// (which preserves Gaussianity and would leave rho' unchanged under WGN by construction, so it is
+/// uninteresting for a different reason); a time-domain blanker for impulsive QRN, which this probe
+/// says nothing about; or WSJT-X-style successive cancellation of already-DECODED signals, which is
+/// an unrelated technique that happens to share the word "subtraction".
+///
+/// The demod path was declined on mechanism without measurement and stays declined: a per-bin
+/// per-frame gain is a fast bin-wise AGC, and a milder version of that already flipped
+/// SCFDMA52-16QAM from 2/2 pass to 2/2 fail (CLAUDE.md, "A rig setting you did not verify").
+///
+/// Consistent with the operator rule already in the tree: `onair-signal-chain-verification.md` sets
+/// rig DSP NR **off** ("distorts BPSK signal") and `run-onair-ic9700-ft991a.sh` clears NR/NB by CAT
+/// before every run. Same algorithm family; this puts a number on it.
+#[test]
+#[ignore = "research harness (side-task 2026-09-07): asserts nothing, prints the rho' table. \
+            RESULT: rho' rises on all 3 captures x 4 params — spectral subtraction makes frame \
+            detection worse. Kept so the elimination travels with its apparatus."]
+fn f11_does_spectral_subtraction_lower_rho_prime() {
+    const MODE: &str = "BPSK250";
+    let params = [(1.0f32, 0.10f32), (1.0, 0.01), (2.0, 0.10), (2.0, 0.01)];
+
+    println!("\n=== F11: spectral subtraction, detector path ===");
+    println!("metric is rho' = rho_noise / rho_signal; lower is better. rho_noise ALONE is not the metric.\n");
+
+    // ρ_signal: a real on-air frame capture.
+    let signal = match load_corpus("ic9700-frame-bpsk250-rs-whitened.wav") {
+        Ok(c) => c.samples,
+        Err(e) => {
+            println!("  signal capture unavailable ({e}); cannot form rho' — aborting");
+            return;
+        }
+    };
+
+    for noise_name in [
+        "ic9700-idle-wide-500hz-control.wav",
+        "ic9700-idle-500hz.wav",
+        "ic9700-idle-250hz.wav",
+    ] {
+        let noise = match load_corpus(noise_name) {
+            Ok(c) => c.samples,
+            Err(e) => {
+                println!("  {noise_name}: unavailable ({e})");
+                continue;
+            }
+        };
+        let base_n = peak_rho_over_capture(MODE, &noise);
+        let base_s = peak_rho_over_capture(MODE, &signal);
+        let (Some(bn), Some(bs)) = (base_n, base_s) else {
+            println!("  {noise_name}: no rho (no template?)");
+            continue;
+        };
+        println!("  {noise_name}");
+        println!(
+            "    baseline          rho_noise={bn:.3}  rho_signal={bs:.3}  rho'={:.3}",
+            bn / bs
+        );
+        for (alpha, beta) in params {
+            let sn = peak_rho_over_capture(MODE, &spectral_subtract(&noise, alpha, beta));
+            let ss = peak_rho_over_capture(MODE, &spectral_subtract(&signal, alpha, beta));
+            match (sn, ss) {
+                (Some(n), Some(s)) => println!(
+                    "    a={alpha:.0} b={beta:.2}       rho_noise={n:.3}  rho_signal={s:.3}  \
+                     rho'={:.3}   (delta rho' {:+.3})",
+                    n / s,
+                    n / s - bn / bs
+                ),
+                _ => println!("    a={alpha:.0} b={beta:.2}       no rho"),
+            }
+        }
+    }
+    println!("\nKill criterion: rho' not lower than baseline, or peak rho_noise RISES.");
+    println!(
+        "Keep criterion: rho' falls by ~0.7x — what doubling the preamble duration buys (f7).\n"
+    );
+}
