@@ -245,9 +245,12 @@ impl SharedPtt {
     /// no-op rather than releasing whoever keyed next.
     pub fn force_release(&self, observer: Option<&Arc<dyn PttObserver>>) -> UnkeyOutcome {
         let mut g = self.lock();
-        if g.asserted_at.is_none() {
-            return UnkeyOutcome::NotKeyed;
-        }
+        // The hardware release is attempted UNCONDITIONALLY — deliberately, and unlike `unkey`.
+        // This is the operator's override, and it must not be gated on the daemon's BELIEF about the
+        // state: that belief can be wrong (a rig left keyed by VOX, by a previous process, or by a
+        // release this daemon thinks succeeded), which is the same reason the watchdog exists. An
+        // override that only works when we already agree the rig is keyed is not an override.
+        let armed = g.asserted_at.is_some();
         if let Some(ptt) = g.controller.as_mut() {
             if let Err(e) = ptt.release_ptt() {
                 tracing::warn!(error = %e, "forced PTT release failed; leaving the watchdog armed");
@@ -259,6 +262,12 @@ impl SharedPtt {
         g.stuck_warned = false;
         g.generation = g.generation.wrapping_add(1);
         g.held_by = "nobody";
+        if !armed {
+            // The hardware was released anyway (see above), but there was no logical transition, so
+            // no event — emitting `false` for a state nobody was in is the spurious-edge class #836
+            // exists to prevent.
+            return UnkeyOutcome::NotKeyed;
+        }
         if displaced != "manual" {
             tracing::warn!(
                 displaced,
@@ -972,12 +981,34 @@ mod ownership_token_tests {
         assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
-    /// Forcing an idle transmitter is a no-op, not a spurious hardware release.
+    /// Forcing an idle transmitter still hits the hardware, but reports no transition.
+    ///
+    /// The two halves are deliberate and pull in opposite directions:
+    ///
+    /// * **The hardware release is unconditional**, because the daemon's belief about the state can
+    ///   be WRONG — a rig left keyed by VOX, by a previous process, or by a release this daemon
+    ///   thinks succeeded. That is the same reason the watchdog exists, and an override that only
+    ///   works when we already agree the rig is keyed is not an override.
+    /// * **No event and `NotKeyed`**, because there was no logical transition, and emitting `false`
+    ///   for a state nobody was in is the spurious-edge class #836 exists to prevent.
+    ///
+    /// This test asserted the opposite when first written (no hardware call at all). It was changed
+    /// deliberately after the daemon's `ptt_command_guard_reports_hardware_failure_to_skip_dispatch`
+    /// showed that gating the override on our own state model silently dropped the "a failed release
+    /// reports hard failure" contract — a changed intent, not a test bent to fit.
     #[test]
-    fn a_force_release_with_nothing_keyed_does_nothing() {
+    fn a_force_release_with_nothing_keyed_still_releases_the_hardware() {
         let (p, _a, releases) = ptt(Duration::from_secs(180));
-        assert_eq!(p.force_release(None), UnkeyOutcome::NotKeyed);
-        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            p.force_release(None),
+            UnkeyOutcome::NotKeyed,
+            "no logical transition, so no event"
+        );
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            1,
+            "the hardware release must be attempted anyway — the operator's override cannot be              gated on the daemon believing the rig is keyed"
+        );
     }
 
     /// After any release the holder label is cleared, so nothing can be "held by" a finished key.

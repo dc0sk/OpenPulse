@@ -78,6 +78,22 @@ impl SharedPtt {
         self.0.hw_assert()
     }
 
+    /// Key as the operator's manual hold (#1263) — an owned key, so an automatic emission arriving
+    /// mid-hold is refused rather than stealing the deadline.
+    pub fn key_as_manual(&self) -> Result<(), PttError> {
+        self.0.key_as("manual", None)
+    }
+
+    /// Who holds the key, for diagnostics (#1263).
+    pub fn held_by(&self) -> &'static str {
+        self.0.held_by()
+    }
+
+    /// The operator's hard override (#1263): release whoever holds the key.
+    pub fn force_release_manual(&self) -> openpulse_radio::shared_ptt::UnkeyOutcome {
+        self.0.force_release(None)
+    }
+
     /// Hardware release only — no deadline change, no event.
     pub fn hw_release(&self) -> Result<(), PttError> {
         self.0.hw_release()

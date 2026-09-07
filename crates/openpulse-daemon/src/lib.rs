@@ -2186,13 +2186,18 @@ pub async fn apply_command_to_engine(
             }
         }
         ControlCommand::PttAssert => {
-            // The hardware key happens in the server's `handle_ptt_command`; here we arm the watchdog
-            // deadline and announce the logical edge. The independent watchdog thread reads this arm.
-            runtime_state.ptt.arm();
+            // #1263: `handle_ptt_command` now takes an OWNED key (`key_as_manual`), which arms the
+            // watchdog itself — so the separate `arm()` that used to live here is gone. Re-arming
+            // would also have defeated the idempotence the assert path needs: a second `ptt-assert`
+            // must not push the 180 s deadline out, or re-asserting every 170 s never expires.
+            //
+            // This arm is reached only when the key was actually taken (a hard failure sets
+            // `ptt_hard_failed` and skips the dispatch), so the edge is announced here as before.
             let _ = event_tx.send(ControlEvent::PttChanged { active: true });
         }
         ControlCommand::PttRelease => {
-            runtime_state.ptt.disarm();
+            // The hardware release and disarm both happen in `force_release_manual` — the operator's
+            // hard override, which drops the transmitter whoever holds it (#1263).
             let _ = event_tx.send(ControlEvent::PttChanged { active: false });
         }
         ControlCommand::ConnectPeer { callsign } => {
@@ -3190,8 +3195,18 @@ mod command_apply_tests {
         let ev = Arc::new(tx);
         let mut rs = RuntimeControlState::default();
 
+        // The manual path is split across two functions in production, and #1263 moved the arming
+        // from this one to the other: `handle_ptt_command` (in `server.rs`) takes the OWNED key —
+        // hardware assert plus watchdog arm — and `apply_command_to_engine` announces the edge. This
+        // test used to call `apply` alone and assert `is_keyed()`, which meant it was exercising a
+        // half-path that armed the watchdog with no hardware behind it. Driving both halves here is
+        // more faithful; the hardware/refusal half has its own test in `server.rs`.
+        rs.ptt.key_as_manual().expect("manual key");
         apply(ControlCommand::PttAssert, &mut engine, &mut rs, &ev).await;
         assert!(rs.ptt.is_keyed());
+        assert_eq!(rs.ptt.held_by(), "manual");
+
+        rs.ptt.force_release_manual();
         apply(ControlCommand::PttRelease, &mut engine, &mut rs, &ev).await;
         assert!(!rs.ptt.is_keyed());
 

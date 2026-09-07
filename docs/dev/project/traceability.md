@@ -47,6 +47,27 @@ and the actually-observed results per change.
   timer. Restored by `sha256sum`. Full `scripts/gate.sh` verdict in the PR.
 - **OTA send retries on busy** (`OtaAttempt::Nack`) rather than stopping as it does on an assert
   fault: nothing went out, but the condition is transient.
+- **The ratchet refused the half-done version, correctly.** `REACH: FAIL — force_release, key_as have
+  no production caller`: I had built the mechanism and deferred wiring the manual path to it. That
+  deferral was not coherent — an override with no caller is the defined-but-not-consumed shape — so
+  the manual path is migrated here: `PttAssert` takes an owned key labelled `manual` (idempotent, so
+  a second assert does not re-arm and defeat the 180 s watchdog) and `PttRelease` calls
+  `force_release`.
+- **Two contracts I changed silently, both caught by tests that already existed.** (1) A failed
+  hardware *release* must report hard failure so the dispatch is skipped (#836); my first
+  `force_release_manual` swallowed the `UnkeyOutcome`. (2) `ptt_commands_track_state_and_emit_changed`
+  drove `apply` alone and asserted `is_keyed()` — which, once the arming moved to the hardware call,
+  meant it had been exercising a half-path that armed the watchdog with no rig behind it. Both are
+  the #1258 `"none"`-drift shape: a mechanism swap quietly altering a caller's contract.
+- **The operator's override does NOT consult our own state model, and that is deliberate.** The
+  hardware release is attempted unconditionally, because the daemon's belief that nothing is keyed
+  can be wrong — a rig left keyed by VOX, by a previous process, or by a release we think succeeded
+  — which is the same reason the watchdog exists. It still returns `NotKeyed` and emits nothing when
+  no logical transition occurred, so #836's spurious-edge property holds. The radio-side test that
+  asserted the opposite was rewritten with the reason recorded: a changed intent, not a test bent to
+  fit.
+- **A refused `PttAssert` now reaches the client** as a `CommandError`. The CLI's one-shot sender
+  prints `ok` for anything else, so an operator whose key was refused would have been told it worked.
 
 ## 2026-09-06 — A PTT guard releases only the key it took (#1263, PR-1)
 

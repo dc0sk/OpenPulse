@@ -733,7 +733,7 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                 // the borrow of ptt_controller doesn't cross the await point.
                 // If the hardware call fails, skip the engine dispatch to avoid emitting a spurious
                 // PttChanged event that would tell clients PTT is active when it is not.
-                let ptt_hard_failed = handle_ptt_command(&cmd, &ptt);
+                let ptt_hard_failed = handle_ptt_command(&cmd, &ptt, &handle.event_tx);
                 // OTA ISS send with real-radio PTT turnaround: when a session is
                 // active, a SendMessage drives the receiver-led OTA send here (where
                 // the PTT controller lives) — key PTT for the data frame, release it,
@@ -1633,17 +1633,63 @@ fn transmit_beacon_with_ptt(
 /// Returns `true` when the hardware call failed (a stuck/absent rig): the caller then skips the
 /// engine dispatch so no spurious `PttChanged` tells clients PTT is active when it is not. Any other
 /// command (or no controller) is a no-op returning `false`.
-fn handle_ptt_command(cmd: &crate::Command, ptt: &crate::ptt::SharedPtt) -> bool {
+fn handle_ptt_command(
+    cmd: &crate::Command,
+    ptt: &crate::ptt::SharedPtt,
+    event_tx: &tokio::sync::broadcast::Sender<crate::protocol::ControlEvent>,
+) -> bool {
     // Hardware only: the watchdog arm/disarm and the `PttChanged` edge for a manual command are
     // applied in `apply_command_to_engine` (the `PttAssert`/`PttRelease` arms). Keeping this
     // HW-only preserves the #836 contract — a hard failure here skips that dispatch entirely.
     let (result, action) = match cmd {
-        crate::Command::PttAssert => (ptt.hw_assert(), "assert"),
-        crate::Command::PttRelease => (ptt.hw_release(), "release"),
+        // #1263: the operator's key is an OWNED key now, labelled `manual`, so an automatic
+        // emission arriving mid-hold is refused instead of stealing the deadline — and, critically,
+        // its guard's drop can no longer release the operator's carrier.
+        crate::Command::PttAssert => (
+            match ptt.key_as_manual() {
+                // Already keyed BY THE OPERATOR is idempotent — a second `ptt-assert` must not
+                // re-arm, or re-asserting every 170 s would defeat the 180 s watchdog.
+                Err(openpulse_radio::PttError::AlreadyKeyed { held_by: "manual" }) => Ok(()),
+                other => other,
+            },
+            "assert",
+        ),
+        // The operator's HARD OVERRIDE, kept deliberately (maintainer decision, #1263): this drops
+        // the transmitter whoever holds it. Without it an operator watching a runaway automatic
+        // burst would have to wait out the full 180 s watchdog. `force_release` bumps the key
+        // generation, so the displaced holder's guard cannot later release somebody else's key.
+        crate::Command::PttRelease => {
+            // Preserve the #836 contract: a hardware release that FAILS must report hard failure so
+            // the caller skips the dispatch and no `PttChanged{false}` claims a state the rig never
+            // reached. `force_release` leaves the watchdog armed in that case, so it retries.
+            // (`ptt_command_guard_reports_hardware_failure_to_skip_dispatch` caught this when the
+            // first version of this arm swallowed the outcome — the same shape as #1258's `"none"`
+            // drift: a mechanism swap quietly changing a caller's contract.)
+            let outcome = ptt.force_release_manual();
+            let r = match outcome {
+                openpulse_radio::shared_ptt::UnkeyOutcome::Failed => Err(
+                    openpulse_radio::PttError::Serial("hardware release failed".into()),
+                ),
+                _ => Ok(()),
+            };
+            (r, "release")
+        }
         _ => return false,
     };
     if let Err(e) = result {
-        tracing::warn!("PTT {action} failed: {e}");
+        // A refused assert must REACH the client (#1263). The CLI's one-shot sender prints `ok`
+        // for anything that is not a `CommandError`, so an operator whose key was refused because
+        // an automatic emission held the transmitter would otherwise be told it succeeded.
+        let refused = matches!(e, openpulse_radio::PttError::AlreadyKeyed { .. });
+        if refused {
+            tracing::info!("PTT {action} refused: {e}");
+        } else {
+            tracing::warn!("PTT {action} failed: {e}");
+        }
+        let _ = event_tx.send(crate::protocol::ControlEvent::CommandError {
+            command: format!("ptt_{action}"),
+            reason: e.to_string(),
+        });
         return true;
     }
     false
@@ -2505,12 +2551,13 @@ mod discovery_tick_tests {
             })),
             crate::ptt::DEFAULT_PTT_MAX,
         );
+        let (ev, _rx) = tokio::sync::broadcast::channel(16);
         assert!(
-            handle_ptt_command(&Command::PttAssert, &failing),
+            handle_ptt_command(&Command::PttAssert, &failing, &ev),
             "a failed assert must report hard failure"
         );
         assert!(
-            handle_ptt_command(&Command::PttRelease, &failing),
+            handle_ptt_command(&Command::PttRelease, &failing, &ev),
             "a failed release must report hard failure"
         );
 
@@ -2519,13 +2566,14 @@ mod discovery_tick_tests {
             Some(Box::new(FlakyPtt::default())),
             crate::ptt::DEFAULT_PTT_MAX,
         );
-        assert!(!handle_ptt_command(&Command::PttAssert, &ok));
-        assert!(!handle_ptt_command(&Command::PttRelease, &ok));
+        assert!(!handle_ptt_command(&Command::PttAssert, &ok, &ev));
+        assert!(!handle_ptt_command(&Command::PttRelease, &ok, &ev));
 
         // Non-PTT commands and the no-controller case are always no-op passes.
         assert!(!handle_ptt_command(
             &Command::PttAssert,
-            &crate::ptt::SharedPtt::default()
+            &crate::ptt::SharedPtt::default(),
+            &ev
         ));
         assert!(!handle_ptt_command(
             &Command::GetConfig,
@@ -2535,7 +2583,8 @@ mod discovery_tick_tests {
                     fail_release: true,
                 })),
                 crate::ptt::DEFAULT_PTT_MAX,
-            )
+            ),
+            &ev
         ));
     }
 
