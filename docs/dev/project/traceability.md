@@ -9,6 +9,54 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-07 — An unusable PTT backend refuses every emission and keeps retrying (#1285)
+
+- **Requirement/change:** #1285. The root defect was **not** the refuse-vs-warn policy question the
+  issue was filed on: `build_ptt_controller` collapsed *every* failure to `None`, and
+  `SharedPtt::key` skips the hardware assert entirely when there is no controller — so it
+  **succeeds**, arms the watchdog, and the caller transmits. `ptt_backend = "none"` (the operator
+  wants VOX or a manual key) and "rigctld is down" were the same state, and in the second the daemon
+  played audio into an unkeyed rig believing it had transmitted.
+- **The maintainer's original ruling was right but incomplete, and completing it is the fix.** Refuse
+  on a config error, because a typo cannot self-heal and failing fast costs nothing. But
+  warn-and-continue for a connect failure leaves the *identical harm* — silent non-transmission —
+  standing; the ruling separated the two cases by **fixability**, not by consequence. So the
+  connect case now starts, refuses every emission, and keeps retrying.
+- **Refusing makes the EXISTING machinery correct, with no new policy.** `keyed_transmit` already
+  skips an emission whose assert fails, so nothing is radiated unkeyed; and the failure is an
+  `Assert`-class fault rather than `AlreadyKeyed`, so the station ID **marks** rather than defers and
+  a dead rig is not re-attempted at the 50 ms tick rate (#1263 F3). A test pins that distinction,
+  because if it ever flipped the ID would defer for the whole 180 s watchdog window.
+- **Design decision — the retry lives INSIDE the controller.** The first design was a background
+  thread hot-swapping `SharedPtt`'s controller field; that is worse, because the field sits behind
+  the same mutex the watchdog takes, and the watchdog is the one path that must stay preemptible.
+  `RetryingPtt` reconnects lazily at the moment an emission wants the transmitter — exactly when it
+  matters — rate-limited to one connect attempt per 5 s, with no thread, no lock surgery and no
+  watchdog interaction. A live controller that fails mid-session is dropped so the next emission
+  reconnects rather than keying a handle the rig no longer honours.
+- **A distinction the issue did not have: malformed vs absent.** `parse_gpio_spec` reported a
+  *malformed* spec as `PttError::Serial`, which would now be retried forever. A spec that cannot
+  parse can never self-heal, so it is `Config` and refuses startup — while a well-formed spec whose
+  device is simply missing stays transient, because a **USB CM108 adapter can be plugged in after
+  the daemon starts**. That is why the CM108 case retries rather than refusing.
+- **Tests:** four in `retry_tests` — an unreachable backend refuses the key; **`"none"` still keys**
+  (the control, without which a build that refused everything would pass the first assertion while
+  breaking every VOX station); the retry is rate-limited; and the refusal is not mistaken for a busy
+  rig. Plus the two daemon selector tests, rewritten.
+- **Two existing tests asserted the OLD fail-open, and were changed as a matter of intent rather than
+  bent to fit.** `cm108_with_a_missing_device_is_a_graceful_noop` asserted `is_none()` — "disables
+  PTT, not a crash" — and `None` is precisely the state that permits an unkeyed transmit. "Gracefully
+  disabled" *was* the defect. Both now assert the refusing behaviour and say why in the test.
+- **Test results:** 4/4 new pass; the key one **fails against the restored fail-open** with `an
+  unreachable PTT backend must REFUSE the key`, while the `"none"` control keeps passing, so the
+  failure is attributable to the conflation rather than to a blanket refusal. Restored by
+  `sha256sum`. Radio 54 + 11 + 10, daemon/ARDOP/KISS/CLI all green, clippy clean, `REACH`/`TRACE`
+  pass. Full `scripts/gate.sh` verdict in the PR.
+- **Left as-is, flagged:** the OTA send returns `Delivered` on an `Assert` fault, i.e. stops
+  retrying. With a dead rig that is arguably right — do not burn the retry budget — but it reports a
+  frame as delivered that never went out. Pre-existing, and now reachable more often; worth its own
+  issue rather than a silent change here.
+
 ## 2026-09-07 — #1062: doubling the preamble costs almost nothing on a fade (f13)
 
 - **Requirement/change:** #1062's unmeasured half. f7/f12 measured what length **buys** — the

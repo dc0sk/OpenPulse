@@ -19,7 +19,11 @@ trait PttLine: Send {
 /// Parse a `chip:line[:active_low]` spec into `(chip, line_offset, active_low)`.
 fn parse_gpio_spec(spec: &str) -> Result<(String, u32, bool), PttError> {
     let bad = || {
-        PttError::Serial(format!(
+        // Config, not Serial (#1285): a spec that does not PARSE can never self-heal, so it must
+        // refuse startup rather than be retried forever. A well-formed spec whose device is simply
+        // absent is the opposite case — a USB adapter can be plugged in later — and stays a
+        // transient error the retrying controller keeps attempting.
+        PttError::Config(format!(
             "GPIO spec '{spec}' must be chip:line[:active_low], e.g. gpiochip0:17"
         ))
     };

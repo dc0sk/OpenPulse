@@ -520,6 +520,28 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
         }
     }
 
+    // #1285: refuse to start on a PTT CONFIG error, matching what this daemon already does for the
+    // station key, the [qsy] policy and the trust store. A mistyped `ptt_backend = "rigctl"` used to
+    // warn, start, and then transmit into an unkeyed rig — with `ota_enabled` the daemon opens an OTA
+    // session at launch. A typo cannot self-heal, so failing fast costs nothing and there is no
+    // startup-ordering trap; an unreachable-but-real backend is handled the other way, inside
+    // `build_ptt_controller`.
+    if !cfg.modem.ptt_backend.is_empty() && cfg.modem.ptt_backend != "none" {
+        if let Err(openpulse_radio::PttError::Config(why)) =
+            openpulse_radio::ptt_builder::build_ptt(&openpulse_radio::ptt_builder::PttSpec {
+                backend: &cfg.modem.ptt_backend,
+                rigctld_addr: &cfg.radio.rigctld_addr,
+                device: &cfg.modem.ptt_device,
+                gpio_pin: cfg.modem.ptt_gpio,
+            })
+        {
+            return Err(format!(
+                "[modem] ptt_backend is unusable; refusing to start rather than transmit into an \
+                 unkeyed rig — fix [modem] in config: {why}"
+            ));
+        }
+    }
+
     let ptt_controller: Option<Box<dyn PttController + Send>> = build_ptt_controller(
         &cfg.modem.ptt_backend,
         &cfg.radio.rigctld_addr,
@@ -2040,21 +2062,42 @@ fn build_ptt_controller(
     // PTT" and "the PTT the operator asked for is unusable" the same state, so a mistyped
     // `ptt_backend` starts a daemon that transmits into an unkeyed rig. Fixed in #1285, separately
     // and on purpose: a deduplication must not quietly alter a caller's contract.
-    match openpulse_radio::ptt_builder::build_ptt(&openpulse_radio::ptt_builder::PttSpec {
+    let spec = openpulse_radio::ptt_builder::PttSpec {
         backend,
         rigctld_addr,
         device: ptt_device,
         gpio_pin: ptt_gpio,
-    }) {
-        // `"none"` mapped to `Some(NoOpPtt)` here before, NOT to `None` — and `SharedPtt` is handed
-        // the result, so the two are not interchangeable. Preserved deliberately; the daemon's own
-        // `none_and_vox_build_a_controller` test caught the drift when this adapter first returned
-        // the builder's `Ok(None)` straight through, which is what that test is for.
+    };
+    match openpulse_radio::ptt_builder::build_ptt(&spec) {
+        // `"none"` maps to `Some(NoOpPtt)`, NOT to `None` — `SharedPtt` is handed the result and the
+        // two are not interchangeable. The daemon's own `none_and_vox_build_a_controller` test caught
+        // the drift when this adapter first passed the builder's `Ok(None)` straight through.
         Ok(None) => Some(openpulse_radio::ptt_builder::no_ptt()),
         Ok(ctrl) => ctrl,
+        // A CONFIG error cannot self-heal: an unknown backend name or a feature that is not compiled
+        // in is a typo the operator must fix, so the caller refuses to start (#1285). Returning
+        // `None` here would be the old fail-open, and `None` means "key succeeds, transmit" —
+        // which is how a mistyped `ptt_backend` came to play audio into an unkeyed rig.
+        Err(openpulse_radio::PttError::Config(_)) => None,
+        // A REAL backend that is merely unreachable gets a controller that refuses every key and
+        // keeps trying (#1285). It must not collapse to `None`: the rig may simply not be powered up
+        // yet, and refusing to start would make the daemon lose a systemd ordering race — but
+        // carrying on with no controller would transmit unkeyed, which is the same harm the config
+        // case has and the reason "warn and continue" was not enough on its own.
         Err(e) => {
-            tracing::warn!(backend, error = %e, "PTT unavailable; PTT commands will be no-ops");
-            None
+            tracing::warn!(
+                backend,
+                error = %e,
+                "PTT backend unreachable; every emission will be REFUSED until it reconnects"
+            );
+            Some(Box::new(openpulse_radio::ptt_builder::RetryingPtt::new(
+                openpulse_radio::ptt_builder::OwnedPttSpec {
+                    backend: backend.to_string(),
+                    rigctld_addr: rigctld_addr.to_string(),
+                    device: ptt_device.to_string(),
+                    gpio_pin: ptt_gpio,
+                },
+            )))
         }
     }
 }
@@ -2136,23 +2179,36 @@ mod ptt_selector_tests {
         assert!(build_ptt_controller("vox", "", "", 3).is_some());
     }
 
+    /// A device that is MISSING may appear later, so it refuses and retries rather than disabling.
+    ///
+    /// **CHANGED INTENT at #1285, not a test bent to fit.** This asserted `is_none()` — "disables
+    /// PTT, not a crash" — and `None` is precisely the state in which `SharedPtt::key` skips the
+    /// hardware assert, succeeds, and lets the caller transmit. So "gracefully disabled" meant the
+    /// daemon played audio into an unkeyed rig believing it had transmitted. A CM108 adapter is USB:
+    /// it can be plugged in after the daemon starts, which is why this is the retrying case and not
+    /// the refuse-to-start case.
     #[test]
-    fn cm108_with_a_missing_device_is_a_graceful_noop() {
-        // The daemon selector reaches the cm108 arm and, on open failure, returns None (PTT disabled)
-        // rather than erroring — the daemon must keep running with no PTT.
+    fn cm108_with_a_missing_device_refuses_and_retries() {
         let ctrl = build_ptt_controller("cm108", "", "/dev/nonexistent-openpulse-hidraw-xyz", 3);
+        let mut ctrl = ctrl.expect("a missing device must yield a REFUSING controller, not None");
         assert!(
-            ctrl.is_none(),
-            "a missing CM108 device disables PTT, not a crash"
+            ctrl.assert_ptt().is_err(),
+            "a missing CM108 device must refuse the key — None would have permitted an unkeyed \
+             transmit, which is the #1285 defect"
         );
     }
 
+    /// A spec that cannot PARSE refuses at startup; a device that is merely absent retries.
     #[test]
-    fn gpio_with_a_bad_spec_or_no_feature_is_a_graceful_noop() {
-        // With the `gpio` feature off, GpioPtt::open reports not-compiled-in; with it on, the bad spec /
-        // missing chip fails. Either way the daemon selector returns None (PTT disabled), never a crash.
+    fn a_malformed_gpio_spec_refuses_startup_but_an_absent_chip_retries() {
+        // Unparseable, or the feature is not compiled in: a config error, which cannot self-heal,
+        // so the selector returns None and `run` refuses to start on it.
+        assert!(
+            build_ptt_controller("gpio", "", "not-a-valid-spec", 3).is_none(),
+            "a malformed GPIO spec is a config error — it must reach the startup refusal"
+        );
+        // An EMPTY spec is also unparseable, so it takes the same path.
         assert!(build_ptt_controller("gpio", "", "", 3).is_none());
-        assert!(build_ptt_controller("gpio", "", "not-a-valid-spec", 3).is_none());
     }
 
     #[test]

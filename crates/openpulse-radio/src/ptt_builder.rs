@@ -149,3 +149,205 @@ mod tests {
         assert!(matches!(err, PttError::Config(_)));
     }
 }
+
+/// Seconds between reconnect attempts for a backend that is configured but currently unusable.
+///
+/// Bounded so a dead rigctld is not hammered: with a 50 ms rx tick, an unbounded retry would attempt
+/// a TCP connect 20 times a second for as long as the rig stays down.
+const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A configured backend that is not currently usable — refuses every key, and keeps trying (#1285).
+///
+/// **This exists because `None` meant two different things.** `build_ptt` used to collapse every
+/// failure to "no controller", and `SharedPtt::key` skips the hardware assert entirely when there is
+/// no controller — so it *succeeds*, arms the watchdog, and the caller transmits. That made
+/// `ptt_backend = "none"` (the operator wants VOX or a manual key) indistinguishable from "rigctld
+/// is down", and in the second case the daemon played audio into an unkeyed rig believing it had
+/// transmitted.
+///
+/// Refusing is what makes the existing machinery correct without any new policy: `keyed_transmit`
+/// already skips an emission whose assert fails, so **nothing is ever radiated unkeyed**; and the
+/// failure is a hardware `Assert`, not `AlreadyKeyed`, so the station ID marks rather than defers and
+/// a broken rig is not re-attempted at the tick rate (#1263 F3).
+///
+/// The retry lives **inside the controller** rather than in a background thread or a hot-swap of
+/// `SharedPtt`'s field. That was the first design and it was worse: the controller sits behind the
+/// same mutex the watchdog takes, so swapping it needs lock surgery on the one path that must stay
+/// preemptible. Here the reconnect is attempted lazily, at the moment an emission wants the
+/// transmitter — which is exactly when it matters — and rate-limited so a dead rig costs one connect
+/// attempt per `RETRY_INTERVAL`.
+pub struct RetryingPtt {
+    spec: OwnedPttSpec,
+    inner: Option<Box<dyn PttController + Send>>,
+    last_attempt: Option<std::time::Instant>,
+}
+
+/// An owned [`PttSpec`], so a controller can rebuild itself later.
+#[derive(Debug, Clone, Default)]
+pub struct OwnedPttSpec {
+    pub backend: String,
+    pub rigctld_addr: String,
+    pub device: String,
+    pub gpio_pin: u8,
+}
+
+impl OwnedPttSpec {
+    fn as_spec(&self) -> PttSpec<'_> {
+        PttSpec {
+            backend: &self.backend,
+            rigctld_addr: &self.rigctld_addr,
+            device: &self.device,
+            gpio_pin: self.gpio_pin,
+        }
+    }
+}
+
+impl RetryingPtt {
+    /// Wrap a spec whose backend is real but currently unreachable.
+    pub fn new(spec: OwnedPttSpec) -> Self {
+        Self {
+            spec,
+            inner: None,
+            last_attempt: Some(std::time::Instant::now()),
+        }
+    }
+
+    /// Try to (re)build the controller, at most once per [`RETRY_INTERVAL`].
+    fn ensure(&mut self) -> Result<(), PttError> {
+        if self.inner.is_some() {
+            return Ok(());
+        }
+        if let Some(t) = self.last_attempt {
+            if t.elapsed() < RETRY_INTERVAL {
+                return Err(PttError::Rigctld(format!(
+                    "PTT backend `{}` is unavailable; retrying",
+                    self.spec.backend
+                )));
+            }
+        }
+        self.last_attempt = Some(std::time::Instant::now());
+        match build_ptt(&self.spec.as_spec()) {
+            Ok(Some(c)) => {
+                tracing::info!(backend = %self.spec.backend, "PTT backend reconnected");
+                self.inner = Some(c);
+                Ok(())
+            }
+            // `Ok(None)` cannot happen: this wrapper is only built for a backend that is not
+            // `"none"`. Treat it as unavailable rather than as success, so a future change to
+            // `build_ptt` cannot silently turn a refusal into a permitted unkeyed transmit.
+            Ok(None) => Err(PttError::Config(format!(
+                "PTT backend `{}` resolved to no controller",
+                self.spec.backend
+            ))),
+            Err(e) => {
+                tracing::warn!(backend = %self.spec.backend, error = %e, "PTT reconnect failed");
+                Err(e)
+            }
+        }
+    }
+}
+
+impl PttController for RetryingPtt {
+    fn assert_ptt(&mut self) -> Result<(), PttError> {
+        self.ensure()?;
+        match self.inner.as_mut() {
+            Some(c) => c.assert_ptt().inspect_err(|_| {
+                // A live controller that fails mid-session is dropped, so the next emission
+                // reconnects rather than keying a handle the rig no longer honours.
+                self.inner = None;
+            }),
+            None => Err(PttError::Rigctld("PTT backend unavailable".into())),
+        }
+    }
+
+    fn release_ptt(&mut self) -> Result<(), PttError> {
+        // A release with no working controller is Ok, not an error: nothing is keyed, so there is
+        // nothing to drop, and returning Err here would make every guard's Drop log a failure.
+        match self.inner.as_mut() {
+            Some(c) => c.release_ptt(),
+            None => Ok(()),
+        }
+    }
+
+    fn is_asserted(&self) -> bool {
+        self.inner
+            .as_ref()
+            .map(|c| c.is_asserted())
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use crate::SharedPtt;
+    use std::time::Duration;
+
+    fn unreachable_spec() -> OwnedPttSpec {
+        OwnedPttSpec {
+            backend: "rigctld".into(),
+            // Port 1 on loopback: reserved, nothing listens, connect fails fast.
+            rigctld_addr: "127.0.0.1:1".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The #1285 defect: an unreachable backend used to become `None`, and `None` KEYS SUCCESSFULLY.
+    #[test]
+    fn an_unreachable_backend_refuses_the_key_instead_of_permitting_an_unkeyed_transmit() {
+        let ptt = SharedPtt::new(
+            Some(Box::new(RetryingPtt::new(unreachable_spec()))),
+            Duration::from_secs(180),
+        );
+        assert!(
+            ptt.keyed(None).is_err(),
+            "an unreachable PTT backend must REFUSE the key — the emission is then skipped by \
+             keyed_transmit, so nothing is radiated unkeyed"
+        );
+        assert!(!ptt.is_keyed(), "and nothing may be left armed");
+    }
+
+    /// The control that makes the test above mean something: `"none"` still keys.
+    ///
+    /// Without this, a build where `SharedPtt` refused everything would pass the assertion above
+    /// while breaking every VOX and manually-keyed station.
+    #[test]
+    fn no_ptt_configured_still_keys() {
+        let ptt = SharedPtt::new(Some(no_ptt()), Duration::from_secs(180));
+        assert!(
+            ptt.keyed(None).is_ok(),
+            "`ptt_backend = \"none\"` means the operator uses VOX or keys manually — it must not be \
+             confused with a backend that is broken, which is exactly the conflation #1285 fixes"
+        );
+    }
+
+    /// A dead rig costs one connect attempt per interval, not one per emission.
+    #[test]
+    fn the_retry_is_rate_limited() {
+        let mut c = RetryingPtt::new(unreachable_spec());
+        // The first attempt happens at construction time, so an immediate assert must NOT reconnect
+        // — it reports unavailable from the rate limiter instead. With a 50 ms rx tick an unbounded
+        // retry would attempt a TCP connect 20 times a second for as long as the rig stays down.
+        let before = c.last_attempt;
+        assert!(c.assert_ptt().is_err());
+        assert_eq!(
+            c.last_attempt, before,
+            "a second assert inside RETRY_INTERVAL must not launch another connect"
+        );
+    }
+
+    /// The refusal is an `Assert`-class fault, not `AlreadyKeyed` — so the station ID MARKS.
+    ///
+    /// If this ever became `AlreadyKeyed`, the ID would defer instead, and a broken rig would be
+    /// re-attempted at the 50 ms tick rate for the whole 180 s watchdog window (#1263 F3).
+    #[test]
+    fn the_refusal_is_not_mistaken_for_a_busy_rig() {
+        let mut c = RetryingPtt::new(unreachable_spec());
+        let e = c.assert_ptt().expect_err("unreachable");
+        assert!(
+            !matches!(e, PttError::AlreadyKeyed { .. }),
+            "an unreachable backend must not report AlreadyKeyed: the station ID defers on that and \
+             would retry a dead rig every tick"
+        );
+    }
+}
