@@ -9,6 +9,68 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — The FSK4-ACK scan reached 2 s of a 9 s window, and restarted every tick (#1247)
+
+- **Requirement/change:** `decode_fsk4_ack_in_stream` capped its trial-decode onset scan at
+  `FSK4_ACK_SEARCH_SAMPLES = 16_000` — 2 s at 8 kHz — inside a listen window the same function sizes
+  at 4 s, or 9 s with the MFSK16 sub-floor rung, which `hpx_hf` carries. Nothing else could rescue a
+  later ACK: the whole-buffer decode cannot carry a noisy lead, a normal-rung ACK is transmitted as
+  FSK4 rather than K=3, and a retry opens a fresh buffer.
+
+- **Design decision (reviewed by Fable before implementing; measuring first inverted the fix).**
+  1. **The issue's own proposal — derive the cap from the window — is the wrong fix.** The caller
+     re-invokes the scan on the WHOLE accumulated buffer once per frame of growth, so the cap bounds
+     a *redundancy*, not a single pass. Raising it multiplies an already-quadratic cost on the thread
+     draining the capture. Scanning **incrementally** instead covers the entire window for less total
+     work, and the constant disappears rather than being re-tuned.
+  2. **An outcome-level defect the issue never mentions.** The scan returns the FIRST CRC-valid
+     offset; when that ACK failed the caller's session check, the old scan restarted from zero next
+     tick and found the SAME foreign ACK again — deterministically, for the whole window. A live
+     lock, not a probabilistic miss. Reachable only in the session-hash mode; with an E7 MAC key a
+     foreign ACK never decodes at all.
+  3. **The equivalence rests on an inherited property.** A resumed scan matches a rescan only if a
+     trial decode gives the same answer later. `fsk4_ack_at` is side-effect-free, but its demod
+     config carries `afc_correction_hz`, which the per-chunk `decode_fsk4_ack` feeds via
+     `update_afc_estimate`. It stays put ONLY because `Fsk4Plugin` inherits the trait's `None` for
+     `estimate_afc_hz`. Pinned by a test rather than refactored, following #1177's precedent of
+     pinning the whitening property its gateless scan depends on.
+  4. **Prior art I had missed:** `ScanPlanner` already implements never-retry-a-start-position for
+     the data path. The offset bookkeeping is factored into a pure `ack_scan_span`, so the
+     never-repeat/never-skip property is gated directly rather than through an instrument.
+
+- **Implementation:** `crates/openpulse-modem/src/engine.rs` — `ack_scan_span` (pure),
+  `decode_fsk4_ack_in_stream_from` (resumable, uncapped), the listen loop keeps `fsk4_scan_from` and
+  continues scanning within a tick when a hit is rejected; `FSK4_ACK_SEARCH_SAMPLES` deleted, with a
+  comment where it stood recording why.
+
+- **Tests:** `ack_scan_tests` (planner never-repeat/never-skip over uneven growth including sub-step
+  growth and off-grid lengths; the AFC pin) and `fsk4_ack_scan_reaches_the_whole_window.rs`
+  (cap removal, an early-ACK control, and the foreign-ACK starvation), all through the production
+  entry with the capture delivered in chunks via `push_frame`.
+
+- **Test results:** 6 passed. **Sabotage-verified with clean attribution**: restarting from zero
+  fails ONLY the starvation gate; reinstating the cap fails ONLY the cap gate.
+
+- **Two defects found in my own work by sabotaging, and neither would have been caught by the tests
+  passing.** (a) Sabotaging the resume made the listen **hang** rather than fail — the inner retry
+  loop assumed the resume offset always advances. It does, but the loop now enforces it instead.
+  (b) The first fixture was **vacuous**: a FSK4 ACK is almost exactly one chunk long, so
+  chunk-aligned ACKs are decoded by the per-chunk whole-buffer path and the scan is never exercised —
+  the sabotaged build passed all three tests. Every offset is now deliberately off the chunk grid.
+  A third pass tightened the starvation fixture to sit INSIDE the old cap, so it fails for the resume
+  defect only; before that it failed under both sabotages and the two mechanisms were indistinguishable.
+
+- **Cost, stated honestly.** The performance argument is NOT the justification. One pass is ~0.1 s;
+  today's rescan measured 0.5-1.2 s over a chunked 9 s listen with a 2x spread I cannot attribute,
+  and on `hpx_hf` the K=3 MFSK16 arm dominates the listen at ~2.5 s regardless. The real cost claim
+  is only that raising the cap would have made an already-quadratic path worse.
+
+- **Filed:** #1315 — `receive_ack_with_short_fec` (ARDOP production, and the CLI's `transmit_arq`)
+  has **no in-stream acquisition at all**, which is #1177's shape unfixed, compounded by
+  `stage_capture_input` reopening the stream per read. A different function with a different frame
+  type; not folded in. Also corrects this work's Consumer claim: the CLI ARQ path does not reach
+  `receive_ota_ack_within`; `server.rs:1912` is its only production caller.
+
 ## 2026-09-08 — `[audio] device` was honoured by exactly one engine in the workspace (#1311)
 
 - **Requirement/change:** found while scoping #1308. `ModemEngine::set_default_device` was called at
