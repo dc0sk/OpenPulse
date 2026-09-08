@@ -66,6 +66,15 @@ impl KissServer {
             relay_forwarder,
             ptt,
         );
+        // Force-release a key that outlives DEFAULT_PTT_MAX (#1299). Without this the crate built a
+        // `SharedPtt` and never started its watchdog thread, so `force_release_if_expired` had no
+        // caller and the deadline was never checked — a `SharedPtt` with no watchdog is the bare
+        // `Box` with extra steps. The RAII guard already covers an early return or an unwind; what
+        // it cannot reach is a transmit that BLOCKS rather than returns, which is the case the
+        // watchdog exists for. Spawned in the constructor, as ARDOP does (`ardop/src/lib.rs:112`),
+        // so a bridge that can transmit always has one — not in `run_with_listener`, which a caller
+        // holding `bridge()` can bypass. The thread exits when the last `SharedPtt` clone drops.
+        let _ptt_watchdog = bridge.ptt.spawn_watchdog(None);
         Self {
             bridge,
             tx_data_rx: Some(tx_data_rx),

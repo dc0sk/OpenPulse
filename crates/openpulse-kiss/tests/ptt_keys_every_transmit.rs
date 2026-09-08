@@ -77,6 +77,58 @@ fn the_shared_ptt_is_wired_and_keys() {
     assert_eq!(spy.releases.load(Ordering::SeqCst), 1);
 }
 
+/// THE #1299 GATE: the crate's `SharedPtt` has a watchdog thread, so its deadline is enforced.
+///
+/// `openpulse-kiss` built a `SharedPtt` and took guards from it, but called `spawn_watchdog`
+/// nowhere — so `force_release_if_expired` had no caller anywhere in the crate and the deadline was
+/// never checked. A `SharedPtt` with no watchdog thread is the bare `Box` with extra steps.
+///
+/// The RAII guard already covers an early return and an unwind. What it cannot reach is a transmit
+/// that **blocks** rather than returns, which is exactly the case a watchdog exists for — and on a
+/// real rig that is a stuck carrier with nothing to take it back.
+///
+/// Drives the real constructor (`KissServer::with_ptt`), not a hand-built `SharedPtt`: the defect
+/// was in the wiring, so a test that builds its own would pass against the unfixed crate.
+#[test]
+fn the_watchdog_force_releases_a_key_that_outlives_its_deadline() {
+    let spy = Spy::new();
+    let engine = openpulse_modem::ModemEngine::new(Box::new(
+        openpulse_audio::loopback::LoopbackBackend::default(),
+    ));
+    let server = openpulse_kiss::KissServer::with_ptt(
+        engine,
+        openpulse_kiss::KissConfig {
+            bind_addr: "127.0.0.1".into(),
+            port: 0,
+            mode: "BPSK250".into(),
+            loopback: true,
+        },
+        Default::default(),
+        None,
+        Some(Box::new(spy.clone())),
+    );
+    let ptt = server.bridge().ptt.clone();
+    // Shorten the 180 s production deadline; the watchdog ticks every 100 ms.
+    ptt.set_max_duration(std::time::Duration::from_millis(120));
+
+    // Key WITHOUT holding a guard, standing in for a transmit that blocks past the deadline: a
+    // dropped guard would release on its own and prove nothing about the watchdog.
+    ptt.key(None).expect("assert");
+    assert!(spy.asserted.load(Ordering::SeqCst), "keyed");
+
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    assert!(
+        !spy.asserted.load(Ordering::SeqCst),
+        "the transmitter is STILL KEYED past its deadline — the crate builds a SharedPtt but never \
+         starts its watchdog, so nothing calls force_release_if_expired (#1299)"
+    );
+    assert_eq!(
+        spy.releases.load(Ordering::SeqCst),
+        1,
+        "exactly one release: the watchdog is single-fire"
+    );
+}
+
 /// **Source scan.** Every `.transmit(` in `bridge.rs` sits inside `keyed_transmit`.
 ///
 /// The pattern is `.transmit(`, NOT `engine.transmit` as the ARDOP and daemon scanners use. KISS
