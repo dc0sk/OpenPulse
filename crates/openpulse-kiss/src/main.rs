@@ -80,6 +80,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut engine = ModemEngine::new(audio);
+    // Pin audio I/O to the configured device (#1311). Without this the engine falls back to the
+    // OS default: `stage_capture_input` resolves `device.or(self.default_device)`, and every call
+    // site in this binary passes `None`, so an operator with a USB soundcard interface plus onboard
+    // audio silently got the onboard card. `[audio] device` was honoured by exactly one engine in
+    // the workspace before this.
+    if !cfg.audio.device.is_empty() {
+        engine.set_default_device(Some(cfg.audio.device.clone()));
+    }
     // Record the operator's identity + declared TX power in the §97 regulatory TX-metadata log. Frames
     // carry their own AX.25 source call, but the log's station_id is the configured operator call.
     engine.set_callsign(cfg.station.callsign.clone());
