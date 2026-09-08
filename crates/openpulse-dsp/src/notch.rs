@@ -85,6 +85,8 @@ struct NotchBiquad {
     y1: f32,
     y2: f32,
     f0: f32,
+    /// Whether state has been primed; a freshly designed notch must be, a retuned one must not.
+    primed: bool,
 }
 
 impl NotchBiquad {
@@ -104,7 +106,23 @@ impl NotchBiquad {
             y1: 0.0,
             y2: 0.0,
             f0,
+            primed: false,
         }
+    }
+
+    /// Recompute coefficients for a new centre frequency, KEEPING filter state (#1303).
+    ///
+    /// The detected bin jitters between adjacent bins tick to tick (measured 2199.22 / 2201.17 Hz on
+    /// a steady tone), and rebuilding the biquad for that discards `x1..y2`. At Q=25 the notch's
+    /// time constant is ~29 samples, so a rebuild every 400-sample tick never reaches steady state.
+    fn retune(&mut self, f0: f32, fs: f32, q: f32) {
+        let (x1, x2, y1, y2, primed) = (self.x1, self.x2, self.y1, self.y2, self.primed);
+        *self = Self::design(f0, fs, q);
+        self.x1 = x1;
+        self.x2 = x2;
+        self.y1 = y1;
+        self.y2 = y2;
+        self.primed = primed;
     }
 
     /// Prime state to a constant so the cascade starts at steady state (no step transient):
@@ -114,6 +132,7 @@ impl NotchBiquad {
         self.x2 = x;
         self.y1 = x;
         self.y2 = x;
+        self.primed = true;
     }
 
     #[inline]
@@ -152,6 +171,21 @@ pub struct NotchBank {
     planner: FftPlanner<f32>,
     window: Vec<f32>,
     persistence: Persistence,
+    /// The last `fft_size` samples seen, for DETECTION (#1303).
+    ///
+    /// The filter must act on the block it is given; the detector must not. The daemon delivers
+    /// ~400-sample ticks, and analysing those directly costs `10*log10(fft_size/take)` of processing
+    /// gain — ~10 dB at 400 — which no window recovers. It also puts `inner`/`floor_halfwidth_hz`,
+    /// which are meaningful at the 4096-sample resolution they were fitted at, into a regime where
+    /// the protected band spans ~9 resolution cells. Analysing a rolling window restores the exact
+    /// regime those constants assume.
+    analysis: Vec<f32>,
+    /// New samples since the last persistence observation, so `min_silence_hits` counts INDEPENDENT
+    /// observations. It counts blocks, and consecutive rolling windows overlap by ~90 %.
+    since_observed: usize,
+    /// Hann window matching the current `analysis` fill, rebuilt only when the fill length changes
+    /// (warm-up only; once full it is `window`).
+    warmup_window: Vec<f32>,
 }
 
 impl NotchBank {
@@ -165,6 +199,9 @@ impl NotchBank {
             planner: FftPlanner::new(),
             window,
             persistence: Persistence::default(),
+            analysis: Vec::new(),
+            since_observed: 0,
+            warmup_window: Vec::new(),
         }
     }
 
@@ -174,15 +211,33 @@ impl NotchBank {
     }
 
     /// Set fixed notch centre frequencies (oracle / manual placement).
+    /// Set the active notch centres, PRESERVING the state of notches that are already running.
+    ///
+    /// A detection within `min_spacing_hz` of a live notch is the same interferer by this module's
+    /// own definition of distinctness, so it retunes that notch in place instead of building a new
+    /// one. Rebuilding every block reset the filter state and held suppression at ~12 dB on the
+    /// daemon's 400-sample ticks, where carrying state reaches the design figure (#1303).
     pub fn set_notch_freqs(&mut self, freqs_hz: &[f32]) {
         let fs = self.params.sample_rate;
         let q = self.params.q;
-        self.biquads = freqs_hz
+        let tol = self.params.min_spacing_hz;
+        let mut live = std::mem::take(&mut self.biquads);
+        let mut next: Vec<NotchBiquad> = Vec::with_capacity(freqs_hz.len());
+        for &f in freqs_hz
             .iter()
             .take(self.params.max_notches)
             .filter(|&&f| f > 0.0 && f < fs / 2.0)
-            .map(|&f| NotchBiquad::design(f, fs, q))
-            .collect();
+        {
+            match live.iter().position(|b| (b.f0 - f).abs() <= tol) {
+                Some(i) => {
+                    let mut bq = live.remove(i);
+                    bq.retune(f, fs, q);
+                    next.push(bq);
+                }
+                None => next.push(NotchBiquad::design(f, fs, q)),
+            }
+        }
+        self.biquads = next;
     }
 
     /// Update the protected passband (Hz) the auto-detector must never notch — the receiver's
@@ -279,8 +334,18 @@ impl NotchBank {
         if block.is_empty() {
             return Vec::new();
         }
+        // Detection runs on the ROLLING buffer, filtering on the block as given (#1303).
+        let n = self.params.fft_size;
+        self.analysis.extend_from_slice(block);
+        if self.analysis.len() > n {
+            let drop = self.analysis.len() - n;
+            self.analysis.drain(..drop);
+        }
+        self.since_observed = self.since_observed.saturating_add(block.len());
         if self.mode == NotchMode::Auto {
-            let mut freqs = self.detect_freqs(block);
+            let window = std::mem::take(&mut self.analysis);
+            let mut freqs = self.detect_freqs(&window);
+            self.analysis = window;
             // Add confirmed external interferers that sit out of band (persistence path): a notch
             // there is safe and these are robustly external even if this block's detection missed.
             for f in self.confirmed_external() {
@@ -298,9 +363,13 @@ impl NotchBank {
         if self.biquads.is_empty() {
             return block.to_vec();
         }
+        // Prime ONLY notches that have never run. Priming a live notch every block is what capped
+        // suppression at ~12 dB on 400-sample ticks (#1303).
         let x0 = block[0];
         for bq in &mut self.biquads {
-            bq.prime(x0);
+            if !bq.primed {
+                bq.prime(x0);
+            }
         }
         let mut buf = block.to_vec();
         for bq in &mut self.biquads {
@@ -329,12 +398,27 @@ impl NotchBank {
     }
 
     /// Half-spectrum magnitude (dB) of a Hann-windowed, zero-padded block.
+    ///
+    /// The window matches the DATA length, not `fft_size` (#1303). Applying the first `take` taps of
+    /// a `fft_size`-long Hann to a shorter block is a rising quarter-sine, not a window — at 400
+    /// samples of a 4096-point Hann the weights run 0 to 0.09. Zero-padding then only interpolates
+    /// the spectrum, which is what zero-padding is for. Reached only during warm-up now that
+    /// detection runs on a rolling `fft_size` buffer, but a short block must still be analysed
+    /// correctly rather than through a ramp.
     fn spectrum_db(&mut self, block: &[f32]) -> Vec<f32> {
         let n = self.params.fft_size;
         let mut buf = vec![Complex32::new(0.0, 0.0); n];
         let take = block.len().min(n);
+        let win: &[f32] = if take == n {
+            &self.window
+        } else {
+            if self.warmup_window.len() != take {
+                self.warmup_window = hann(take);
+            }
+            &self.warmup_window
+        };
         for i in 0..take {
-            buf[i] = Complex32::new(block[i] * self.window[i], 0.0);
+            buf[i] = Complex32::new(block[i] * win[i], 0.0);
         }
         self.planner.plan_fft_forward(n).process(&mut buf);
         (0..n / 2)
@@ -476,6 +560,111 @@ mod tests {
         assert!(
             freqs.iter().any(|&f| (f - 1200.0).abs() < 30.0),
             "expected a notch near 1200 Hz, got {freqs:?}"
+        );
+    }
+
+    /// #1303 (1/3): detection must not depend on how the caller chunked the audio.
+    ///
+    /// The daemon delivers ~400-sample ticks; the acceptance suite delivers one large block. Before
+    /// the rolling analysis buffer those were different analyses — a 400-sample tick lost
+    /// `10*log10(4096/400)` of processing gain and put `inner`/`floor_halfwidth_hz` in a regime they
+    /// were never fitted for. Same audio in, same notches out.
+    #[test]
+    fn detection_is_the_same_whether_audio_arrives_in_ticks_or_one_block() {
+        let p = NotchParams::default();
+        let n = p.fft_size;
+        let fs = p.sample_rate;
+        // A strong out-of-band tone plus a little deterministic hash noise.
+        let audio: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / fs;
+                0.5 * (std::f32::consts::TAU * 2200.0 * t).sin()
+                    + 0.02 * (((i * 2654435761) % 1000) as f32 / 1000.0 - 0.5)
+            })
+            .collect();
+
+        let mut one = NotchBank::new(p.clone());
+        one.process_block(&audio);
+
+        let mut ticks = NotchBank::new(p.clone());
+        for c in audio.chunks(400) {
+            ticks.process_block(c);
+        }
+
+        let (a, b) = (one.active_freqs(), ticks.active_freqs());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "one-block detection found {a:?}, tick-by-tick found {b:?} — the detector's answer \
+             depends on the caller's block size, so the daemon and the acceptance suite are running \
+             different analyses (#1303)"
+        );
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(
+                (x - y).abs() <= p.min_spacing_hz,
+                "same audio, different notch centres: {a:?} vs {b:?}"
+            );
+        }
+    }
+
+    /// #1303 (2/3): a notch must actually suppress, across a STREAM of small blocks.
+    ///
+    /// `process_block` re-primed every biquad to `block[0]` on every call. At Q=25 a notch's time
+    /// constant is ~29 samples, so re-priming every 400-sample tick never let it reach steady state:
+    /// measured 11.9 dB of suppression on the daemon's block size against >200 dB with state carried.
+    /// `fixed_notch_kills_its_tone` cannot see this — it measures `out[1024..]` of ONE long block and
+    /// so skips the transient entirely.
+    #[test]
+    fn a_notch_suppresses_a_tone_across_a_stream_of_small_blocks() {
+        let p = NotchParams::default();
+        let fs = p.sample_rate;
+        let mut bank = NotchBank::new(p);
+        bank.set_mode(NotchMode::Fixed);
+        bank.set_notch_freqs(&[2200.0]);
+
+        let tone: Vec<f32> = (0..8000)
+            .map(|i| (std::f32::consts::TAU * 2200.0 * i as f32 / fs).sin())
+            .collect();
+        let mut out = Vec::with_capacity(tone.len());
+        for c in tone.chunks(400) {
+            out.extend(bank.process_block(c));
+        }
+
+        let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        // Skip the first block: a genuinely new notch is primed once and settles within it.
+        let supp = 20.0 * (rms(&tone[400..]) / rms(&out[400..]).max(1e-12)).log10();
+        assert!(
+            supp >= 20.0,
+            "only {supp:.1} dB of suppression on 400-sample blocks. The biquads are being re-primed \
+             (or rebuilt) per block, so the notch never reaches steady state — a perfectly DETECTED \
+             interferer still reaches the demodulator nearly unattenuated (#1303)."
+        );
+    }
+
+    /// #1303 (3/3): a short block is windowed by a Hann of ITS OWN length, not a prefix of a longer one.
+    ///
+    /// The first 400 taps of a 4096-point Hann run 0 to 0.091 — a rising quarter-sine, which is not a
+    /// window and costs ~24 dB of magnitude. Reached during warm-up only, but a short block must be
+    /// analysed correctly rather than through a ramp. Checked against Hann coherent-gain theory
+    /// (`peak ≈ A * take / 4`), not against a recorded number.
+    #[test]
+    fn a_short_block_is_windowed_by_a_hann_of_its_own_length() {
+        let p = NotchParams::default();
+        let fs = p.sample_rate;
+        let take = 400usize;
+        const AMP: f32 = 0.5;
+        let mut bank = NotchBank::new(p);
+        let tone: Vec<f32> = (0..take)
+            .map(|i| AMP * (std::f32::consts::TAU * 2200.0 * i as f32 / fs).sin())
+            .collect();
+
+        let mag = bank.spectrum_db(&tone);
+        let peak = mag.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let theory = 20.0 * (AMP * take as f32 / 4.0).log10();
+        assert!(
+            (peak - theory).abs() <= 3.0,
+            "peak {peak:.1} dB against Hann-coherent-gain theory {theory:.1} dB for a {take}-sample \
+             block. A prefix of the full-length Hann lands ~24 dB low, which is the #1303 defect."
         );
     }
 
