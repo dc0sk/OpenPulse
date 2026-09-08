@@ -9,6 +9,30 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — `openpulse-kiss` built a `SharedPtt` and never started its watchdog (#1299, KISS half)
+
+- **Requirement/change:** found while writing #1260's Twins section, which first claimed the
+  repeater was "the last hand-rolled keying path". It was not — and the census that corrected it
+  showed KISS in a third state: `SharedPtt` + guard (`bridge.rs:105`, `:131`) but **no
+  `spawn_watchdog` anywhere in the crate**, so `force_release_if_expired` had no caller and the
+  180 s deadline was never checked.
+- **Design decision:** spawn it in the constructor (`KissServer::with_ptt`), as ARDOP does
+  (`ardop/src/lib.rs:112`), rather than in `run_with_listener` — a caller holding `bridge()` can
+  transmit without ever running the listener, and a bridge that can transmit must have a watchdog.
+  The handle is dropped deliberately: the thread exits when the last `SharedPtt` clone drops.
+- **Scope:** the guard already covered an early return and an unwind. What it cannot reach — and
+  what this restores — is a transmit that **blocks** rather than returns.
+- **Implementation:** `crates/openpulse-kiss/src/lib.rs`, one line plus its rationale.
+- **Tests:** `ptt_keys_every_transmit::the_watchdog_force_releases_a_key_that_outlives_its_deadline`
+  — drives the real constructor (a hand-built `SharedPtt` would pass against the unfixed crate),
+  shortens the deadline, and keys **without** holding a guard, since a dropped guard would release
+  on its own and prove nothing about the watchdog.
+- **Test results:** 3 passed. Sabotage-verified: removing the `spawn_watchdog` line fails it with
+  "the transmitter is STILL KEYED past its deadline". Full workspace gate below.
+- **Not closed:** #1299's other half — `openpulse-cli` still keys a bare `PttController` at
+  `transmit.rs:18`, `calibrate.rs:201` and `:328`. Lower risk (foreground, attended, and
+  `transmit.rs` releases before its `?`), but outside the discipline every other path is now under.
+
 ## 2026-09-08 — The noise-floor tracker was a function of the caller's chunking (#1254)
 
 - **Requirement/change:** `NoiseFloorTracker::update` discarded any buffer shorter than its
