@@ -9,6 +9,70 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — The notch analysed the daemon's 400-sample ticks, and re-primed its filter every block (#1303)
+
+- **Requirement/change:** `NotchBank::spectrum_db` windowed a short block with the first `take` taps
+  of a `fft_size`-long Hann — a rising quarter-sine, not a window. The notch sits at the
+  `route_audio_stage(InputCapture)` seam and the daemon is the only surface that enables it
+  (`server.rs:184-187`; `ModemEngine::new` defaults it OFF, the config defaults it ON), so the live
+  regime is ~400-sample ticks while REQ-QRM-01's acceptance suite analyses 4096.
+
+- **Design decision (reviewed by Fable, which MEASURED it and overturned the issue's central claim).**
+  1. **"The wrong window masks interferers" is FALSE at the amplitudes that matter.** Measured on the
+     real `ic9700-idle-hot.wav` floor: today's code detects a 0.30-0.60 tone at 400 samples on every
+     block, 1.00 hit fraction, zero false notches. The wrong window costs ~2-3 dB at the margin
+     (0.10 amp: 0.28 -> 0.68 hit). What costs ~10 dB is the block LENGTH — processing gain — which no
+     window recovers.
+  2. **Scaling `inner` by `4*n/take` would have made it 14x worse.** The arithmetic was right
+     (measured lobe 41/21/83 bins at take 400/800/200 vs predicted 41.0/20.5/81.9); the inference was
+     not. Scaling `inner` to 61 shrinks the median ring and yields **0.70 false notches/block against
+     0.05**, for no gain. Inside a zero-padded main lobe the magnitude is monotone, so the +/-6-bin
+     local-max test accepts only the true peak anyway.
+  3. **My Prior-art field contained the error that hid the fix.** I wrote "a notch must act on the
+     block it is given". The FILTER must; the DETECTOR need not — `process_block` already separates
+     them. Detection now runs on a rolling `fft_size` buffer, restoring the exact regime `inner` and
+     `floor_halfwidth_hz` were fitted at, and the whole scaling question disappears.
+  4. **The larger defect was the twin I had marked UNCHECKED.** `process_block` rebuilt and re-primed
+     every biquad per block. At Q=25 the notch time constant is ~29 samples, so measured suppression
+     was **11.9 dB at 400-sample blocks / 14.8 at 800 / 22.7 at 4096 / >200 dB with state carried**.
+     A perfectly detected interferer reached the demodulator ~12 dB down, and `input_prerouted` means
+     that is what it got. The detected bin jitters between adjacent bins (2199.22 / 2201.17 Hz), so
+     the fix retunes in place rather than rebuilding.
+
+- **Implementation:** `crates/openpulse-dsp/src/notch.rs` — a rolling `analysis` buffer for detection;
+  `hann(take)` during warm-up only; `NotchBiquad::retune` + a `primed` flag so `set_notch_freqs`
+  preserves the state of a notch already running and `process_block` primes only genuinely new ones.
+  A detection within `min_spacing_hz` of a live notch is the same interferer by this module's own
+  definition of distinctness, so that existing constant decides reuse — no new one was introduced.
+
+- **Tests:** three fast gates in the default run, because REQ-QRM-01's own suite is `#[ignore]`d for
+  runtime and therefore checks none of this per-PR:
+  `detection_is_the_same_whether_audio_arrives_in_ticks_or_one_block`,
+  `a_notch_suppresses_a_tone_across_a_stream_of_small_blocks`,
+  `a_short_block_is_windowed_by_a_hann_of_its_own_length` (against Hann coherent-gain theory,
+  `peak ~ A*take/4`, not a recorded number). **My originally proposed test was vacuous** — frequency
+  error is within a bin at every block size today, because zero-padding interpolates.
+
+- **Test results:** 11 passed. Sabotage-verified with clean attribution: priming every block fails
+  ONLY the suppression gate; the prefix window fails ONLY the warm-up gate; detecting on the raw
+  block fails ONLY the equivalence gate.
+
+- **REQ-QRM-01 re-run, which is the evidence that mattered.** The rolling buffer changes WHICH 4096
+  samples the held-out suite analyses — it previously took the first 4096 of one whole-buffer read,
+  and now takes the last — so its rescue result could not be assumed to survive. `scripts/slow-tests.sh
+  notch`: **SLOW-TESTS: PASS**, 3 passed, 0 failed, 2055 s. Nothing faster substitutes for this, and
+  a green workspace gate does not cover it (#1274).
+
+- **Corrected about the slow suite:** its `chunks(4096)` line is the `prefilter` arm
+  (`NotchMode::Fixed`, no detection). The detection arms feed an unpaced loopback that drains the
+  whole buffer in one read, so the seam analyses the FIRST 4096 samples of one ~200k block. Same
+  conclusion about the regime, different mechanism — and "sweep block sizes there" cannot be done by
+  changing `chunks(N)`.
+
+- **Filed:** #1316 — `band_filled` returns true on **45 % of idle** IC-9700 blocks at every block
+  size, because the shaped floor alone puts the protected band >6 dB over the passband median. Latent
+  (persistence defaults to 0) but it halves the silence evidence for whoever enables it.
+
 ## 2026-09-08 — The FSK4-ACK scan reached 2 s of a 9 s window, and restarted every tick (#1247)
 
 - **Requirement/change:** `decode_fsk4_ack_in_stream` capped its trial-decode onset scan at
