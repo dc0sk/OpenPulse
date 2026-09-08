@@ -1963,9 +1963,17 @@ impl ModemEngine {
         //
         // The floor comes from the passband spectral distribution, not from block energies, because
         // a carrier that stays on raises every block and drags a time-domain percentile up with it —
-        // exactly how `EnergyGate` saturates. Measured on the real capture: the spectral floor reads
-        // 0.138 RMS on idle and **0.140 with a frame present**, while the total level goes 0.126 →
-        // 0.225. That immovability is the whole point.
+        // exactly how `EnergyGate` saturates. Re-measured on the real capture after #1254, at the
+        // daemon's own read size and with the frame SUPERIMPOSED on the noise (the fixture used to
+        // append it, which put digital silence in the noise bins under the frame and collapsed the
+        // floor instead of testing it): the spectral floor reads **0.1289 RMS on idle and 0.1343
+        // with a frame present** (+4 %), while the total level goes **0.126 → 0.2255** (+79 %).
+        // That immovability is the whole point. The older figures here (0.138/0.140) were the EMA's
+        // output when it stepped once per multi-window read; it now steps per window.
+        //
+        // The premise is bounded, and #1304 is where it fails: a signal filling most of the
+        // analysed 300–2700 Hz band is not a narrowband carrier, and the estimator recovers ITS
+        // mean square. OFDM52/SCFDMA52 at 2031 Hz are exactly that.
         //
         // Deliberately mode-independent. A noise floor is a property of the band, not the waveform,
         // and this sits at the single shared `InputCapture` seam so every receive path gets it.
@@ -2106,6 +2114,9 @@ impl ModemEngine {
         // DCD is updated inside the seam on the PRE-AGC level; gate burst accumulation on that
         // true-channel energy, not the AGC-boosted sample RMS (which would latch a boosted noise floor
         // as a permanent "carrier present").
+        // Whether the adaptive floor existed BEFORE this block was judged (#1254). The seam warms the
+        // tracker and re-aims the squelch inside `route_audio_stage`, so this must be read first.
+        let was_cold = self.noise_floor.mean_sq().is_none();
         let samples = self.route_audio_stage(PipelineStage::InputCapture, samples)?;
         let carrier_present =
             !samples.samples.is_empty() && self.dcd.energy() >= self.dcd.threshold();
@@ -2124,8 +2135,25 @@ impl ModemEngine {
             }
             Ok(None)
         } else if self.rx_capturing && !self.rx_burst.is_empty() {
-            // Carrier dropped after a burst → the frame is complete; flush it.
             self.rx_capturing = false;
+            // COLD START (#1254): until the tracker has its first observation the squelch is still
+            // the fixed default, so on a band whose floor sits above it every read before the first
+            // full window reads as "carrier". Flushing that is not a harmless short burst: with
+            // `ota_enabled` the failed decode drives `on_rx_frame(Failed)` AND returns an ACK frame,
+            // so the daemon KEYS THE TRANSMITTER and radiates a NACK on pure noise at every start —
+            // the #1178 class, spent RF, on exactly the hot bands REQ-DCD-01 exists for.
+            //
+            // Discard rather than suppress: suppressing carrier-detect while cold would drop the
+            // samples themselves, and on a quiet backend (loopback, the twin rig) the tracker is
+            // cold when a frame's first read lands — that would eat a third of a BPSK250 preamble.
+            // Here nothing is lost, because a burst is only discarded when the FIRST warm judgement
+            // says the carrier is absent; if it says present, the cold samples stay in the burst.
+            // A tracker that can never warm leaves this branch exactly as it was.
+            if was_cold && self.noise_floor.mean_sq().is_some() {
+                self.rx_burst.clear();
+                return Ok(None);
+            }
+            // Carrier dropped after a burst → the frame is complete; flush it.
             Ok(Some(AudioSamples {
                 samples: std::mem::take(&mut self.rx_burst),
             }))

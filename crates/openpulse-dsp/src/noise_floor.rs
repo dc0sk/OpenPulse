@@ -18,10 +18,13 @@
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
-/// Analysis window length. 512 samples at 8 kHz is 64 ms and 15.6 Hz per bin — fine enough that a
+/// Analysis window length — and the contract callers depend on: **the adaptive squelch engages
+/// after this many samples of audio, however the caller chunked them** (#1254).
+///
+/// 512 samples at 8 kHz is 64 ms and 15.6 Hz per bin — fine enough that a
 /// 500–1000 Hz signal covers well under half the passband's bins, which is what keeps the low
 /// percentile on noise.
-const WINDOW: usize = 512;
+pub const WINDOW: usize = 512;
 
 /// Percentile of passband bin powers taken as the noise level, before bias correction.
 ///
@@ -102,6 +105,14 @@ pub fn spectral_noise_floor_mean_sq(
 #[derive(Debug, Clone)]
 pub struct NoiseFloorTracker {
     mean_sq: Option<f32>,
+    /// Samples not yet consumed by a full analysis window (#1254).
+    ///
+    /// Without this the tracker was a function of the CALLER'S CHUNKING, not of the audio: `update`
+    /// discarded any buffer under `WINDOW` outright. The daemon's rx tick hands it whatever one
+    /// `read()` drained — period-quantized, ~200-600 samples at 8 kHz — so observations happened
+    /// only on the reads that happened to straddle 512, and the EMA retained a value derived from
+    /// that biased subset indefinitely. Bounded: never holds `WINDOW` samples or more.
+    carry: Vec<f32>,
     rise: f32,
     fall: f32,
     lo_hz: f32,
@@ -119,6 +130,7 @@ impl NoiseFloorTracker {
     pub fn new(lo_hz: f32, hi_hz: f32) -> Self {
         Self {
             mean_sq: None,
+            carry: Vec::new(),
             rise: 0.05,
             fall: 0.30,
             lo_hz,
@@ -126,11 +138,30 @@ impl NoiseFloorTracker {
         }
     }
 
-    /// Fold one captured block into the estimate; returns the current floor if one exists.
+    /// Fold captured audio into the estimate; returns the current floor if one exists.
+    ///
+    /// Accepts any block length. Samples are buffered across calls and consumed one `WINDOW` at a
+    /// time, so the result depends only on the sample stream and not on how the caller chunked it —
+    /// pinned by `the_floor_is_invariant_to_the_caller_s_chunking` (#1254).
+    ///
+    /// The EMA steps **per window**, not per call: pooling an arbitrary number of windows into one
+    /// observation made a 64 ms read and a 5 s read each worth one step, so the smoothing rate
+    /// tracked the driver's period rather than elapsed audio.
     pub fn update(&mut self, samples: &[f32], sample_rate: f32) -> Option<f32> {
-        if let Some(obs) =
-            spectral_noise_floor_mean_sq(samples, sample_rate, self.lo_hz, self.hi_hz)
-        {
+        if sample_rate <= 0.0 || self.hi_hz <= self.lo_hz {
+            return self.mean_sq;
+        }
+        self.carry.extend_from_slice(samples);
+        let mut consumed = 0;
+        while self.carry.len() - consumed >= WINDOW {
+            let obs = spectral_noise_floor_mean_sq(
+                &self.carry[consumed..consumed + WINDOW],
+                sample_rate,
+                self.lo_hz,
+                self.hi_hz,
+            );
+            consumed += WINDOW;
+            let Some(obs) = obs else { continue };
             self.mean_sq = Some(match self.mean_sq {
                 None => obs,
                 Some(prev) => {
@@ -139,6 +170,7 @@ impl NoiseFloorTracker {
                 }
             });
         }
+        self.carry.drain(..consumed);
         self.mean_sq
     }
 
@@ -156,6 +188,63 @@ impl NoiseFloorTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE #1254 GATE: the floor is a function of the AUDIO, not of how the caller chunked it.
+    ///
+    /// `update` used to discard any block under `WINDOW`, so the estimate depended on the driver's
+    /// period and the tick's phase. The daemon's rx tick hands over one `read()` — period-quantized,
+    /// ~200-600 samples at 8 kHz — so observations landed only on reads that happened to straddle
+    /// 512, from a biased subset (the slow ticks), and the EMA then retained that value forever.
+    ///
+    /// Neither the old code nor "raise the tick until reads exceed 512" can pass this: the second
+    /// re-tunes one constant against another and still breaks whenever the driver chunks differently.
+    #[test]
+    fn the_floor_is_invariant_to_the_caller_s_chunking() {
+        let audio = white(512 * 20, 0.05, 7);
+        let reference = {
+            let mut t = NoiseFloorTracker::default();
+            t.update(&audio, 8000.0);
+            t.mean_sq().expect("one shot warms")
+        };
+
+        // 200 is cpal's default ALSA period at 8 kHz; 400 is one nominal 50 ms daemon tick; 600 is a
+        // tick that straddled two periods; 4096 is the read after a blocking decode (#1301).
+        for chunk in [200usize, 400, 512, 600, 800, 4096] {
+            let mut t = NoiseFloorTracker::default();
+            let mut last = None;
+            for block in audio.chunks(chunk) {
+                last = t.update(block, 8000.0);
+            }
+            let got = last.expect("every chunking must warm on 20 windows of audio");
+            assert_eq!(
+                got.to_bits(),
+                reference.to_bits(),
+                "chunk {chunk}: floor {got:e} != one-shot {reference:e} — the estimate still \
+                 depends on the caller's block size, so the driver's period decides the squelch"
+            );
+        }
+    }
+
+    /// The daemon's own read size must warm the tracker at all — the branch #1254 was filed on.
+    #[test]
+    fn a_sub_window_read_warms_the_tracker_once_enough_audio_has_arrived() {
+        let audio = white(512 * 4, 0.05, 11);
+        let mut t = NoiseFloorTracker::default();
+        // 400 samples = 8000 Hz x the default `receive_tick_ms` of 50.
+        let mut blocks = audio.chunks(400);
+        assert!(
+            t.update(blocks.next().expect("first"), 8000.0).is_none(),
+            "400 samples is under one window, so nothing can be estimated yet"
+        );
+        for b in blocks {
+            t.update(b, 8000.0);
+        }
+        assert!(
+            t.mean_sq().is_some(),
+            "four windows of audio delivered in 400-sample reads left the tracker cold — the \
+             adaptive squelch never engages and the fixed threshold governs"
+        );
+    }
 
     fn white(n: usize, sigma: f32, seed: u64) -> Vec<f32> {
         let mut s = seed | 1;

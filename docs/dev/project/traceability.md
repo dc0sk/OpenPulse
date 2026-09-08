@@ -9,6 +9,80 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — The noise-floor tracker was a function of the caller's chunking (#1254)
+
+- **Requirement/change:** `NoiseFloorTracker::update` discarded any buffer shorter than its
+  512-sample analysis window, with no carry-over. The daemon's rx tick hands it one `rx_stream.read()`
+  — period-quantized, well under 512 on a nominal tick — so REQ-DCD-01's adaptive squelch engaged on
+  a cadence set by driver chunking and tick phase rather than by the audio.
+
+- **Design decision (reviewed by Fable twice — before implementing, and again on the implementation;
+  both rounds overturned something).**
+  1. **My headline was wrong.** I claimed the tracker "never warms", from 8000 Hz x 50 ms = 400
+     samples. Falsified: cpal's ALSA host requests a ~25 ms period, so reads are period-quantized and
+     some exceed 512 — and the first tick after a blocking decode (#1301) drains seconds. The real
+     branch is the issue's own worst case, **intermittent warming from a biased subset**, which the
+     EMA then retains. Severity changed; the fix did not.
+  2. **Step the EMA per window, not per call.** Pooling made a 64 ms read and a 5 s read each worth
+     one α-step. Per-window stepping is what makes the estimate a pure function of the sample
+     stream, and it is the regime `EXP_QUANTILE_SCALE` and the #1055 margin were bracketed in
+     (the old 800-sample fixture was also one window per read).
+  3. **The right test is chunking invariance**, not "feed 400": identical audio in chunks of
+     171/400/511/512/513/4096 must give a bit-identical floor. Neither the old code nor the issue's
+     alternative fix ("size the read to the window") can pass it — and that alternative is not merely
+     a re-tuned constant, it is *insufficient*, since no tick length guarantees ≥ 512 per read when
+     the driver quantizes to its own period.
+  4. **My gate change was erosion, and in one place vacuity.** Sweeping block sizes made
+     `bursts.is_empty()` fail below the window, so I replaced it with a fitted tolerance
+     (`512 + 600`). Review showed that tolerance let a **400-sample burst on PURE IDLE satisfy the
+     negative control**: at every block size under 512, `a_frame_in_that_same_floor_still_produces_a_bounded_burst`
+     could not fail. I had reintroduced the exact defect the PR removes, in the sibling test.
+
+- **The transient is fixed, not tolerated — because it keys the transmitter.** Until the first
+  observation exists the fixed squelch governs, so on a hot band the reads before the first full
+  window flush as a burst. Under `ota_enabled` that burst decodes to nothing, drives
+  `on_rx_frame(Failed)`, and returns an ACK frame — so the daemon **radiates a NACK on pure noise at
+  every start**, on exactly the bands REQ-DCD-01 exists for. That is the #1178 class (spent RF).
+  `accumulate_routed` now *discards* a burst that ends on the tracker's first warm judgement rather
+  than suppressing carrier-detect while cold: suppression would drop the samples, and on a quiet
+  backend the tracker is cold when a frame's first read lands, which would eat a third of a BPSK250
+  preamble. A tracker that can never warm leaves the branch exactly as before, so there is no
+  fail-deaf path.
+
+- **A fixture defect found in the same file:** the negative control **concatenated** the frame after
+  the noise instead of superimposing it, so the noise bins under the frame were digitally silent and
+  the floor *collapsed* to the clamp while the frame played — the burst boundary was decided by the
+  floor re-learning afterwards, not by `DCD_SQUELCH_MARGIN`. Now superimposed, and the seam comment's
+  numbers are re-measured on that fixture (floor 0.1289 → 0.1343, +4 %, while the level goes
+  0.126 → 0.2255, +79 %).
+
+- **Implementation:** `crates/openpulse-dsp/src/noise_floor.rs` — `carry: Vec<f32>`, per-window EMA
+  stepping, `WINDOW` exported as the documented contract "the squelch engages after this many
+  samples". `crates/openpulse-modem/src/engine.rs` — `was_cold` read before the seam;
+  cold-start burst discarded; seam comment re-measured and scoped against #1304.
+  `crates/openpulse-modem/tests/daemon_squelch_noise_floor.rs` — both tests swept over block sizes
+  spanning `WINDOW`, warm tripwire, superimposed fixture, frame-sized burst filter.
+
+- **Tests:** `openpulse-dsp --lib noise_floor` — `the_floor_is_invariant_to_the_caller_s_chunking`,
+  `a_sub_window_read_warms_the_tracker_once_enough_audio_has_arrived`. Both acceptance tests now
+  sweep `[171, 400, 511, 512, 513, 4096]`.
+
+- **Test results:** dsp 101 passed, modem `daemon_squelch_noise_floor` 2 passed at all six block
+  sizes. **Sabotage-verified in four directions**: (a) reinstating the discard of short reads fails
+  both acceptance tests on the warm tripwire; (b) it also fails both new dsp gates; (c) disabling the
+  cold-start discard fails the idle test with a flushed 342-sample noise burst at block 171;
+  (d) **removing the frame entirely fails the negative control** — the vacuity check, which the
+  pre-review version passed. Full workspace gate below.
+
+- **Filed, not fixed here:** #1303 (`NotchBank::spectrum_db` applies the first `len` taps of a
+  4096-Hann to a short block — a ramp, not a window — and `notch_rescues_interferer` feeds
+  `chunks(4096)`, the one size where that is correct; same archetype, REQ-QRM-01's evidence) and
+  **#1304**, which this change makes *reliably reachable*: the estimator recovers the mean square of
+  any process filling most of the analysed band, so a sustained OFDM52 signal (2031 Hz, ~85 % of the
+  155 passband bins) walks the floor above its own level. Pre-#1254 the tracker stepped only on
+  occasional qualifying reads; now the poison clock runs at 15.6 steps/s on every band. Not fixable
+  here — every candidate has the cold-start-on-a-hot-floor trap and needs its own design review.
+
 ## 2026-09-08 — #1264 closed won't-fix: `block_in_place` on the `block_on` thread is inert (#1301 filed)
 
 - **Requirement/change:** #1264 claimed five `lib.rs` transmit sites "block a tokio worker thread"
