@@ -9,6 +9,45 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — A repeater that is not running was reported as running (#1298)
+
+- **Requirement/change:** the `EnableRepeater` thread `take()`s the `CrossBandRepeater` out of the
+  runtime state, so its exit means the repeater is gone — and nothing observed that.
+  `repeater_enabled` stayed `true`, `EnableRepeater` answered "already enabled" forever, and the
+  no-repeater arm logged a `warn!` and then set `repeater_enabled = true` and emitted
+  `RepeaterChanged { enabled: true }` anyway.
+
+- **Design decision (reviewed by Fable as part of #1297's design; it corrected the issue's premise).**
+  #1298 said "the loop exits on the first capture that does not decode, which on hardware is the
+  first capture", making enabled-forever the *normal* state on a rig. **That went stale when #1300
+  merged** — a non-decoding capture is now `Ok(None)` and the loop continues. What kills the thread
+  now is a PTT fault or a transmit error. So the normal state on a rig is not a dead thread reported
+  as enabled; it is **a live thread that never relays and never says so above DEBUG**. Both defects
+  in the issue survive that correction; its severity framing did not, and the issue has been amended.
+  Reaping at the top of the two repeater commands rather than from a periodic tick: the thread's own
+  events are what notify clients promptly, and the reap only has to make the *next* command truthful
+  — a tick poll would need `runtime_state` on the tick path for no added signal.
+
+- **Implementation:** `crates/openpulse-daemon/src/lib.rs` — `reap_finished_repeater`; the
+  no-repeater arm returns a `CommandError`; the thread emits `CommandError` + a `false` edge on the
+  **error path only**, since a clean stop is already reported by `DisableRepeater` and emitting there
+  too would put two `false` edges on one transition.
+
+- **Tests:** `enabling_a_repeater_that_does_not_exist_fails_instead_of_claiming_success` and
+  `a_repeater_thread_that_exited_is_reaped_rather_than_reported_enabled`. And
+  `apply_repeater_enable_disable_emits_state_changes` **was pinning the defect**: it ran with
+  `RuntimeControlState::default()` (`repeater: None`) and asserted that enabling SUCCEEDED. It now
+  builds a real `CrossBandRepeater` so the success path is the one it tests.
+
+- **Test results:** 7 passed. Sabotage-verified in both directions: removing the reap calls fails the
+  reap gate with "the dead thread was never reported"; reinstating the claim-success arm fails the
+  enable gate with "the daemon reports a repeater as enabled while none exists". Full workspace gate
+  below.
+
+- **Filed alongside:** #1308 — the repeater has **no audio device configuration at all**; both its
+  engines use the OS default input, and no config field anywhere could name a second card. #1297's
+  accumulation fix cannot be exercised on a real two-rig station without it.
+
 ## 2026-09-08 — A cap-flushed burst is not ladder evidence (#1255)
 
 - **Requirement/change:** `accumulate_routed` returned `Ok(Some(burst))` for two opposite events —
