@@ -871,8 +871,9 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                 // independent watchdog thread are the primary, flood-/block-proof paths.
                 ptt.force_release_if_expired(&handle.event_tx);
                 let mode = handle.active_mode.lock().await.clone();
-                // block_in_place: engine capture/transmit are synchronous; LoopbackBackend
-                // returns immediately. A real audio backend blocks until samples arrive.
+                // Engine capture/transmit are synchronous; LoopbackBackend returns immediately, a
+                // real audio backend blocks until samples arrive. The `block_in_place` below does
+                // not offload that — this task is the `block_on` thread (#1264/#1301).
                 let decode_start = std::time::Instant::now();
                 // Accumulate a full burst before decoding: on a streaming (cpal) backend
                 // one frame spans many tick windows, so decoding a single partial window
@@ -1261,8 +1262,13 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
 /// rate ladder. Splitting the transmit from the ACK listen (vs the bundled
 /// `transmit_arq_ota`) is what lets PTT be keyed only for the TX, so the radio can
 /// hear the ACK. PTT is a no-op on the twin rig (NoOpPtt); on a real rig this is
-/// the correct turnaround. The long phases run under `block_in_place` so the
-/// blocking turnaround does not stall the daemon's async runtime.
+/// the correct turnaround. The long phases run under `block_in_place`, which on this call site
+/// frees NOTHING: `server::run`'s future is `!Send` and is polled by `#[tokio::main]`'s `block_on`
+/// on the main thread, where `block_in_place` has no core to hand off and runs the closure inline.
+/// It is here so the call cannot panic if this code is ever polled on a worker — not to keep the
+/// runtime responsive, which it does not do. The loop is unresponsive for the frame's duration
+/// (~8.5 s at BPSK250, ~68 s at BPSK31); that is #1301, and #1264 was filed on the belief that this
+/// comment was accurate.
 /// Drain queued file-transfer fragments to the air as one PTT-keyed burst (assert → transmit all →
 /// release), so the half-duplex peer can answer. Called after every command and receive tick; a no-op
 /// when the queue is empty. On a PTT-assert failure the burst is dropped and the session's stall/retry
@@ -1561,7 +1567,9 @@ fn discovery_tick(
                 .get(label)
                 .cloned()
         });
-    // Decode (on slot boundaries) runs inside `tick`; `block_in_place` keeps the async loop responsive.
+    // Decode (on slot boundaries) runs inside `tick`. `block_in_place` does NOT keep the async loop
+    // responsive here — see the note on `ota_send_with_ptt`: on the `block_on` thread it runs inline.
+    // It guards against a future where this is polled on a worker (#1264/#1301).
     let outcomes = tokio::task::block_in_place(|| {
         let rt = runtime_state.discovery.as_mut().expect("checked above");
         if let Some(hz) = per_band_freq {
