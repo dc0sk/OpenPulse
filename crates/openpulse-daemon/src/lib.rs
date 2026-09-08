@@ -1609,6 +1609,39 @@ pub(crate) enum KeyedTxError {
     Transmit(openpulse_core::error::ModemError),
 }
 
+/// Clear repeater state whose thread has already exited (#1298).
+///
+/// The `EnableRepeater` thread OWNS the `CrossBandRepeater` — it is `take()`n out of the runtime
+/// state — so when that thread exits the repeater is gone for good. Nothing observed that:
+/// `repeater_enabled` stayed `true`, `EnableRepeater` answered "already enabled", and a
+/// `DisableRepeater` + `EnableRepeater` pair reported success while starting nothing.
+///
+/// Called at the top of both repeater commands rather than from a periodic tick: the events emitted
+/// by the thread itself are what notify clients promptly, and this only has to make the *next*
+/// command see the truth. A tick poll would need `runtime_state` on the tick path for no added
+/// signal.
+fn reap_finished_repeater(
+    runtime_state: &mut RuntimeControlState,
+    event_tx: &Arc<broadcast::Sender<ControlEvent>>,
+) {
+    let finished = runtime_state
+        .repeater_thread
+        .as_ref()
+        .is_some_and(|t| t.is_finished());
+    if !finished {
+        return;
+    }
+    if let Some(t) = runtime_state.repeater_thread.take() {
+        let _ = t.join();
+    }
+    runtime_state.repeater_stop = None;
+    if runtime_state.repeater_enabled {
+        runtime_state.repeater_enabled = false;
+        tracing::warn!("cross-band repeater thread has exited; marking the repeater disabled");
+        let _ = event_tx.send(ControlEvent::RepeaterChanged { enabled: false });
+    }
+}
+
 pub(crate) fn keyed_transmit<T>(
     ptt: &crate::ptt::SharedPtt,
     event_tx: Option<&broadcast::Sender<ControlEvent>>,
@@ -2567,6 +2600,7 @@ pub async fn apply_command_to_engine(
             }
         }
         ControlCommand::EnableRepeater => {
+            reap_finished_repeater(runtime_state, event_tx);
             if runtime_state.repeater_enabled {
                 let _ = event_tx.send(ControlEvent::CommandError {
                     command: "enable_repeater".to_string(),
@@ -2575,24 +2609,46 @@ pub async fn apply_command_to_engine(
                 return;
             }
 
-            if let Some(mut repeater) = runtime_state.repeater.take() {
-                let stop = Arc::new(AtomicBool::new(false));
-                let stop_clone = Arc::clone(&stop);
-                let thread = std::thread::spawn(move || {
-                    if let Err(e) = repeater.run_full_duplex(stop_clone) {
-                        tracing::warn!(error = %e, "cross-band repeater exited with error");
-                    }
+            // No repeater to run is a FAILED enable, not a quiet one (#1298). This arm used to warn
+            // at `tracing::warn!` and then set `repeater_enabled = true` and emit
+            // `RepeaterChanged { enabled: true }` anyway — so a daemon with no repeater reported one
+            // as running, and no command sequence could get back to a truthful state.
+            let Some(mut repeater) = runtime_state.repeater.take() else {
+                let _ = event_tx.send(ControlEvent::CommandError {
+                    command: "enable_repeater".to_string(),
+                    reason: "no repeater is available — it was not built at startup (see the \
+                             startup log for why), or a previous session ended and consumed it"
+                        .to_string(),
                 });
-                runtime_state.repeater_stop = Some(stop);
-                runtime_state.repeater_thread = Some(thread);
-            } else {
-                tracing::warn!("enable_repeater: no pre-built repeater in runtime state; audio routing not started");
-            }
+                return;
+            };
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = Arc::clone(&stop);
+            // The thread owns the repeater, so when it exits the repeater is GONE. Report that:
+            // without it, "relaying nothing because the band is quiet" and "the thread died" are
+            // the same observation from outside (#1298).
+            let thread_tx = Arc::clone(event_tx);
+            let thread = std::thread::spawn(move || {
+                if let Err(e) = repeater.run_full_duplex(stop_clone) {
+                    tracing::warn!(error = %e, "cross-band repeater exited with error");
+                    let _ = thread_tx.send(ControlEvent::CommandError {
+                        command: "repeater".to_string(),
+                        reason: format!("cross-band repeater stopped: {e}"),
+                    });
+                    // Only on the error path: a clean stop is already reported by DisableRepeater,
+                    // and emitting there too would put two `false` edges on one transition.
+                    let _ = thread_tx.send(ControlEvent::RepeaterChanged { enabled: false });
+                }
+            });
+            runtime_state.repeater_stop = Some(stop);
+            runtime_state.repeater_thread = Some(thread);
 
             runtime_state.repeater_enabled = true;
             let _ = event_tx.send(ControlEvent::RepeaterChanged { enabled: true });
         }
         ControlCommand::DisableRepeater => {
+            reap_finished_repeater(runtime_state, event_tx);
             if !runtime_state.repeater_enabled {
                 let _ = event_tx.send(ControlEvent::CommandError {
                     command: "disable_repeater".to_string(),
@@ -4334,6 +4390,24 @@ mod command_apply_tests {
         }
     }
 
+    /// Build a real, runnable repeater so `EnableRepeater` has something to start.
+    fn test_repeater(enabled: bool) -> openpulse_repeater::CrossBandRepeater {
+        let mk = || {
+            let mut e = ModemEngine::new(Box::new(openpulse_audio::LoopbackBackend::new()));
+            let _ = e.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
+            e
+        };
+        openpulse_repeater::CrossBandRepeater::new(
+            Box::new(openpulse_radio::NoOpPtt::new()),
+            mk(),
+            mk(),
+            openpulse_repeater::RepeaterConfig {
+                enabled,
+                ..Default::default()
+            },
+        )
+    }
+
     #[tokio::test]
     async fn apply_repeater_enable_disable_emits_state_changes() {
         let mut engine = test_engine();
@@ -4341,6 +4415,9 @@ mod command_apply_tests {
         let (tx, mut rx) = broadcast::channel::<ControlEvent>(16);
         let ev_tx = Arc::new(tx);
         let mut runtime_state = RuntimeControlState::default();
+        // #1298: this test used to run with `repeater: None` and assert that enabling SUCCEEDED —
+        // it was pinning the defect. A daemon with nothing to run must not report a running repeater.
+        runtime_state.repeater = Some(test_repeater(true));
 
         apply_command_to_engine(
             &ControlCommand::EnableRepeater,
@@ -4371,6 +4448,121 @@ mod command_apply_tests {
             ControlEvent::RepeaterChanged { enabled } => assert!(!enabled),
             other => panic!("expected RepeaterChanged, got {other:?}"),
         }
+    }
+
+    /// THE #1298 GATE (enable half): with nothing to run, enabling must FAIL and say so.
+    ///
+    /// The old arm logged a `warn!`, then set `repeater_enabled = true` and emitted
+    /// `RepeaterChanged { enabled: true }` regardless — so a daemon with no repeater reported one as
+    /// running, and no command sequence could get back to a truthful state.
+    #[tokio::test]
+    async fn enabling_a_repeater_that_does_not_exist_fails_instead_of_claiming_success() {
+        let mut engine = test_engine();
+        let active_mode: SharedMode = Arc::new(Mutex::new("BPSK250".to_string()));
+        let (tx, mut rx) = broadcast::channel::<ControlEvent>(16);
+        let ev_tx = Arc::new(tx);
+        let mut runtime_state = RuntimeControlState::default();
+        assert!(runtime_state.repeater.is_none(), "premise: nothing to run");
+
+        apply_command_to_engine(
+            &ControlCommand::EnableRepeater,
+            &mut engine,
+            &active_mode,
+            &ev_tx,
+            None,
+            &mut runtime_state,
+        )
+        .await;
+
+        assert!(
+            !runtime_state.repeater_enabled,
+            "the daemon reports a repeater as enabled while none exists"
+        );
+        match rx.recv().await.expect("expected an event") {
+            ControlEvent::CommandError { command, reason } => {
+                assert_eq!(command, "enable_repeater");
+                assert!(
+                    reason.contains("no repeater is available"),
+                    "unhelpful reason: {reason}"
+                );
+            }
+            other => {
+                panic!("expected CommandError, got {other:?} — a RepeaterChanged here is the bug")
+            }
+        }
+    }
+
+    /// THE #1298 GATE (reap half): a thread that has exited must not leave the repeater "enabled".
+    ///
+    /// The thread OWNS the `CrossBandRepeater`, so its exit means the repeater is gone. Nothing
+    /// observed that: `EnableRepeater` answered "already enabled" forever after.
+    #[tokio::test]
+    async fn a_repeater_thread_that_exited_is_reaped_rather_than_reported_enabled() {
+        let mut engine = test_engine();
+        let active_mode: SharedMode = Arc::new(Mutex::new("BPSK250".to_string()));
+        let (tx, mut rx) = broadcast::channel::<ControlEvent>(64);
+        let ev_tx = Arc::new(tx);
+        let mut runtime_state = RuntimeControlState::default();
+        // A DISABLED repeater's `run_full_duplex` returns Ok(0) at once, so the thread exits
+        // immediately — standing in for any exit the daemon did not ask for.
+        runtime_state.repeater = Some(test_repeater(false));
+
+        apply_command_to_engine(
+            &ControlCommand::EnableRepeater,
+            &mut engine,
+            &active_mode,
+            &ev_tx,
+            None,
+            &mut runtime_state,
+        )
+        .await;
+        assert!(runtime_state.repeater_enabled, "enable succeeded");
+
+        // Let the thread finish.
+        for _ in 0..200 {
+            if runtime_state
+                .repeater_thread
+                .as_ref()
+                .is_some_and(|t| t.is_finished())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // The next command must see the truth rather than "already enabled".
+        apply_command_to_engine(
+            &ControlCommand::EnableRepeater,
+            &mut engine,
+            &active_mode,
+            &ev_tx,
+            None,
+            &mut runtime_state,
+        )
+        .await;
+
+        let mut saw_disabled_edge = false;
+        let mut saw_already_enabled = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ControlEvent::RepeaterChanged { enabled: false } => saw_disabled_edge = true,
+                ControlEvent::CommandError { ref reason, .. }
+                    if reason.contains("already enabled") =>
+                {
+                    saw_already_enabled = true
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_disabled_edge,
+            "the dead thread was never reported: clients still believe a repeater is running"
+        );
+        assert!(
+            !saw_already_enabled,
+            "the daemon answered 'repeater already enabled' about a thread that had exited — this \
+             is the state no command sequence could escape"
+        );
     }
 
     #[tokio::test]
