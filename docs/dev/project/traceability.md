@@ -9,6 +9,61 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — The repeater's receive window could not contain a frame (#1297)
+
+- **Requirement/change:** `relay_one_frame_at` called `engine_rx.receive(...)`, which opens an input
+  stream, reads once and drops it. On a callback backend each attempt therefore saw a fresh buffer
+  covering one poll interval — tens of ms against a seconds-long frame — so the cross-band repeater
+  could not receive on real audio however long it ran. The #1118 shape, on a shipping surface.
+
+- **Design decision (reviewed by Fable before implementing; it changed the shape and corrected two
+  of my claims).**
+  1. **A shared helper, not a second open-coded copy.** `server.rs`'s rx ticker already does this by
+     hand. My proposal would have made the repeater the second copy with ARDOP and KISS to follow —
+     and my assumption that their TCP-driven shape made a per-call window correct is **false**: both
+     poll continuously (`ardop/src/bridge.rs:430`, `kiss/src/bridge.rs:237`). Extracted as
+     `openpulse_modem::capture_ticker::CaptureTicker`; adoption by the other three is #1310, kept
+     out of this PR because refactoring a working receive path inside a fix for a broken one trades
+     risk for tidiness.
+  2. **The stream cannot live on the struct.** `Box<dyn AudioInputStream>` is not `Send` (a cpal
+     `Stream` is not, on most hosts) and the daemon moves the repeater into a thread — so a field
+     would make `CrossBandRepeater` unspawnable. Caught by the workspace build, not by design: the
+     ticker is a loop local, which is what `server.rs` does for the same reason. `relay_one_frame`
+     now takes `&mut CaptureTicker`.
+  3. **My "has never relayed a frame on real audio" was inference presented as fact.** Provable:
+     cannot relay on cpal at HEAD by construction, and no on-air run is recorded. Not provable: that
+     no earlier version ever did. The issue was amended.
+  4. **A second defect in the same arm, which #1300 put there.** Its `Err => Ok(None)` swallowed
+     `ModemError::Audio` from `open_input` alongside the demodulation errors it was written for, so
+     a repeater whose RX device could not be opened — no default input, or ALSA `EBUSY` because the
+     daemon holds that card — was indistinguishable from a quiet band, forever, at DEBUG. The ticker
+     reports the first fault at WARN and retries.
+
+- **Implementation:** `crates/openpulse-modem/src/capture_ticker.rs` (new; claimed by CAP-73) and
+  `crates/openpulse-repeater/src/lib.rs` — `receive` → tick + `accumulate_capture` + `decode_burst`.
+
+- **Tests:** `repeater_integration::a_frame_split_across_several_reads_is_still_relayed` delivers one
+  frame's audio **one chunk per read** via `LoopbackBackend::push_frame`. That is the whole point:
+  `LoopbackBackend::read` drains the entire buffer, so every other test in the crate hands `receive`
+  the whole frame at once — which is exactly why a green suite never saw this. Twelve existing tests
+  needed a `relay_until` helper, because one call is now one capture TICK rather than one receive
+  attempt (the burst flushes on the first empty read after the frame), which is how the daemon's loop
+  experiences it.
+
+- **Test results:** 15 passed across the crate. **Sabotage-verified**: reverting the RX to
+  `engine_rx.receive(...)` fails the new gate with "no frame relayed within 16 ticks" while the rest
+  of the suite stays green — so the fixture discriminates and the old suite genuinely could not.
+  Full workspace gate below. Note the first local clippy/trace pass FAILED on two things this
+  produced — the `Send` break above, and `capture_ticker.rs` as a `NEW-ORPHAN` claimed by no
+  capability — both fixed before commit.
+
+- **What this does NOT deliver.** The repeater still cannot be pointed at a second sound card:
+  **#1308** — both its engines use the OS default input and no config field anywhere could name
+  another. So this is provable in-process and unverifiable on a station until that lands. Two further
+  limits found in review and recorded on the issue: the relay is payload-for-payload rather than
+  wire-for-wire, and `decode_burst` decodes with `FecMode::None`, so **FEC-coded traffic is not
+  relayable at all** — under `hpx_hf` that is everything that survives a fade.
+
 ## 2026-09-08 — A repeater that is not running was reported as running (#1298)
 
 - **Requirement/change:** the `EnableRepeater` thread `take()`s the `CrossBandRepeater` out of the

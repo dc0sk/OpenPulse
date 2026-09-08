@@ -5,6 +5,7 @@
 
 pub mod benchmark;
 pub mod capture_replay;
+pub mod capture_ticker;
 pub mod channel_sim;
 pub mod diagnostics;
 pub mod engine;

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use openpulse_core::station_id::StationIdTimer;
+use openpulse_modem::capture_ticker::CaptureTicker;
 use openpulse_modem::ModemEngine;
 use openpulse_radio::{PttController, PttKeyGuard, SharedPtt, DEFAULT_PTT_MAX};
 use thiserror::Error;
@@ -85,25 +86,42 @@ impl CrossBandRepeater {
     ///
     /// Returns the number of bytes relayed, or `None` if no frame was available.
     /// FEC is not applied on the relay path (raw mode).
-    pub fn relay_one_frame(&mut self) -> Result<Option<usize>, RepeaterError> {
+    pub fn relay_one_frame(
+        &mut self,
+        rx: &mut CaptureTicker,
+    ) -> Result<Option<usize>, RepeaterError> {
         let now_ms = self.start.elapsed().as_millis() as u64;
-        self.relay_one_frame_at(now_ms)
+        self.relay_one_frame_at(rx, now_ms)
     }
 
     /// [`relay_one_frame`] with an explicit monotonic clock (for deterministic ID-timing tests).
-    pub fn relay_one_frame_at(&mut self, now_ms: u64) -> Result<Option<usize>, RepeaterError> {
+    pub fn relay_one_frame_at(
+        &mut self,
+        rx: &mut CaptureTicker,
+        now_ms: u64,
+    ) -> Result<Option<usize>, RepeaterError> {
         if !self.config.enabled {
             return Ok(None);
         }
 
-        let bytes = match self.engine_rx.receive(&self.config.mode.clone(), None) {
+        // Hold ONE capture stream across attempts and accumulate under DCD gating, the way the
+        // daemon's rx ticker does (#1297). A capture fault is reported and retried inside the
+        // ticker rather than surfacing here: treating it as fatal would stop the repeater
+        // listening for good, and treating it as silence — which the previous `Err => Ok(None)`
+        // arm did — made an unopenable RX device indistinguishable from a quiet band, at DEBUG.
+        let Some(burst) = rx.tick(&mut self.engine_rx, &self.config.mode).burst else {
+            return Ok(None);
+        };
+
+        let bytes = match self
+            .engine_rx
+            .decode_burst(&self.config.mode.clone(), &burst)
+        {
             Ok(b) => b,
             Err(e) => {
-                // A capture that does not demodulate is indistinguishable from an idle channel — it
-                // is the ordinary quiet case, not a fault. Propagating it ended the whole session on
-                // the first window with no frame in it (#1297); only PTT and transmit faults stop a
-                // repeater.
-                tracing::debug!(error = %e, "cross-band relay: no frame in this capture window");
+                // A burst that does not decode is the ordinary case on a live band: noise that
+                // opened the squelch, or a frame this repeater's mode cannot read. Not a fault.
+                tracing::debug!(error = %e, "cross-band relay: burst did not decode");
                 return Ok(None);
             }
         };
@@ -205,12 +223,17 @@ impl CrossBandRepeater {
         if !self.config.enabled {
             return Ok(0);
         }
+        // The capture stream is owned HERE, not on the struct: `Box<dyn AudioInputStream>` is not
+        // `Send` (a cpal `Stream` is not, on most hosts) and the daemon moves the repeater into a
+        // thread, so a stream field would make `CrossBandRepeater` unspawnable. The daemon's own rx
+        // ticker keeps its stream as a loop local for the same reason.
+        let mut rx = CaptureTicker::new(None);
         let mut count = 0u64;
         let result = loop {
             if stop.load(Ordering::Relaxed) {
                 break Ok(count);
             }
-            match self.relay_one_frame() {
+            match self.relay_one_frame(&mut rx) {
                 Ok(Some(_)) => count += 1,
                 // Since #1297 an idle window is `Ok(None)` rather than a session-ending error, so
                 // this arm is now reached continuously instead of never. Without a pause the loop
@@ -270,6 +293,22 @@ mod full_duplex_silence_tests {
         e
     }
 
+    /// Tick until a frame is relayed, the way the daemon's loop does.
+    ///
+    /// Since #1297 one `relay_one_frame_at` is one capture TICK, not one receive attempt: the burst
+    /// accumulator flushes when the carrier drops, which on `LoopbackBackend` is the first empty
+    /// read after the frame. So relaying takes at least two calls.
+    fn relay_until(rp: &mut CrossBandRepeater, now_ms: u64) -> usize {
+        let mut rx = CaptureTicker::new(None);
+        for _ in 0..16 {
+            match rp.relay_one_frame_at(&mut rx, now_ms).expect("relay") {
+                Some(n) => return n,
+                None => continue,
+            }
+        }
+        panic!("no frame relayed within 16 ticks");
+    }
+
     /// The half of "the deadline measures silence" that no integration test can reach.
     ///
     /// `acquire_key`'s re-key branch fires only after the watchdog has taken a held key, and the
@@ -306,7 +345,7 @@ mod full_duplex_silence_tests {
         };
 
         feed();
-        rp.relay_one_frame_at(0).expect("relay").expect("Some");
+        relay_until(&mut rp, 0);
         assert_eq!(
             *spy.edges.lock().expect("lock"),
             vec!["assert"],
@@ -323,7 +362,7 @@ mod full_duplex_silence_tests {
         );
 
         feed();
-        rp.relay_one_frame_at(1_000).expect("relay").expect("Some");
+        relay_until(&mut rp, 1_000);
         assert_eq!(
             *spy.edges.lock().expect("lock"),
             vec!["assert", "release", "assert"],
@@ -358,9 +397,7 @@ mod full_duplex_silence_tests {
             src.register_plugin(Box::new(BpskPlugin::new()))
                 .expect("register src");
             src.transmit(b"fd frame", "BPSK250", None).expect("tx");
-            rp.relay_one_frame_at(i * 100)
-                .expect("relay")
-                .expect("Some");
+            relay_until(&mut rp, i * 100);
             std::thread::sleep(Duration::from_millis(100));
         }
 

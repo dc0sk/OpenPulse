@@ -621,6 +621,8 @@ capabilities:
     tests:
     - crates/openpulse-core/tests/relay_integration.rs
     - crates/openpulse-repeater/tests/repeater_integration.rs
+    - crates/openpulse-repeater/tests/half_duplex_ptt.rs
+    - crates/openpulse-repeater/tests/repeater_integration.rs
     traceability: baseline
   CAP-48:
     code:
@@ -1031,6 +1033,7 @@ capabilities:
     code:
     - crates/openpulse-core/src/audio.rs
     - crates/openpulse-daemon/src/monitor.rs
+    - crates/openpulse-modem/src/capture_ticker.rs
     name: Device resolution and multi-mode receive
     satisfies:
     - REQ-DEV-01

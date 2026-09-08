@@ -10,6 +10,19 @@ use openpulse_modem::ModemEngine;
 use openpulse_radio::NoOpPtt;
 use openpulse_repeater::{CrossBandRepeater, RepeaterConfig};
 
+/// Tick until a frame is relayed. Since #1297 one call is one capture TICK: the burst accumulator
+/// flushes when the carrier drops, which on `LoopbackBackend` is the first empty read after the
+/// frame, so relaying takes at least two calls — exactly as the daemon's loop experiences it.
+fn relay_until(rp: &mut CrossBandRepeater, now_ms: u64) -> usize {
+    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
+    for _ in 0..16 {
+        if let Some(n) = rp.relay_one_frame_at(&mut rx, now_ms).expect("relay") {
+            return n;
+        }
+    }
+    panic!("no frame relayed within 16 ticks");
+}
+
 fn make_engine_with_plugin() -> (ModemEngine, LoopbackBackend) {
     let lb = LoopbackBackend::new();
     let mut engine = ModemEngine::new(Box::new(lb.clone_shared()));
@@ -68,7 +81,8 @@ fn relay_disabled_returns_none() {
     };
     let mut repeater =
         CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, config);
-    let result = repeater.relay_one_frame().expect("no error");
+    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
+    let result = repeater.relay_one_frame(&mut rx).expect("no error");
     assert_eq!(result, None);
 }
 
@@ -104,7 +118,7 @@ fn relay_loopback_cross_band() {
         ..Default::default()
     };
     let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
-    let n = repeater.relay_one_frame().expect("relay").expect("Some");
+    let n = relay_until(&mut repeater, 0);
     assert_eq!(n, payload.len());
 
     // Verify PTT was asserted then released.
@@ -195,10 +209,7 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
 
     // First relay at t=0: one keying pair for the relayed frame, no ID yet.
     feed_frame(&lb_rx);
-    repeater
-        .relay_one_frame_at(0)
-        .expect("relay")
-        .expect("Some");
+    relay_until(&mut repeater, 0);
     assert_eq!(
         *log.lock().unwrap(),
         vec!["assert", "release"],
@@ -213,10 +224,7 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
     // Second relay at t = 601 s: the interval has elapsed, so the ID goes out under the SAME key.
     log.lock().unwrap().clear();
     feed_frame(&lb_rx);
-    repeater
-        .relay_one_frame_at(601_000)
-        .expect("relay")
-        .expect("Some");
+    relay_until(&mut repeater, 601_000);
     assert_eq!(
         *log.lock().unwrap(),
         vec!["assert", "release"],
@@ -261,7 +269,8 @@ fn relay_empty_buffer_returns_none() {
     // a repeater that keyed up and relayed garbage on an empty buffer.
     let mut repeater =
         CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, config);
-    match repeater.relay_one_frame() {
+    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
+    match repeater.relay_one_frame(&mut rx) {
         Ok(None) => {}
         Ok(Some(n)) => panic!("relayed {n} bytes from an empty receive buffer"),
         Err(_) => {} // receive() surfacing an error on an empty buffer is acceptable
@@ -333,10 +342,7 @@ fn full_duplex_holds_one_key_across_frames_and_releases_it_at_session_end() {
 
     for t in [0u64, 1_000] {
         feed(&lb_rx);
-        repeater
-            .relay_one_frame_at(t)
-            .expect("relay")
-            .expect("Some");
+        relay_until(&mut repeater, t);
     }
     assert_eq!(
         *ptt_log.lock().unwrap(),
@@ -413,11 +419,82 @@ fn full_duplex_relay_one_frame_keys_rather_than_transmitting_into_an_unkeyed_rig
     };
     let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
 
-    let result = repeater.relay_one_frame().expect("relay");
-    assert!(result.is_some(), "expected a frame to relay");
+    let n = relay_until(&mut repeater, 0);
+    assert!(n > 0, "expected a frame to relay");
     assert_eq!(
         *ptt_log.lock().unwrap(),
         vec!["T 1"],
         "a full-duplex relay must key before transmitting, and hold rather than release"
+    );
+}
+
+/// THE #1297 GATE: a frame delivered across SEVERAL reads is still relayed.
+///
+/// This is the defect's whole shape. `engine_rx.receive(...)` opened an input stream, read once and
+/// dropped it, so on a callback backend each attempt saw a fresh buffer covering one poll interval —
+/// tens of milliseconds against a seconds-long frame. The repeater could not receive on real audio
+/// however long it ran.
+///
+/// **Why the existing tests could not see it.** `LoopbackBackend::read` drains the whole buffer, so
+/// the buffer IS the frame and one `receive` call got all of it. Every other test in this file feeds
+/// the frame that way. `push_frame` pops ONE queued frame per read, which is the chunked delivery a
+/// real capture device does — and the property that discriminates the fix from the defect.
+///
+/// It does NOT reproduce cpal in one respect worth naming: the flush here is triggered by an empty
+/// read, whereas a live stream returns noise and the flush comes from the DCD energy dropping below
+/// the adaptive squelch. So this proves accumulation across reads, not flush-on-DCD-drop.
+#[test]
+fn a_frame_split_across_several_reads_is_still_relayed() {
+    let (engine_rx, lb_rx) = make_engine_with_plugin();
+    let (engine_tx, lb_tx) = make_engine_with_plugin();
+
+    let frame = {
+        let lb = LoopbackBackend::new();
+        let mut src = ModemEngine::new(Box::new(lb.clone_shared()));
+        src.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register");
+        src.transmit(b"split across reads", "BPSK250", None)
+            .expect("tx");
+        lb.drain_samples()
+    };
+    // One read per chunk. 12 chunks of a ~9.5 k-sample frame is ~790 samples each — the order of a
+    // real tick's read, and far short of a frame however many arrive.
+    let chunk = frame.len() / 12 + 1;
+    let chunks = frame.chunks(chunk).count();
+    assert!(chunks >= 8, "fixture must span several reads, got {chunks}");
+    for c in frame.chunks(chunk) {
+        lb_rx.push_frame(c);
+    }
+
+    let config = RepeaterConfig {
+        enabled: true,
+        mode: "BPSK250".into(),
+        tx_hang_ms: 0,
+        full_duplex: false,
+        ..Default::default()
+    };
+    let mut repeater =
+        CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, config);
+
+    let n = relay_until(&mut repeater, 0);
+    assert!(
+        n > 0,
+        "no frame relayed from audio delivered across {chunks} reads — the receive path cannot \
+         accumulate, so on a callback backend it can never see a whole frame"
+    );
+
+    // And what reached rig_b is the payload, not noise.
+    let out = {
+        let lb = LoopbackBackend::new();
+        let mut rx = ModemEngine::new(Box::new(lb.clone_shared()));
+        rx.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register");
+        lb.fill_samples(&lb_tx.drain_samples());
+        rx.receive("BPSK250", None).expect("decode relayed frame")
+    };
+    assert_eq!(
+        out.as_slice(),
+        b"split across reads",
+        "the relayed bytes are not the frame that arrived"
     );
 }
