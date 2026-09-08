@@ -6160,9 +6160,12 @@ impl ModemEngine {
     /// the union decode, and the receive-loop throttle so they can't drift.
     const MFSK16_ACK_SPS: usize = 256;
     const MFSK16_ACK_SYMS: usize = 40;
-    /// How far into a capture the FSK4-ACK trial-decoder searches for the dual-waveform ACK's leading FSK4
-    /// copy — a turnaround-jitter bound (~2 s at 8 kHz); the copy is always near the buffer start.
-    const FSK4_ACK_SEARCH_SAMPLES: usize = 16_000;
+    // REMOVED (#1247): `FSK4_ACK_SEARCH_SAMPLES = 16_000`, a ~2 s "turnaround-jitter bound" on the
+    // FSK4-ACK trial decoder. Its premise — "the copy is always near the buffer start" — was an
+    // assumption no measurement supported, and IRS turnaround has never been measured on hardware
+    // (`docs/dev/ota-hardware-validation.md`). Inside a 4-9 s listen window it made an ACK past 2 s
+    // unreachable by every decoder in the path. The scan is resumable now, so it covers the whole
+    // window for less total work than the capped rescan did — see `decode_fsk4_ack_in_stream_from`.
 
     /// Transmit the sub-floor ARQ ACK as [`MFSK16_ACK_COPIES`] time-spaced `MFSK16-ACK` copies in a single
     /// PTT keying (0.5 s silence gaps), for the receiver to union-decode with
@@ -6295,18 +6298,68 @@ impl ModemEngine {
         AckFrame::decode_maybe_authenticated(&arr, self.ack_mac_key.as_ref()).ok()
     }
 
+    /// Trial-decode offsets not yet tried, given the buffer length (#1247). Pure, so it can be gated
+    /// without an instrument.
+    ///
+    /// Returns the inclusive grid span `(first, last)` to try, or `None` when nothing new is
+    /// scannable. Offsets stay on the `step` grid so a resumed scan tries exactly the positions a
+    /// from-scratch scan would, in the same order — coverage AND detection latency are unchanged.
+    ///
+    /// Mirrors `ScanPlanner`'s never-retry-a-start-position rule for the data path; the ACK path had
+    /// a fixed cap instead, which is #1247.
+    fn ack_scan_span(
+        last_tried: Option<usize>,
+        len: usize,
+        frame_len: usize,
+        step: usize,
+    ) -> Option<(usize, usize)> {
+        let step = step.max(1);
+        let max_start = len.checked_sub(frame_len)?;
+        let highest = (max_start / step) * step;
+        let first = match last_tried {
+            None => 0,
+            Some(l) => l.checked_add(step)?,
+        };
+        (first <= highest).then_some((first, highest))
+    }
+
     /// Acquire a FSK4-ACK frame within a longer capture by trial-decoding a frame-length window at coarse
     /// offsets (CRC-gated). FSK4-ACK has no sync preamble, so the dual-waveform sub-floor ACK's LEADING FSK4
     /// copy can't be isolated by the plain whole-buffer demod; a non-MFSK16 peer needs this to hear it.
-    /// Bounded to the first [`FSK4_ACK_SEARCH_SAMPLES`] (turnaround jitter), quarter-symbol step.
-    fn decode_fsk4_ack_in_stream(&self, samples: &[f32]) -> Option<AckFrame> {
-        let fsk4_len = self.fsk4_ack_frame_len()?;
-        if samples.len() < fsk4_len {
-            return None;
-        }
+    ///
+    /// **Resumable (#1247).** `last_tried` is the highest offset already attempted; the scan continues past
+    /// it and returns the offset it stopped at, so the caller can resume. Two things this fixes:
+    ///
+    /// * There is no longer an offset CAP. The old bound was 16 000 samples — 2 s — inside a listen window
+    ///   the same function sizes at 4 s, or 9 s when the profile carries the MFSK16 sub-floor rung, which
+    ///   `hpx_hf` does. An ACK past 2 s was unreachable by every decoder in the path: the whole-buffer
+    ///   decode cannot carry a noisy lead, a normal-rung ACK is transmitted as FSK4 rather than K=3, and
+    ///   retries open a fresh buffer. Raising that cap was the obvious fix and the wrong one — the caller
+    ///   re-invokes this per frame of buffer growth, so a raised cap multiplies an already-quadratic cost.
+    /// * A foreign ACK no longer starves the listen. The scan returns the FIRST CRC-valid offset; when that
+    ///   ACK fails the caller's session check, the old scan restarted from zero on the next tick and found
+    ///   the SAME foreign ACK again, deterministically, for the whole window. Resuming past it reaches a
+    ///   real ACK behind it.
+    ///
+    /// Safe to resume only because a trial decode is side-effect-free AND its result does not depend on
+    /// state that moves during the listen: `fsk4_ack_at` takes `&self`, and the demod config's
+    /// `afc_correction_hz` stays put because FSK4-ACK publishes no AFC estimator. That second half is an
+    /// inherited property, not a designed one, so it is pinned by
+    /// `fsk4_ack_publishes_no_afc_estimator_so_a_resumed_scan_is_equivalent`.
+    fn decode_fsk4_ack_in_stream_from(
+        &self,
+        samples: &[f32],
+        last_tried: Option<usize>,
+    ) -> (Option<AckFrame>, Option<usize>) {
+        let Some(fsk4_len) = self.fsk4_ack_frame_len() else {
+            return (None, last_tried);
+        };
         let sps = (AudioConfig::default().sample_rate as usize / 100).max(1); // FSK4-ACK is 100 baud
         let step = (sps / 4).max(1);
-        let search_end = (samples.len() - fsk4_len).min(Self::FSK4_ACK_SEARCH_SAMPLES);
+        let Some((first, last)) = Self::ack_scan_span(last_tried, samples.len(), fsk4_len, step)
+        else {
+            return (None, last_tried);
+        };
         // No energy gate here. #894 added one (`rms >= 0.3 * peak`) because an all-zero window then
         // decoded degenerately past ShortFec+CRC as a valid AckOk. Wire whitening (#1027) removed that
         // case — a silent window demodulates to 13 zero bytes, which descramble to a non-codeword and
@@ -6315,14 +6368,14 @@ impl ModemEngine {
         // RMS and refuses the real frame about 60 % of the time at the ACK channel's operating point.
         // The whitening property this relies on is pinned by `silent_window_is_not_a_valid_short_fec_ack`
         // (a keystream change would otherwise re-open the degenerate case silently).
-        let mut off = 0;
-        while off <= search_end {
+        let mut off = first;
+        while off <= last {
             if let Some(ack) = self.fsk4_ack_at(&samples[off..off + fsk4_len]) {
-                return Some(ack);
+                return (Some(ack), Some(off));
             }
             off += step;
         }
-        None
+        (None, Some(last))
     }
 
     /// Does the active OTA profile include the MFSK16 sub-floor rung? Gates the union-listen ACK path so
@@ -6399,6 +6452,8 @@ impl ModemEngine {
         // peer's only route to the recommendation). Same throttle idea — retry per FSK4-frame of growth.
         let fsk4_len = self.fsk4_ack_frame_len().unwrap_or(4160);
         let mut next_fsk4_at = fsk4_len;
+        // Highest FSK4 trial offset already attempted, so the scan never re-tries one (#1247).
+        let mut fsk4_scan_from: Option<usize> = None;
         let mut accum: Vec<f32> = Vec::new();
         // Hold ONE capture stream open for the whole window so the ~4.84 s K=3 ACK is captured as CONTIGUOUS
         // audio. Re-opening per read (the old `stage_capture_input` path) discards the audio a cpal backend
@@ -6422,9 +6477,25 @@ impl ModemEngine {
                         accum.extend_from_slice(&routed.samples);
                         if accum.len() >= next_fsk4_at {
                             next_fsk4_at = accum.len() + fsk4_len;
-                            if let Some(ack) = self.decode_fsk4_ack_in_stream(&accum) {
-                                if session_ok(&ack) {
-                                    return Ok(ack);
+                            // Resume past offsets already tried (#1247), and keep going within THIS
+                            // tick when a hit is rejected: a foreign-session ACK sitting early in the
+                            // buffer otherwise wins the scan on every tick and starves the listen.
+                            loop {
+                                let (found, last) =
+                                    self.decode_fsk4_ack_in_stream_from(&accum, fsk4_scan_from);
+                                // Only continue while the scan is making progress. `last` always
+                                // advances today (a hit returns its own offset), but this loop is
+                                // the one place where it not advancing would spin forever instead of
+                                // failing — found by sabotaging the resume and watching the test
+                                // HANG rather than fail. An invariant worth enforcing, not assuming.
+                                let advanced = last > fsk4_scan_from;
+                                if last.is_some() {
+                                    fsk4_scan_from = last;
+                                }
+                                match found {
+                                    Some(ack) if session_ok(&ack) => return Ok(ack),
+                                    Some(_) if advanced => continue,
+                                    _ => break,
                                 }
                             }
                         }
@@ -7322,6 +7393,100 @@ fn apply_dc_block(mut samples: Vec<f32>) -> Vec<f32> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod ack_scan_tests {
+    use super::*;
+
+    /// The resumable scan must try exactly the offsets a from-scratch scan would — no repeats, no
+    /// gaps — however the buffer grows (#1247).
+    ///
+    /// Pure, so this gates the property directly rather than through a counter or an exported
+    /// accessor. `ScanPlanner` has the same rule for the data path; the ACK path had a fixed cap.
+    #[test]
+    fn a_resumed_scan_covers_exactly_the_offsets_a_full_scan_would() {
+        const FRAME: usize = 4160;
+        const STEP: usize = 20;
+        // Growth that is uneven, sometimes smaller than one step, and lands off the step grid.
+        let lengths = [
+            0, 100, 4159, 4160, 4165, 4180, 4181, 8000, 8001, 20_000, 20_003, 60_000, 72_000,
+        ];
+
+        let mut last: Option<usize> = None;
+        let mut tried: Vec<usize> = Vec::new();
+        for len in lengths {
+            if let Some((first, hi)) = ModemEngine::ack_scan_span(last, len, FRAME, STEP) {
+                let mut off = first;
+                while off <= hi {
+                    tried.push(off);
+                    off += STEP;
+                }
+                last = Some(hi);
+            }
+        }
+
+        let final_len = *lengths.last().expect("non-empty");
+        let expected: Vec<usize> = (0..=(final_len - FRAME) / STEP).map(|k| k * STEP).collect();
+        assert_eq!(
+            tried, expected,
+            "a resumed scan did not cover the same offsets, in the same order, as one full scan of \
+             the final buffer — so resuming changes either coverage or detection latency"
+        );
+
+        let mut sorted = tried.clone();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            tried.len(),
+            "an offset was tried twice; the whole point of resuming is that it is not"
+        );
+    }
+
+    /// A buffer shorter than one frame yields nothing, and never panics on the subtraction.
+    #[test]
+    fn a_buffer_shorter_than_one_frame_yields_no_offsets() {
+        assert_eq!(ModemEngine::ack_scan_span(None, 0, 4160, 20), None);
+        assert_eq!(ModemEngine::ack_scan_span(None, 4159, 4160, 20), None);
+        assert_eq!(
+            ModemEngine::ack_scan_span(None, 4160, 4160, 20),
+            Some((0, 0))
+        );
+        // Already past the end: nothing new.
+        assert_eq!(ModemEngine::ack_scan_span(Some(0), 4160, 4160, 20), None);
+    }
+
+    /// THE PROPERTY THAT MAKES RESUMING EQUIVALENT, pinned because it is INHERITED, not designed.
+    ///
+    /// A resumed scan is only equivalent to a rescan if a trial decode at a given offset gives the
+    /// same answer later in the listen as it would have earlier. `fsk4_ack_at` takes `&self` and
+    /// mutates nothing, but its demod config carries `afc_correction_hz` — and the listen loop calls
+    /// `decode_fsk4_ack` on every chunk, which feeds `update_afc_estimate`. The correction stays put
+    /// only because `Fsk4Plugin` does not override `estimate_afc_hz` and inherits the trait's `None`.
+    ///
+    /// Give FSK4-ACK an AFC estimator and resumed and from-scratch scans diverge silently. This test
+    /// is what makes that a deliberate decision rather than a surprise.
+    #[test]
+    fn fsk4_ack_publishes_no_afc_estimator_so_a_resumed_scan_is_equivalent() {
+        let mut e = ModemEngine::new(Box::new(openpulse_audio::LoopbackBackend::new()));
+        e.register_plugin(Box::new(fsk4_plugin::Fsk4Plugin::new()))
+            .expect("register");
+        let plugin = e.plugins.get("FSK4-ACK").expect("FSK4-ACK registered");
+        let cfg = openpulse_core::plugin::ModulationConfig {
+            mode: "FSK4-ACK".to_string(),
+            ..Default::default()
+        };
+        let noise: Vec<f32> = (0..8000)
+            .map(|i| ((i * 7919) % 211) as f32 / 211.0 - 0.5)
+            .collect();
+        assert!(
+            plugin.estimate_afc_hz(&noise, &cfg).is_none(),
+            "FSK4-ACK now publishes an AFC estimate, so `afc_correction_hz` can move DURING an ACK \
+             listen — and a resumed trial-decode scan is no longer equivalent to rescanning from \
+             zero (#1247). Either thread a config captured at listen start into \
+             `decode_fsk4_ack_in_stream_from`, or restore the cap and accept the unreachable region."
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
