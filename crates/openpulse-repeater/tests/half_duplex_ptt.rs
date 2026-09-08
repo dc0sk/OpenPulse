@@ -160,9 +160,20 @@ fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
     src.transmit(b"relay frame", "BPSK250", None).expect("tx");
 
     let mut rp = CrossBandRepeater::new(Box::new(spy.clone()), engine_rx, engine_tx, config);
-    let err = rp
-        .relay_one_frame()
-        .expect_err("the tx engine has no plugin, so the relay must fail");
+    // Since #1297 one call is one capture TICK: the burst flushes on the first empty read after the
+    // frame, so the transmit — and its failure — happen on a later tick than the one that read it.
+    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
+    let mut err = None;
+    for _ in 0..16 {
+        match rp.relay_one_frame(&mut rx) {
+            Ok(_) => continue,
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let err = err.expect("the tx engine has no plugin, so the relay must fail within 16 ticks");
 
     assert!(
         !spy.is_asserted(),
