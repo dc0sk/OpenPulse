@@ -9,6 +9,58 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — A cap-flushed burst is not ladder evidence (#1255)
+
+- **Requirement/change:** `accumulate_routed` returned `Ok(Some(burst))` for two opposite events —
+  carrier drop (a complete transmission) and cap hit (the carrier was still up) — with nothing
+  distinguishing them, so a failed decode of a capped slab drove `RxOutcome::Failed`.
+
+- **Design decision (reviewed by Fable before implementing; it changed both the shape and the
+  severity).**
+  1. **A third API shape, and the cheapest.** I proposed either a `BurstEnd` return type (~19 test
+     files churn, several of them acceptance gates) or a side-channel query (silently ignorable).
+     Review found the engine already owns both ends: record the reason internally and consult it in
+     `ota_decode_and_ack_inner`, returning `ack: None`. That lands in the discrimination **#1123
+     already built** — the daemon's `ladder_frame = res.ack.is_some()` branch already means "key
+     nothing, leave the budget alone". Zero daemon changes, no signature churn.
+  2. **The severity is the controller, not the keying.** I framed this as spent RF. The keying IS
+     bounded, by `OTA_NACK_BUDGET`. The **rate-controller demotion is not**: successive capped slabs
+     walk `recommended_level` down and the next real ACK carries it to the peer.
+  3. **Two of the issue's premises did not survive.** "A capped burst is never one legitimate frame"
+     is false — a frame at the head of the slab is whole and decodable — and its proposal to skip the
+     decode would have made the daemon **deaf on a hot band**, because when the squelch sits below
+     the floor every burst is a cap flush (#1254's regime, fixed hours earlier the same day).
+     The issue is re-scoped from "add `BurstEnd`" to "a cap flush is not ladder evidence".
+  4. **My own QRM argument was wrong and is retracted.** I justified keeping the decode by the
+     interferer-holds-the-channel case; the DCD is measured **post-notch**, so a notchable interferer
+     never holds it open and REQ-QRM-01's rescue case never produces a cap flush. The right reasons
+     are stuck-DCD and the boundary frame.
+  5. **Scope of "keep the decode", stated so the next reader does not overclaim it.** Both scan
+     phases bound onsets to `4 x acq_samples` (~0.5 s at BPSK250, ~4 s at BPSK31) against a 37-300 s
+     slab. Keeping the decode preserves *boundary* frames; it does not reach a frame embedded
+     mid-carrier.
+
+- **Implementation:** `crates/openpulse-modem/src/engine.rs` — `last_flush_capped` set at the two
+  flush sites, `take()`n in `ota_decode_and_ack_inner` before the OTA borrow so a later hand-built
+  burst cannot read a stale `true`.
+
+- **Tests:** `cap_flush_is_not_ladder_evidence.rs`, all through `accumulate_capture` (the flush
+  reason exists nowhere else). The stuck carrier is a **tone, not broadband noise**: the squelch is
+  driven by a low percentile across passband bins, so wideband noise raises the floor with itself and
+  the carrier reads absent within a second — measured while building this fixture, and an independent
+  reproduction of #1304's mechanism. The cap length is **discovered by feeding until it flushes**
+  rather than transcribed, since no public accessor exposes the candidate-set max.
+
+- **Test results:** 3 passed. Sabotage-verified: disabling the check fails the fix's test with "a
+  cap-flushed slab that decoded nothing produced an ACK frame" while both controls stay green — so
+  the fix is not blanket-suppressing the NACK path. Full workspace gate below.
+
+- **A number this incidentally confirms.** #1249's "~25-31 s to `ota_decode_burst` a cap-length slab,
+  flat in buffer length" was one uncommitted ad-hoc run, and review flagged it as unreproduced. This
+  file takes ~70 s for three tests, two of which decode a capped slab, and shrinking the slab 8x
+  (298 k vs 2.39 M samples) did **not** reduce it — which is the flatness that figure claims. Not a
+  measurement of the number, but the first committed evidence consistent with it.
+
 ## 2026-09-08 — `openpulse-kiss` built a `SharedPtt` and never started its watchdog (#1299, KISS half)
 
 - **Requirement/change:** found while writing #1260's Twins section, which first claimed the
