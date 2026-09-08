@@ -9,6 +9,48 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — `[audio] device` was honoured by exactly one engine in the workspace (#1311)
+
+- **Requirement/change:** found while scoping #1308. `ModemEngine::set_default_device` was called at
+  exactly ONE construction site in the workspace — the daemon's main engine. ARDOP, KISS and the TUI
+  built engines and passed a hardcoded `None` for the per-call device, so on any multi-card host they
+  took the OS default card and `[audio] device` — documented with a whole paragraph on hotplug-safe
+  resolution — was silently ignored. `openpulse-tnc` is the shipped Pat surface.
+
+- **Census, corrected twice.** My issue filing said "four front-ends", which was a claim about a
+  filter that had only looked at the sites #1308's review named. Reading every site: **three** are
+  broken (ARDOP, KISS, TUI); the **CLI is correct** by the other mechanism, threading `--device` per
+  call; `openpulse-mesh` is moot (real-audio capability removed, and `no_real_audio.rs` keeps it
+  out); the repeater's two engines are #1308 and blocked on a ruling.
+
+- **The finding under the finding.** The engine resolves a device as `device.or(self.default_device)`,
+  so a front-end may name it per call OR once at construction. The two correct surfaces used two
+  **different** mechanisms, nothing documents which a front-end should use, and three of them used
+  neither. There are also **seven** copies of the backend-selection `match` across the workspace, so
+  there was no shared place where pinning the device would have been the obvious next line.
+
+- **Design decision.** Three one-line fixes plus a **source scan**, rather than the shared engine
+  builder the #1308 review floated. The builder is right in principle — `ptt_builder` (#1258) is the
+  in-repo precedent for the identical shape — but it needs `cpal` feature forwarding across five
+  crates, which is a wide change to make inside a fix for a silent-wrong-card bug. The scan is what
+  actually prevents recurrence, and it is the instrument this repo already uses for keying
+  (`ptt_keys_every_transmit`). Deduping the seven matches stays available and separable.
+  The TUI needed its config load moved ahead of the engine: it takes its backend from `--backend`
+  and has no device flag, so the config was the only source and it was read too late.
+
+- **Implementation:** `crates/openpulse-{ardop,kiss,tui}/src/main.rs`, one guarded
+  `set_default_device` each; the TUI's `openpulse_config::load()` hoisted above the backend match.
+
+- **Tests:** `front_ends_pin_the_audio_device.rs` — a scan requiring a `set_default_device` within 12
+  lines of every `ModemEngine::new(`, with the exclusions written into the source as a list and a
+  reason each, so a future front-end is added to the scan rather than quietly omitted from it.
+
+- **Test results:** 2 passed. **Validated in three directions**, because a scan that matches nothing
+  passes exactly like a scan over compliant code: a planted violation is flagged, a planted fix is
+  accepted, a `set_default_device` placed outside the window is rejected — and then the real check,
+  deleting the pin from `openpulse-kiss` itself, which fails with "openpulse-kiss builds a
+  ModemEngine at line(s) [82] without calling set_default_device". Full workspace gate below.
+
 ## 2026-09-08 — The repeater's receive window could not contain a frame (#1297)
 
 - **Requirement/change:** `relay_one_frame_at` called `engine_rx.receive(...)`, which opens an input
