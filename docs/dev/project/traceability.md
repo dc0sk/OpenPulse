@@ -9,6 +9,56 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-08 — #1264 closed won't-fix: `block_in_place` on the `block_on` thread is inert (#1301 filed)
+
+- **Requirement/change:** #1264 claimed five `lib.rs` transmit sites "block a tokio worker thread"
+  because they lack `tokio::task::block_in_place`, which `server.rs`'s four sites have. Measure
+  before fixing (the issue's own instruction), then decide.
+
+- **Design decision (reviewed by Fable before implementing; the review closed the issue instead).**
+  The premise is false for `openpulse-server`. `#[tokio::main]` polls `server::run`'s future via
+  `block_on` on the **main thread** — the future is `!Send` and cannot be `tokio::spawn`ed
+  (`twin.rs:172-174` already recorded this) — and `block_in_place` from a `block_on` thread has no
+  core to hand off, so it runs the closure inline. **A/B'd against a no-op** rather than argued, which
+  is `defect-archetypes` #14's own probe: a task ticking every 5 ms advanced **80** times during a
+  bare 500 ms block and **81** with `block_in_place`. So the four `server.rs` wrappers cited as the
+  pattern to copy are inert in production, five more would be inert, and the asymmetry that motivated
+  the issue exists only in the comments.
+
+- **Three further corrections, all to claims I or the issue had already written down:**
+  1. **The measurement was 6x low.** I derived duration as `drained_samples / 48000`; the engine
+     synthesises at `AudioConfig::default()` = **8000 Hz mono** (`engine.rs:6648`,
+     `core/src/audio.rs:107`). Real figures are ~8.5 s per fragment at BPSK250 and ~68 s at BPSK31.
+     The cross-derivation that catches this shares no constant with the first — **duration =
+     symbols / baud**, sample-rate-independent — and agrees to 0.5 %. Written into the
+     `measurement-integrity` skill; the sibling lesson got **no** skill change, because #14 already
+     carries it.
+  2. **"A handshake burst is ~20 SAR fragments" is stale** — since #1147 both frames fit ONE
+     fragment (`FRAGMENT_CAPACITY = 251`), and the ~20 figure describes the **PQ** path, which has
+     zero production callers (`PqConReqParams` is `DORMANT(#1147)`).
+  3. **The issue's preferred fix does not compile.** `spawn_blocking` needs `'static + Send`; all
+     five sites hold `engine: &mut ModemEngine`. `openpulse-ardop`/`openpulse-kiss` hold
+     `Arc<Mutex<ModemEngine>>` and are the working example of that option.
+  My own "BPSK31 is the entry rung, so 68 s is not a corner case" also conflated two mode selectors:
+  these sites transmit in `active_mode` (default `BPSK250`), while `hpx_hf` SL2 governs the OTA send.
+
+- **Implementation:** comments only. Three `block_in_place` comments in `server.rs` asserted an effect
+  they do not have ("so the blocking turnaround does not stall the daemon's async runtime"; "keeps
+  the async loop responsive"). Believing them is what produced #1264, so they now say what the call
+  actually does — guard against a future worker-polled context — and point at #1301.
+
+- **Tests:** none added; no behaviour changed. The ablation above is recorded in #1264's closing
+  comment and #1301 rather than committed, because it measures tokio's scheduler, not this codebase.
+
+- **Test results:** `cargo clippy -p openpulse-daemon --no-default-features --all-targets` clean;
+  full workspace gate below.
+
+- **Filed:** #1301 — the real defect. The run loop services no arm (rx tick, command, watchdog) for
+  the duration of a frame: ~8.5 s at the default mode, ~68 s at BPSK31. The PTT watchdog is already
+  on an OS thread (#863) for exactly this reason, so safety is covered and responsiveness is not.
+  Neither fix direction is cheap, and whether operator responsiveness during a transmit is a
+  requirement at all should be decided before either is built.
+
 ## 2026-09-07 — The cross-band repeater onto `SharedPtt`, and what reading it turned up (#1260)
 
 - **Requirement/change:** #1260 — `relay_one_frame` asserted PTT then `?`-returned past its own
