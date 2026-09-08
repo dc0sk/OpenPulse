@@ -678,6 +678,13 @@ pub struct ModemEngine {
     /// drops. Lets a tick-based daemon assemble a full frame from a streaming
     /// (cpal) backend instead of decoding one partial tick window.
     rx_burst: Vec<f32>,
+    /// Whether the last burst was flushed by the runaway CAP rather than by a carrier drop (#1255).
+    ///
+    /// A cap flush means the carrier was still up when the accumulator hit its bound, so the slab is
+    /// not one transmission: it is a stuck channel, or a frame with a long carrier behind it. Consumed
+    /// by `ota_decode_and_ack_inner`, which must not treat a failed decode of such a slab as evidence
+    /// about the rate ladder.
+    last_flush_capped: bool,
     /// Set while decoding an already-front-end-processed burst (e.g. `decode_burst` scans a burst that
     /// `accumulate_routed` already ran through the InputCapture seam). Makes the nested
     /// `route_audio_stage(InputCapture)` in the per-slice decode a pass-through, so the stateful AGC and
@@ -943,6 +950,7 @@ impl ModemEngine {
             default_device: None,
             last_audio: Vec::new(),
             rx_burst: Vec::new(),
+            last_flush_capped: false,
             input_prerouted: false,
             suppress_afc_events: false,
             rx_capturing: false,
@@ -2129,6 +2137,8 @@ impl ModemEngine {
             // configured mode alone — see `active_burst_cap_samples` (#1249).
             if self.rx_burst.len() >= self.active_burst_cap_samples() {
                 self.rx_capturing = false;
+                // The carrier is STILL PRESENT — this slab is not one transmission (#1255).
+                self.last_flush_capped = true;
                 return Ok(Some(AudioSamples {
                     samples: std::mem::take(&mut self.rx_burst),
                 }));
@@ -2154,6 +2164,7 @@ impl ModemEngine {
                 return Ok(None);
             }
             // Carrier dropped after a burst → the frame is complete; flush it.
+            self.last_flush_capped = false;
             Ok(Some(AudioSamples {
                 samples: std::mem::take(&mut self.rx_burst),
             }))
@@ -3036,6 +3047,30 @@ impl ModemEngine {
             let m = decoded.as_ref().map(|(_, _, m)| m.as_str())?;
             Some(self.rx_snr_db(m, &samples.samples[start..end]))
         });
+
+        // #1255: a cap-flushed slab is not evidence about the rate ladder, in either direction.
+        //
+        // The cap exceeds the longest candidate frame, so hitting it means the carrier was still up:
+        // the slab is a stuck channel or a frame trailed by a long carrier, not one transmission
+        // that failed. Feeding `RxOutcome::Failed` here does two things, and only one of them is
+        // bounded. The NACK keying is capped by `OTA_NACK_BUDGET` (`server.rs`), but the rate
+        // controller's demotion is NOT: three such slabs walk `recommended_level` down and the next
+        // real ACK carries it to the peer.
+        //
+        // Routed into the discrimination #1123 already built rather than a new `BurstEnd` type on
+        // the seam: returning `ack: None` puts this in the daemon's existing `ladder_frame == false`
+        // branch, which already means "key nothing, leave the budget alone". Zero daemon changes and
+        // no signature churn across ~19 test files.
+        //
+        // The DECODE above still ran, and must: when the squelch sits below the floor EVERY burst is
+        // a cap flush (that is #1254's regime), so skipping the decode here would have made the
+        // daemon deaf on a hot band. `take()` so the flag is consumed once and a later hand-built
+        // burst cannot read a stale `true`.
+        if decoded.is_none() && std::mem::take(&mut self.last_flush_capped) {
+            tracing::debug!("OTA: cap-flushed burst did not decode; not ladder evidence (#1255)");
+            return Ok((None, None, last_err));
+        }
+        self.last_flush_capped = false;
 
         let ota = self
             .ota
