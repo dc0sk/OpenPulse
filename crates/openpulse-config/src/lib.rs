@@ -498,14 +498,21 @@ pub struct ModemConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RigConfig {
-    /// rigctld TCP address for this rig (default `"127.0.0.1:4532"`). The only field the daemon
-    /// currently consumes (via `[radio.rig_b]` for the cross-band repeater's TX PTT).
+    /// rigctld TCP address for this rig (default `"127.0.0.1:4532"`).
+    ///
+    /// Under `[radio.rig_b]` it drives the cross-band repeater's TX PTT. It must NOT equal the
+    /// top-level `[radio] rigctld_addr` when the main rig reaches that rigctld for CAT or PTT — the
+    /// default value collides with it, so an empty `[radio.rig_b]` section is itself the collision,
+    /// and the daemon refuses to start an enabled repeater on one (#1260).
     pub rigctld_addr: String,
-    /// **Reserved (multi-rig).** Per-rig CAT backend selector; the daemon reads the *top-level*
-    /// `[radio] cat_backend` (`"rigctld"` / `"generic"` / `"none"`), not this per-rig copy.
+    /// Per-rig PTT/CAT backend selector. Read for `[radio.rig_b]` since #1260 (it selects the
+    /// repeater's TX PTT backend through the shared `ptt_builder`); for `[radio.rig_a]` the daemon
+    /// still reads the *top-level* `[radio] cat_backend`.
     pub backend: String,
-    /// **Reserved (multi-rig).** The active generic-backend serial port is the *top-level*
-    /// `[radio] serial_port`; this per-rig copy is unread until the multi-rig refactor.
+    /// Serial port for this rig's backend. Read for `[radio.rig_b]` since #1260 (the `rts`/`dtr`/
+    /// `cm108`/`gpio` device path for the repeater's TX PTT; note there is no per-rig GPIO pin, so
+    /// `backend = "gpio"` on rig_b means pin 0). For `[radio.rig_a]` the active generic-backend port
+    /// is still the *top-level* `[radio] serial_port`.
     pub serial_port: String,
     /// **Reserved (multi-rig).** The active generic-backend rig file is the *top-level*
     /// `[radio] rig_file`; this per-rig copy is unread until the multi-rig refactor.

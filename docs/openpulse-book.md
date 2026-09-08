@@ -4045,11 +4045,13 @@ strong authentication".
 enabled = false
 mode = "BPSK250"     # same mode both directions
 tx_hang_ms = 500     # ignored when full_duplex
-full_duplex = false
+full_duplex = false  # true = hold the key ACROSS frames (dropped after silence),
+                     # not from session start
 
 [radio.rig_b]
-rigctld_addr = "127.0.0.1:4533"   # the daemon reads ONLY this field of rig_b,
-                                  # for the repeater's TX-side PTT
+rigctld_addr = "127.0.0.1:4533"   # must NOT be the main rig's rigctld — the daemon
+backend = "rigctld"               # refuses to start on a collision, because two
+serial_port = ""                  # SharedPtts would key and release one transmitter
 ```
 
 Then, with the daemon running:

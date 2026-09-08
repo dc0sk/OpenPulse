@@ -7,8 +7,12 @@ pub struct RepeaterConfig {
     pub mode: String,
     /// Milliseconds to hold PTT after the last TX byte (half-duplex only).
     pub tx_hang_ms: u64,
-    /// When true, PTT is held for the entire relay session by `run_full_duplex()`.
-    /// `tx_hang_ms` is ignored in full-duplex mode.
+    /// When true, PTT is held *across* relayed frames rather than dropped between them: the key is
+    /// taken on the first frame, re-stamped by each subsequent one, and released by the watchdog
+    /// after [`openpulse_radio::DEFAULT_PTT_MAX`] of silence. `tx_hang_ms` is ignored.
+    ///
+    /// It is NOT held from session start (changed in #1260) — the watchdog is in-process, so an
+    /// eager unbounded hold means a dead daemon leaves rig_b keyed with nothing to release it.
     pub full_duplex: bool,
     /// Station callsign transmitted for §97.119 identification of the *transmitting* rig (rig_b). Empty
     /// disables auto-ID (the repeater then never keys an ID — the operator is responsible).

@@ -20,7 +20,7 @@ use openpulse_core::station_id::StationIdTimer;
 use openpulse_core::trust_store_file::load_trust_store_from_file;
 use openpulse_modem::ModemEngine;
 use openpulse_qsy::session::QsyPolicy;
-use openpulse_radio::{CatController, NoOpPtt, PttController, RigctldController, RigctldPtt};
+use openpulse_radio::{CatController, PttController, RigctldController};
 use openpulse_repeater::{CrossBandRepeater, RepeaterConfig};
 
 use bpsk_plugin::BpskPlugin;
@@ -325,29 +325,74 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                 tracing::warn!(plugin = name, error = %e, "repeater tx: plugin registration failed");
             }
         }
-        let rep_ptt: Box<dyn PttController + Send> = match cfg.radio.rig_b.as_ref() {
-            Some(rig_b) => match RigctldPtt::connect(&rig_b.rigctld_addr) {
-                Ok(ctrl) => {
-                    tracing::info!(addr = %rig_b.rigctld_addr, "repeater PTT connected via rigctld");
-                    Box::new(ctrl)
+        // rig_b is a SECOND transmitter, and until #1260 it was the one place the daemon still had
+        // #1285's fail-open: a failed `RigctldPtt::connect` fell back to `NoOpPtt`, logged "repeater
+        // TX will be silent" — and it is not silent, it transmits into an unkeyed rig. Route it
+        // through the same builder as the main rig so a config error refuses to start and an
+        // unreachable rig gets a controller that refuses to key and keeps retrying.
+        let rep_ptt: Option<Box<dyn PttController + Send>> = match cfg.radio.rig_b.as_ref() {
+            Some(rig_b) => {
+                // Both `RigConfig::default()` and `RadioConfig::default()` carry
+                // `rigctld_addr = "127.0.0.1:4532"`, and `rig_b` is `#[serde(default)]`. So an
+                // operator who writes a `[radio.rig_b]` header without an address — or leaves the
+                // template's commented-out line commented — gets rig_b pointed at the SAME rigctld
+                // as the main rig. Two `SharedPtt`s would then each be certain they own one
+                // transmitter: the daemon's guard drop sends `T 0` under the repeater's frame and
+                // vice versa, and neither watchdog can see the other's key. #1263's refusal rule
+                // protects only within one `SharedPtt`, so it cannot reach this.
+                if let Some(why) = repeater_rig_b_config_error(
+                    &rig_b.backend,
+                    &rig_b.rigctld_addr,
+                    &cfg.modem.ptt_backend,
+                    &cfg.radio.cat_backend,
+                    &cfg.radio.rigctld_addr,
+                ) {
+                    if cfg.repeater.enabled {
+                        return Err(format!("refusing to start: {why}"));
+                    }
+                    tracing::warn!("{why}; the repeater cannot be enabled with this config");
+                    None
+                } else {
+                    match build_ptt_controller(
+                        &rig_b.backend,
+                        &rig_b.rigctld_addr,
+                        &rig_b.serial_port,
+                        0,
+                    ) {
+                        Some(ctrl) => {
+                            tracing::info!(
+                                backend = %rig_b.backend,
+                                addr = %rig_b.rigctld_addr,
+                                "repeater PTT built for rig_b"
+                            );
+                            Some(ctrl)
+                        }
+                        None => {
+                            let why = format!(
+                                "[radio.rig_b] backend = \"{}\" is not a usable PTT backend",
+                                rig_b.backend
+                            );
+                            if cfg.repeater.enabled {
+                                return Err(format!("refusing to start: {why}"));
+                            }
+                            tracing::warn!(
+                                "{why}; the repeater cannot be enabled with this config"
+                            );
+                            None
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        addr = %rig_b.rigctld_addr,
-                        error = %e,
-                        "repeater rigctld PTT connect failed; repeater TX will be silent"
-                    );
-                    Box::new(NoOpPtt::new())
-                }
-            },
+            }
             None => {
                 if cfg.repeater.enabled {
-                    tracing::warn!(
-                        "repeater.enabled = true but [radio.rig_b] is not configured; \
-                         repeater PTT will be no-op — add [radio.rig_b] to config.toml"
+                    return Err(
+                        "refusing to start: repeater.enabled = true but [radio.rig_b] is not \
+                         configured — the repeater would transmit into an unkeyed rig; add \
+                         [radio.rig_b] to config.toml"
+                            .to_string(),
                     );
                 }
-                Box::new(NoOpPtt::new())
+                None
             }
         };
         let rep_cfg = RepeaterConfig {
@@ -358,7 +403,7 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
             callsign: cfg.station.callsign.clone(),
             id_interval_secs: cfg.station.auto_id_interval_secs,
         };
-        CrossBandRepeater::new(rep_ptt, rx, tx, rep_cfg)
+        rep_ptt.map(|p| CrossBandRepeater::new(p, rx, tx, rep_cfg))
     };
 
     let tcp_bind: std::net::SocketAddr =
@@ -609,7 +654,7 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
 
     let mut runtime_state = RuntimeControlState {
         repeater_enabled: cfg.repeater.enabled,
-        repeater: Some(repeater),
+        repeater,
         ptt: crate::ptt::SharedPtt::new(ptt_controller, crate::ptt::DEFAULT_PTT_MAX),
         station_seed,
         local_callsign: cfg.station.callsign.clone(),
@@ -2074,6 +2119,43 @@ fn front_end_state(
     }
 }
 
+/// Why `[radio.rig_b]` cannot drive a second transmitter, or `None` if it can (#1260).
+///
+/// Both `RigConfig::default()` and `RadioConfig::default()` carry `rigctld_addr = "127.0.0.1:4532"`,
+/// and `rig_b` is `#[serde(default)]`. So an operator who writes a `[radio.rig_b]` header without an
+/// address — or leaves the config template's commented-out line commented — gets rig_b pointed at
+/// the SAME rigctld as the main rig. Two `SharedPtt`s would then each be certain they own one
+/// transmitter: the daemon's guard drop sends `T 0` under the repeater's frame and vice versa, and
+/// neither watchdog can see the other's key. #1263's refusal rule protects only *within* one
+/// `SharedPtt`, so it cannot reach this — the construction site has to.
+fn repeater_rig_b_config_error(
+    rig_b_backend: &str,
+    rig_b_addr: &str,
+    main_ptt_backend: &str,
+    main_cat_backend: &str,
+    main_addr: &str,
+) -> Option<String> {
+    // The shared thing is the rigctld ENDPOINT, not the PTT backend: `[radio] rigctld_addr` is the
+    // main rig's CAT endpoint whenever `cat_backend = "rigctld"` (the default), and rigctld keys the
+    // rig over CAT. So `ptt_backend = "vox"` with a defaulted `[radio.rig_b]` still puts rig_b's
+    // `T 1` on the main transmitter — invisible to both `SharedPtt`s, since neither controller is
+    // even involved.
+    let main_uses_rigctld = main_ptt_backend == "rigctld" || main_cat_backend == "rigctld";
+    if rig_b_backend == "rigctld" && main_uses_rigctld && rig_b_addr == main_addr {
+        return Some(format!(
+            "[radio.rig_b] rigctld_addr = {rig_b_addr} is the rigctld the main rig already uses \
+             ([radio] rigctld_addr, reached by cat_backend = \"{main_cat_backend}\" / ptt_backend = \
+             \"{main_ptt_backend}\") — the repeater and the main transmitter would key and release \
+             each other's PTT"
+        ));
+    }
+    // Deliberately a string comparison: it catches the shipped defaults, which is the case this
+    // exists for, and NOT an aliasing spelling such as `localhost:4532` against `127.0.0.1:4532`.
+    // Resolving both sides would need a DNS lookup at startup for a config the operator wrote by
+    // hand; the honest scope is "the default collision", not "every way to name one endpoint".
+    None
+}
+
 fn build_ptt_controller(
     backend: &str,
     rigctld_addr: &str,
@@ -3105,6 +3187,92 @@ mod ws_auth_gate_tests {
         // The one safe case: no TCP auth required and the WS port is loopback-only.
         assert!(!ws_disabled_for_auth(false, "127.0.0.1"));
         assert!(!ws_disabled_for_auth(false, "localhost"));
+    }
+}
+
+#[cfg(test)]
+mod repeater_rig_b_tests {
+    use super::repeater_rig_b_config_error;
+    use openpulse_config::{RadioConfig, RigConfig};
+
+    /// #1260: the aliasing case is not exotic — it is what an empty `[radio.rig_b]` header produces,
+    /// because both defaults carry the same rigctld address.
+    #[test]
+    fn an_empty_rig_b_section_aliases_the_main_rig_and_is_refused() {
+        let rig_b = RigConfig::default();
+        let radio = RadioConfig::default();
+        let why = repeater_rig_b_config_error(
+            &rig_b.backend,
+            &rig_b.rigctld_addr,
+            "rigctld",
+            &radio.cat_backend,
+            &radio.rigctld_addr,
+        )
+        .expect(
+            "a defaulted [radio.rig_b] points at the main rig's rigctld; accepting it gives two \
+             SharedPtts one transmitter",
+        );
+        assert!(
+            why.contains(&rig_b.rigctld_addr),
+            "the error must name the address: {why}"
+        );
+    }
+
+    /// A non-rigctld PTT backend on the main rig does NOT make the address incidental: rigctld keys
+    /// the rig over CAT, so `cat_backend = "rigctld"` — the default — shares the endpoint by itself.
+    #[test]
+    fn a_non_rigctld_ptt_backend_does_not_excuse_the_shared_cat_endpoint() {
+        for main_ptt in ["vox", "cm108", "rts"] {
+            assert!(
+                repeater_rig_b_config_error(
+                    "rigctld",
+                    "127.0.0.1:4532",
+                    main_ptt,
+                    "rigctld",
+                    "127.0.0.1:4532"
+                )
+                .is_some(),
+                "ptt_backend = {main_ptt} still leaves rig_b's `T 1` on the main rig's CAT rigctld"
+            );
+        }
+    }
+
+    /// The cases that are genuinely fine.
+    #[test]
+    fn a_distinct_address_or_a_rigctld_free_main_rig_is_accepted() {
+        assert!(
+            repeater_rig_b_config_error(
+                "rigctld",
+                "127.0.0.1:4533",
+                "rigctld",
+                "rigctld",
+                "127.0.0.1:4532"
+            )
+            .is_none(),
+            "a second rigctld on its own port is the documented cross-band setup"
+        );
+        assert!(
+            repeater_rig_b_config_error(
+                "rigctld",
+                "127.0.0.1:4532",
+                "cm108",
+                "serial",
+                "127.0.0.1:4532"
+            )
+            .is_none(),
+            "nothing on the main rig speaks to that rigctld, so the address matching is incidental"
+        );
+        assert!(
+            repeater_rig_b_config_error(
+                "rts",
+                "127.0.0.1:4532",
+                "rigctld",
+                "rigctld",
+                "127.0.0.1:4532"
+            )
+            .is_none(),
+            "rig_b is not on rigctld, so it never reaches the shared endpoint"
+        );
     }
 }
 
