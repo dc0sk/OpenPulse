@@ -80,6 +80,7 @@ BundleSpec	crates/openpulse-cli/src/commands/audit_bundle.rs
 ByteRange	crates/openpulse-core/src/fec.rs
 CRC12_POLY	plugins/js8/src/crc.rs
 CalibrationResult	crates/openpulse-cli/src/commands/calibrate.rs
+CaptureTicker	crates/openpulse-modem/src/capture_ticker.rs
 CaseDiff	apps/openpulse-testmatrix/src/compare.rs
 CatBackend	crates/openpulse-daemon/src/server.rs
 CessbConfig	crates/openpulse-dsp/src/cessb.rs
@@ -447,8 +448,8 @@ receive_with_window_arq_selective	crates/openpulse-modem/src/engine.rs
 record_arq_retry	crates/openpulse-core/src/hpx.rs
 record_event	crates/openpulse-modem/src/diagnostics.rs
 redact_secrets	crates/openpulse-daemon/src/audit.rs
-relay_one_frame	crates/openpulse-repeater/src/lib.rs
-relay_one_frame_at	crates/openpulse-repeater/src/lib.rs
+relay_burst	crates/openpulse-repeater/src/lib.rs
+relay_burst_at	crates/openpulse-repeater/src/lib.rs
 release	crates/openpulse-radio/src/shared_ptt.rs
 rendezvous_channel_hz	crates/openpulse-config/src/lib.rs
 reset_arq_retry_counter	crates/openpulse-core/src/hpx.rs

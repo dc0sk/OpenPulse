@@ -10,17 +10,21 @@ use openpulse_modem::ModemEngine;
 use openpulse_radio::NoOpPtt;
 use openpulse_repeater::{CrossBandRepeater, RepeaterConfig};
 
-/// Tick until a frame is relayed. Since #1297 one call is one capture TICK: the burst accumulator
-/// flushes when the carrier drops, which on `LoopbackBackend` is the first empty read after the
-/// frame, so relaying takes at least two calls — exactly as the daemon's loop experiences it.
-fn relay_until(rp: &mut CrossBandRepeater, now_ms: u64) -> usize {
-    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
-    for _ in 0..16 {
-        if let Some(n) = rp.relay_one_frame_at(&mut rx, now_ms).expect("relay") {
-            return n;
-        }
-    }
-    panic!("no frame relayed within 16 ticks");
+/// A burst channel the tests do not drive — they call `relay_burst_at` directly.
+fn burst_channel() -> std::sync::mpsc::Receiver<openpulse_modem::pipeline::AudioSamples> {
+    let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+    rx
+}
+
+/// Relay one burst. Since #1308 the repeater does not capture: the daemon's accumulator flushes a
+/// burst and hands it over, so a test hands it one directly.
+fn relay_burst(rp: &mut CrossBandRepeater, audio: &[f32], now_ms: u64) -> usize {
+    let burst = openpulse_modem::pipeline::AudioSamples {
+        samples: audio.to_vec(),
+    };
+    rp.relay_burst_at(&burst, now_ms)
+        .expect("relay")
+        .expect("the burst must relay")
 }
 
 fn make_engine_with_plugin() -> (ModemEngine, LoopbackBackend) {
@@ -68,22 +72,36 @@ fn spawn_mock_rigctld_with_ptt_log(ptt_log: Arc<std::sync::Mutex<Vec<&'static st
     addr
 }
 
+/// A repeater whose burst sender is gone ends its session rather than spinning (#1308).
+///
+/// This replaces `relay_disabled_returns_none`, which pinned `RepeaterConfig.enabled` — a gate
+/// deleted when the daemon took ownership of the repeater's lifecycle. That field made
+/// `EnableRepeater` on a `[repeater] enabled = false` daemon spawn a thread that reported success
+/// and returned `Ok(0)` at once, so the flag it tested was the defect, not the contract. The honest
+/// stand-in for "the thread exits" is the sender being dropped, which is what a daemon shutdown or
+/// a `DisableRepeater` actually does.
 #[test]
-fn relay_disabled_returns_none() {
+fn a_repeater_whose_sender_is_dropped_ends_its_session() {
     let (engine_rx, _lb_rx) = make_engine_with_plugin();
     let (engine_tx, _lb_tx) = make_engine_with_plugin();
     let config = RepeaterConfig {
-        enabled: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
         ..Default::default()
     };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let mut repeater =
-        CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, config);
-    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
-    let result = repeater.relay_one_frame(&mut rx).expect("no error");
-    assert_eq!(result, None);
+        CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, rx, config);
+    drop(tx);
+
+    let relayed = repeater
+        .run_full_duplex(Arc::new(AtomicBool::new(false)))
+        .expect("a disconnected sender ends the session cleanly");
+    assert_eq!(
+        relayed, 0,
+        "nothing was sent, so nothing can have been relayed"
+    );
 }
 
 #[test]
@@ -111,14 +129,19 @@ fn relay_loopback_cross_band() {
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
-        enabled: true,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
         ..Default::default()
     };
-    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
-    let n = relay_until(&mut repeater, 0);
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(rig_b),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
+    let n = relay_burst(&mut repeater, &lb_rx.drain_samples(), 0);
     assert_eq!(n, payload.len());
 
     // Verify PTT was asserted then released.
@@ -198,18 +221,23 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
         asserted: false,
     };
     let config = RepeaterConfig {
-        enabled: true,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
         callsign: "N0CALL".into(),
         id_interval_secs: 600,
     };
-    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(rig_b),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
 
     // First relay at t=0: one keying pair for the relayed frame, no ID yet.
     feed_frame(&lb_rx);
-    relay_until(&mut repeater, 0);
+    relay_burst(&mut repeater, &lb_rx.drain_samples(), 0);
     assert_eq!(
         *log.lock().unwrap(),
         vec!["assert", "release"],
@@ -224,7 +252,7 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
     // Second relay at t = 601 s: the interval has elapsed, so the ID goes out under the SAME key.
     log.lock().unwrap().clear();
     feed_frame(&lb_rx);
-    relay_until(&mut repeater, 601_000);
+    relay_burst(&mut repeater, &lb_rx.drain_samples(), 601_000);
     assert_eq!(
         *log.lock().unwrap(),
         vec!["assert", "release"],
@@ -257,7 +285,6 @@ fn relay_empty_buffer_returns_none() {
     let (engine_rx, _lb_rx) = make_engine_with_plugin();
     let (engine_tx, lb_tx) = make_engine_with_plugin();
     let config = RepeaterConfig {
-        enabled: true,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
@@ -267,13 +294,22 @@ fn relay_empty_buffer_returns_none() {
     // detail, but the contract that matters is the same either way: nothing may be relayed, and
     // nothing may be transmitted. Accepting "any outcome" (as this test used to) would also accept
     // a repeater that keyed up and relayed garbage on an empty buffer.
-    let mut repeater =
-        CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, config);
-    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
-    match repeater.relay_one_frame(&mut rx) {
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(NoOpPtt::new()),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
+    // A burst of silence — what the daemon's accumulator would flush from a squelch that opened on
+    // noise. Nothing may be relayed and nothing may be transmitted.
+    let burst = openpulse_modem::pipeline::AudioSamples {
+        samples: vec![0.0; 8000],
+    };
+    match repeater.relay_burst(&burst) {
         Ok(None) => {}
-        Ok(Some(n)) => panic!("relayed {n} bytes from an empty receive buffer"),
-        Err(_) => {} // receive() surfacing an error on an empty buffer is acceptable
+        Ok(Some(n)) => panic!("relayed {n} bytes from a burst of silence"),
+        Err(_) => {} // a decode error on silence is acceptable
     }
     assert!(
         lb_tx.drain_samples().is_empty(),
@@ -296,13 +332,18 @@ fn full_duplex_idle_session_never_keys_and_a_held_key_is_released_at_session_end
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
-        enabled: true,
         mode: "BPSK250".into(),
         tx_hang_ms: 500, // ignored in full-duplex
         full_duplex: true,
         ..Default::default()
     };
-    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(rig_b),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
 
     let stop = Arc::new(AtomicBool::new(true)); // already stopped
     let count = repeater.run_full_duplex(stop).expect("no error");
@@ -332,17 +373,22 @@ fn full_duplex_holds_one_key_across_frames_and_releases_it_at_session_end() {
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
-        enabled: true,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: true,
         ..Default::default()
     };
-    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(rig_b),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
 
     for t in [0u64, 1_000] {
         feed(&lb_rx);
-        relay_until(&mut repeater, t);
+        relay_burst(&mut repeater, &lb_rx.drain_samples(), t);
     }
     assert_eq!(
         *ptt_log.lock().unwrap(),
@@ -373,13 +419,18 @@ fn full_duplex_disabled_returns_zero_immediately() {
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
-        enabled: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: true,
         ..Default::default()
     };
-    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(rig_b),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let count = repeater.run_full_duplex(stop).expect("no error");
@@ -411,15 +462,20 @@ fn full_duplex_relay_one_frame_keys_rather_than_transmitting_into_an_unkeyed_rig
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
-        enabled: true,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: true,
         ..Default::default()
     };
-    let mut repeater = CrossBandRepeater::new(Box::new(rig_b), engine_rx, engine_tx, config);
+    let mut repeater = CrossBandRepeater::new(
+        Box::new(rig_b),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
 
-    let n = relay_until(&mut repeater, 0);
+    let n = relay_burst(&mut repeater, &lb_rx.drain_samples(), 0);
     assert!(n > 0, "expected a frame to relay");
     assert_eq!(
         *ptt_log.lock().unwrap(),
@@ -428,73 +484,11 @@ fn full_duplex_relay_one_frame_keys_rather_than_transmitting_into_an_unkeyed_rig
     );
 }
 
-/// THE #1297 GATE: a frame delivered across SEVERAL reads is still relayed.
-///
-/// This is the defect's whole shape. `engine_rx.receive(...)` opened an input stream, read once and
-/// dropped it, so on a callback backend each attempt saw a fresh buffer covering one poll interval —
-/// tens of milliseconds against a seconds-long frame. The repeater could not receive on real audio
-/// however long it ran.
-///
-/// **Why the existing tests could not see it.** `LoopbackBackend::read` drains the whole buffer, so
-/// the buffer IS the frame and one `receive` call got all of it. Every other test in this file feeds
-/// the frame that way. `push_frame` pops ONE queued frame per read, which is the chunked delivery a
-/// real capture device does — and the property that discriminates the fix from the defect.
-///
-/// It does NOT reproduce cpal in one respect worth naming: the flush here is triggered by an empty
-/// read, whereas a live stream returns noise and the flush comes from the DCD energy dropping below
-/// the adaptive squelch. So this proves accumulation across reads, not flush-on-DCD-drop.
-#[test]
-fn a_frame_split_across_several_reads_is_still_relayed() {
-    let (engine_rx, lb_rx) = make_engine_with_plugin();
-    let (engine_tx, lb_tx) = make_engine_with_plugin();
-
-    let frame = {
-        let lb = LoopbackBackend::new();
-        let mut src = ModemEngine::new(Box::new(lb.clone_shared()));
-        src.register_plugin(Box::new(BpskPlugin::new()))
-            .expect("register");
-        src.transmit(b"split across reads", "BPSK250", None)
-            .expect("tx");
-        lb.drain_samples()
-    };
-    // One read per chunk. 12 chunks of a ~9.5 k-sample frame is ~790 samples each — the order of a
-    // real tick's read, and far short of a frame however many arrive.
-    let chunk = frame.len() / 12 + 1;
-    let chunks = frame.chunks(chunk).count();
-    assert!(chunks >= 8, "fixture must span several reads, got {chunks}");
-    for c in frame.chunks(chunk) {
-        lb_rx.push_frame(c);
-    }
-
-    let config = RepeaterConfig {
-        enabled: true,
-        mode: "BPSK250".into(),
-        tx_hang_ms: 0,
-        full_duplex: false,
-        ..Default::default()
-    };
-    let mut repeater =
-        CrossBandRepeater::new(Box::new(NoOpPtt::new()), engine_rx, engine_tx, config);
-
-    let n = relay_until(&mut repeater, 0);
-    assert!(
-        n > 0,
-        "no frame relayed from audio delivered across {chunks} reads — the receive path cannot \
-         accumulate, so on a callback backend it can never see a whole frame"
-    );
-
-    // And what reached rig_b is the payload, not noise.
-    let out = {
-        let lb = LoopbackBackend::new();
-        let mut rx = ModemEngine::new(Box::new(lb.clone_shared()));
-        rx.register_plugin(Box::new(BpskPlugin::new()))
-            .expect("register");
-        lb.fill_samples(&lb_tx.drain_samples());
-        rx.receive("BPSK250", None).expect("decode relayed frame")
-    };
-    assert_eq!(
-        out.as_slice(),
-        b"split across reads",
-        "the relayed bytes are not the frame that arrived"
-    );
-}
+// `a_frame_split_across_several_reads_is_still_relayed` (#1297) was REMOVED here, not silently
+// dropped. It pinned that the repeater's own capture accumulated across reads — a property the
+// repeater no longer has, because since #1308 it does not capture at all: the daemon's accumulator
+// flushes a whole burst and hands it over. The property still matters, so it moved rather than
+// vanished: `openpulse-daemon --test repeater_relays_a_daemon_burst` delivers the frame in
+// 4096-sample reads separated by silence reads, through the real `server::run` rx tick, which is
+// where the accumulator now lives. That is a strictly better home for it — the old test could only
+// ever exercise the repeater's copy of the logic, and could not see the daemon at all.

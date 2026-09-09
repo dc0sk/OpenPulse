@@ -55,6 +55,13 @@ impl PttController for SpyPtt {
     }
 }
 
+/// A burst channel these tests do not drive: the sender is dropped at once, which is what a daemon
+/// shutdown or a `DisableRepeater` looks like from inside `run_full_duplex`.
+fn burst_channel() -> std::sync::mpsc::Receiver<openpulse_modem::pipeline::AudioSamples> {
+    let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+    rx
+}
+
 fn engine() -> ModemEngine {
     let mut e = ModemEngine::new(Box::new(LoopbackBackend::new()));
     // Without a plugin the relay loop errors on the first iteration and the session ends before the
@@ -66,18 +73,23 @@ fn engine() -> ModemEngine {
 
 /// Run a repeater session briefly, then stop it, and return the observed PTT edges.
 ///
-/// The session's return value is deliberately ignored. Since #1297 an idle loopback no longer ends
-/// the session — a capture that does not demodulate is silence, not a fault — so the loop simply
-/// spins until `stop`. The question this file asks is whether the transmitter came up at all with
-/// nothing to relay, and whether it was left keyed afterwards.
+/// The session's return value is deliberately ignored. Since #1308 the repeater does not capture at
+/// all: it blocks on the daemon's burst channel, and `burst_channel()` drops the sender, so the
+/// session ends on the `Disconnected` arm. The question this file asks is whether the transmitter
+/// came up at all with nothing to relay, and whether it was left keyed afterwards.
 fn run_session(full_duplex: bool) -> SpyPtt {
     let spy = SpyPtt::default();
     let config = RepeaterConfig {
-        enabled: true,
         full_duplex,
         ..Default::default()
     };
-    let mut rp = CrossBandRepeater::new(Box::new(spy.clone()), engine(), engine(), config);
+    let mut rp = CrossBandRepeater::new(
+        Box::new(spy.clone()),
+        engine(),
+        engine(),
+        burst_channel(),
+        config,
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_c = stop.clone();
@@ -142,7 +154,6 @@ fn full_duplex_idle_session_does_not_hold_ptt_either() {
 fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
     let spy = SpyPtt::default();
     let config = RepeaterConfig {
-        enabled: true,
         ..Default::default()
     };
     // RX decodes; TX has no plugin registered, so `transmit` fails after the key is taken.
@@ -158,22 +169,20 @@ fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
     src.register_plugin(Box::new(BpskPlugin::new()))
         .expect("register src");
     src.transmit(b"relay frame", "BPSK250", None).expect("tx");
+    let frame = lb_rx.drain_samples();
 
-    let mut rp = CrossBandRepeater::new(Box::new(spy.clone()), engine_rx, engine_tx, config);
-    // Since #1297 one call is one capture TICK: the burst flushes on the first empty read after the
-    // frame, so the transmit — and its failure — happen on a later tick than the one that read it.
-    let mut rx = openpulse_modem::capture_ticker::CaptureTicker::new(None);
-    let mut err = None;
-    for _ in 0..16 {
-        match rp.relay_one_frame(&mut rx) {
-            Ok(_) => continue,
-            Err(e) => {
-                err = Some(e);
-                break;
-            }
-        }
-    }
-    let err = err.expect("the tx engine has no plugin, so the relay must fail within 16 ticks");
+    let mut rp = CrossBandRepeater::new(
+        Box::new(spy.clone()),
+        engine_rx,
+        engine_tx,
+        burst_channel(),
+        config,
+    );
+    // Since #1308 the repeater does not capture: hand it the burst the daemon would have flushed.
+    let burst = openpulse_modem::pipeline::AudioSamples { samples: frame };
+    let err = rp
+        .relay_burst(&burst)
+        .expect_err("the tx engine has no plugin, so the relay must fail");
 
     assert!(
         !spy.is_asserted(),
@@ -187,26 +196,37 @@ fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
     );
 }
 
-/// Control: a disabled repeater must not key at all, in either mode.
+/// Control: a repeater with no bursts to relay must not key at all, in either duplex mode.
+///
+/// This was `disabled_repeater_never_keys` until the daemon took ownership of the repeater's
+/// lifecycle (#1308 review): `RepeaterConfig.enabled` is gone, so "disabled" is no longer a state
+/// the crate can be in. The property worth keeping is the one the name only implied — that having
+/// nothing to send is not a reason to bring the transmitter up — and it is the FULL-DUPLEX arm that
+/// makes it worth keeping, since that mode is defined by holding the key across frames.
 #[test]
-fn disabled_repeater_never_keys() {
+fn a_repeater_with_nothing_to_relay_never_keys() {
     for full_duplex in [false, true] {
         let spy = SpyPtt::default();
         let config = RepeaterConfig {
-            enabled: false,
             full_duplex,
             ..Default::default()
         };
-        let mut rp = CrossBandRepeater::new(Box::new(spy.clone()), engine(), engine(), config);
+        let mut rp = CrossBandRepeater::new(
+            Box::new(spy.clone()),
+            engine(),
+            engine(),
+            burst_channel(),
+            config,
+        );
         let relayed = rp
             .run_full_duplex(Arc::new(AtomicBool::new(false)))
-            .expect("a disabled repeater returns Ok(0) immediately");
+            .expect("a dropped burst sender ends the session cleanly");
 
         assert_eq!(relayed, 0);
         assert_eq!(
             spy.edges(),
             Vec::<&str>::new(),
-            "a disabled repeater keyed the transmitter (full_duplex={full_duplex})"
+            "a repeater with nothing to relay keyed the transmitter (full_duplex={full_duplex})"
         );
     }
 }

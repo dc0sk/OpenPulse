@@ -305,6 +305,9 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
     }
 
     // Pre-build the cross-band repeater so it is ready when EnableRepeater fires.
+    let repeater_burst_tx: Option<
+        std::sync::mpsc::SyncSender<openpulse_modem::pipeline::AudioSamples>,
+    >;
     let repeater = {
         let mut rx = ModemEngine::new(build_audio_backend(&cfg.audio.backend));
         for (name, plugin) in [
@@ -403,14 +406,18 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
             }
         };
         let rep_cfg = RepeaterConfig {
-            enabled: cfg.repeater.enabled,
             mode: cfg.repeater.mode.clone(),
             tx_hang_ms: cfg.repeater.tx_hang_ms,
             full_duplex: cfg.repeater.full_duplex,
             callsign: cfg.station.callsign.clone(),
             id_interval_secs: cfg.station.auto_id_interval_secs,
         };
-        rep_ptt.map(|p| CrossBandRepeater::new(p, rx, tx, rep_cfg))
+        // Bounded and lossy on purpose (#1308): the repeater spends rig_b airtime per burst while
+        // the daemon keeps hearing, so a slow relay must drop bursts rather than grow a queue. Four
+        // is a couple of frames of slack, not a buffer.
+        let (burst_tx, burst_rx) = std::sync::mpsc::sync_channel(4);
+        repeater_burst_tx = Some(burst_tx);
+        rep_ptt.map(|p| CrossBandRepeater::new(p, rx, tx, burst_rx, rep_cfg))
     };
 
     let tcp_bind: std::net::SocketAddr =
@@ -660,8 +667,12 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
     };
 
     let mut runtime_state = RuntimeControlState {
-        repeater_enabled: cfg.repeater.enabled,
+        // Set by `start_repeater_if_configured` below, which is the only thing that knows whether a
+        // thread actually started. Startup used to set this from config alone while spawning
+        // nothing, which is what made a config-enabled repeater unstartable (#1308 review).
+        repeater_enabled: false,
         repeater,
+        repeater_bursts: repeater_burst_tx,
         ptt: crate::ptt::SharedPtt::new(ptt_controller, crate::ptt::DEFAULT_PTT_MAX),
         station_seed,
         local_callsign: cfg.station.callsign.clone(),
@@ -727,6 +738,11 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
     // without conflicting with `&mut runtime_state`.
     let ptt = runtime_state.ptt.clone();
     let _ptt_watchdog = runtime_state.ptt.spawn_watchdog(handle.event_tx.clone());
+
+    // Start the repeater if the operator configured it. Deliberately AFTER the PTT watchdog: the
+    // repeater keys rig_b, and nothing should be able to key before the watchdog that bounds a
+    // stuck carrier is running.
+    crate::start_repeater_if_configured(cfg.repeater.enabled, &mut runtime_state, &handle.event_tx);
 
     // Apply the default DCD squelch at startup; per-band overrides kick in on retune.
     engine.set_dcd_squelch(cfg.modem.dcd_squelch);
@@ -954,6 +970,30 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                                 },
                             );
                         }
+                    }
+                }
+                // Cross-band relay (#1308): hand the same flushed burst to the running repeater.
+                //
+                // The repeater used to capture for itself, from a `LoopbackBackend` that
+                // `build_audio_backend` hands it fresh — so through `server::run` it heard nothing
+                // this daemon heard. One accumulator, one flush, both consumers.
+                //
+                // `try_send` on purpose: the relay spends rig_b airtime per burst while the daemon
+                // keeps hearing, so a busy relay must DROP rather than grow a queue that would
+                // eventually put minutes-old audio on the air.
+                if let (Ok(Some(b)), Some(tx), true) = (
+                    &burst,
+                    runtime_state.repeater_bursts.as_ref(),
+                    runtime_state.repeater_stop.is_some(),
+                ) {
+                    if tx.try_send(b.clone()).is_err() {
+                            runtime_state.repeater_bursts_dropped =
+                                runtime_state.repeater_bursts_dropped.saturating_add(1);
+                            tracing::warn!(
+                                dropped = runtime_state.repeater_bursts_dropped,
+                                "cross-band relay is behind; dropped a burst rather than queueing \
+                                 stale audio for transmission"
+                        );
                     }
                 }
                 let bytes = match burst {
