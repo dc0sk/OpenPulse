@@ -9,6 +9,51 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — The QSY scan's per-candidate receive was inert, and opened a second capture stream (#1312)
+
+- **Requirement/change:** `execute_qsy_actions` called `engine.receive(mode, None)` per scanned
+  candidate while the daemon's own `rx_stream` was still held — two concurrent captures on one
+  device, which #1007 established must never happen.
+
+- **Design decision (reviewed by Fable; my proposed fix was wrong on three independent grounds).**
+  1. **The receive was INERT, which is the real defect and bigger than the one I filed.**
+     `last_rx_snr_db()` is written by `record_rx_snr`, which since **#1142** — earlier the same day —
+     runs only after magic/CRC/sequence validate. A dwell on an empty candidate never decodes, so
+     every candidate was scored with the same stale number from the HOME frequency, exactly what the
+     no-rig fallback does openly. On cpal it could not even try: the stream opens AFTER the dwell and
+     `read` returns ~10 ms. Anything it did decode was discarded (`Ok(_) => {}`). Fixed by deletion.
+  2. **A post-hoc drop cannot close the overlap.** I proposed extending the `:865` drop, which runs
+     AFTER `apply_command_to_engine` returns — the streams coexist for the whole scan. The OTA drop
+     at `:826` is placed BEFORE the transmit and keyed on the variant precisely because a pre-drop
+     cannot be effect-keyed. I transplanted "counter, not variant" to the one place it cannot work.
+  3. **My condition would have fired on zero existing paths.** `execute_qsy_actions` has three
+     callers; two run on the **rx tick arm**, which a command-arm snapshot cannot see, and the third
+     transmits the REQ before scanning so the existing drop already fires. My Consumer field had
+     looked at the drop site instead of at the callers.
+  4. **The EBUSY consequence is inconsequential**: on bare ALSA the open fails, the arm warns, and
+     the scan scores the same stale number regardless. My stale-audio claim was real but conditional
+     and smaller than the OTA analogy implies — and is a property of blocking the select loop, not of
+     the second stream, so the deletion does not address it.
+
+- **Implementation:** `crates/openpulse-daemon/src/lib.rs` — the per-candidate `receive` deleted, with
+  the reasoning written where it stood, including that the scan now openly measures nothing until
+  #1308 gives it a stream it may read on the candidate frequency.
+
+- **Tests:** `the_qsy_scan_opens_no_capture_stream_of_its_own` asserts **zero** opens at the BACKEND,
+  using the counting-backend idiom #1007's own test established rather than a new engine counter —
+  which is what I had proposed, and would have meant asserting on an instrument I was adding.
+  `flavor = "multi_thread"` is required: the scan's rig calls use `block_in_place`, which panics on
+  the current-thread runtime the other tests in that module use (the #1264 constraint).
+
+- **Test results:** 1 passed. Sabotage-verified: reinstating the per-candidate receive fails it with
+  **3** opens — one per candidate, the predicted count, which is what proves the backend is counting
+  rather than the assertion passing vacuously.
+
+- **Filed:** #1319 — the rx tick arm transmits (OTA ACK, CONACK, every QSY reply) with `rx_stream`
+  held and never dropped. #1007's post-transmit rule is enforced on the **command arm only**, and a
+  QSY line at BPSK31 is tens of seconds of own-transmit audio handed to the next tick. Found by
+  running the twins grep I had left UNCHECKED.
+
 ## 2026-09-08 — The notch analysed the daemon's 400-sample ticks, and re-primed its filter every block (#1303)
 
 - **Requirement/change:** `NotchBank::spectrum_db` windowed a short block with the first `take` taps

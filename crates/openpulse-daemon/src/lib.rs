@@ -1336,12 +1336,26 @@ async fn execute_qsy_actions(
                     scan_results.push((freq, engine.last_rx_snr_db().unwrap_or(0.0)));
                     continue;
                 }
-                // Dwell per config to let the audio buffer refresh before sampling SNR.
+                // Dwell per config, so the rig settles on the candidate before moving on.
                 tokio::time::sleep(Duration::from_millis(scan_dwell_ms)).await;
-                match tokio::task::block_in_place(|| engine.receive(mode, None)) {
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(freq, error = %e, "qsy scan: receive failed"),
-                }
+                // NO per-candidate receive (#1312). There used to be one here, and it did nothing
+                // for the score while opening a SECOND capture stream on the device the daemon's own
+                // `rx_stream` already holds:
+                //
+                // * `last_rx_snr_db()` is written by `record_rx_snr`, which since #1142 runs only
+                //   after magic/CRC/sequence validate. A dwell on an empty candidate never decodes a
+                //   frame, so the value never moved — every candidate was scored with the same stale
+                //   number from the HOME frequency, which is what the no-rig branch below does
+                //   openly.
+                // * On cpal it could not even try: the stream was opened AFTER the sleep and `read`
+                //   returns only what arrived in ~10 ms.
+                // * Anything it did decode was dropped on the floor (`Ok(_) => {}`) rather than
+                //   reaching `process_received_bytes`.
+                //
+                // So this scan does not measure the candidates; it ranks them all equally and the
+                // ordering falls to the caller's tie-breaks. Making that real needs a stream the
+                // scan may read on the candidate frequency, which is the ownership question in
+                // #1308 — not something a second `open_input` can substitute for.
                 scan_results.push((freq, engine.last_rx_snr_db().unwrap_or(0.0)));
             }
             if let Some(orig) = original_freq {
@@ -4920,6 +4934,127 @@ mod command_apply_tests {
              daemon's streaming (accumulate_capture) path"
         );
         engine
+    }
+
+    /// THE #1312 GATE: the QSY scan must not open a capture stream of its own.
+    ///
+    /// The daemon holds ONE capture stream for the life of the process (dropped only around a
+    /// transmit), and #1007 established the rule: never two capture streams on one device. The scan
+    /// broke it — `engine.receive` per candidate, while `rx_stream` was still held — on every entry
+    /// point, including the two that run on the rx tick arm where no drop exists at all.
+    ///
+    /// Asserted at the BACKEND, which is the behavioural property, using the counting-backend idiom
+    /// #1007's own test established. Positive control: against the unfixed code this reads **3** —
+    /// one open per candidate — so a backend that counted nothing could not produce a passing zero.
+    /// `multi_thread` because the scan's rig calls use `block_in_place`, which panics on the
+    /// current-thread runtime — the constraint #1264 examined. The other 49 tests in this module
+    /// are current-thread; this one has to differ.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_qsy_scan_opens_no_capture_stream_of_its_own() {
+        use openpulse_core::audio::{
+            AudioBackend, AudioConfig, AudioInputStream, AudioOutputStream, DeviceInfo,
+        };
+        use openpulse_core::error::AudioError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counters {
+            opens: AtomicUsize,
+        }
+        struct CountingBackend(Arc<Counters>);
+        struct QuietInput;
+        impl AudioInputStream for QuietInput {
+            fn read(&mut self) -> Result<Vec<f32>, AudioError> {
+                Ok(vec![0.0f32; 80])
+            }
+            fn close(self: Box<Self>) {}
+        }
+        struct NullOutput;
+        impl AudioOutputStream for NullOutput {
+            fn write(&mut self, _s: &[f32]) -> Result<(), AudioError> {
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), AudioError> {
+                Ok(())
+            }
+            fn close(self: Box<Self>) {}
+        }
+        impl AudioBackend for CountingBackend {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn list_devices(&self) -> Result<Vec<DeviceInfo>, AudioError> {
+                Ok(Vec::new())
+            }
+            fn open_input(
+                &self,
+                _d: Option<&str>,
+                _c: &AudioConfig,
+            ) -> Result<Box<dyn AudioInputStream>, AudioError> {
+                self.0.opens.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(QuietInput))
+            }
+            fn open_output(
+                &self,
+                _d: Option<&str>,
+                _c: &AudioConfig,
+            ) -> Result<Box<dyn AudioOutputStream>, AudioError> {
+                Ok(Box::new(NullOutput))
+            }
+        }
+
+        /// The scan only runs its per-candidate step when a rig controller is present — without one
+        /// this test would pass vacuously.
+        struct MockRig;
+        impl openpulse_radio::CatController for MockRig {
+            fn set_frequency(&mut self, _hz: u64) -> Result<(), openpulse_radio::RadioError> {
+                Ok(())
+            }
+            fn get_frequency(&mut self) -> Result<u64, openpulse_radio::RadioError> {
+                Ok(14_070_000)
+            }
+            fn set_mode(
+                &mut self,
+                _m: &openpulse_radio::RigMode,
+            ) -> Result<(), openpulse_radio::RadioError> {
+                Ok(())
+            }
+        }
+
+        let counters = Arc::new(Counters::default());
+        let mut engine = ModemEngine::new(Box::new(CountingBackend(counters.clone())));
+        let _ = engine.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
+        let (tx, _rx) = broadcast::channel::<ControlEvent>(16);
+        let ev_tx = Arc::new(tx);
+        let ptt = crate::ptt::SharedPtt::default();
+        let mut session = openpulse_qsy::session::QsySession::new_initiator();
+        let candidates = vec![14_070_000u64, 14_077_000, 14_080_000];
+
+        execute_qsy_actions(
+            vec![openpulse_qsy::session::QsyAction::StartScan {
+                candidates: candidates.clone(),
+            }],
+            &mut session,
+            &mut engine,
+            Some(&mut MockRig),
+            &ev_tx,
+            &ptt,
+            &[7u8; 32],
+            "BPSK250",
+            0,
+        )
+        .await;
+
+        assert_eq!(
+            counters.opens.load(Ordering::SeqCst),
+            0,
+            "the QSY scan opened {} capture stream(s) while the daemon's own `rx_stream` is held — \
+             two concurrent captures on one device, which #1007 established must never happen. The \
+             per-candidate `receive` that did this scored nothing: `last_rx_snr_db` only moves after \
+             a frame validates, so every candidate got the same stale number from the home \
+             frequency (#1312).",
+            counters.opens.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test]
