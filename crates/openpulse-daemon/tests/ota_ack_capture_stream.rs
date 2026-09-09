@@ -257,3 +257,67 @@ async fn the_capture_stream_is_reopened_after_a_keyed_transmit() {
         "a plain keyed transmit must not overlap two capture streams either"
     );
 }
+
+/// THE #1319 GATE: the RECEIVE TICK arm transmits too, and must drop its stream afterwards.
+///
+/// #1007's rule was enforced on the command arm only. The receive tick also keys the transmitter —
+/// the OTA ACK, a CONACK or QSY reply out of `process_received_bytes`, and the periodic §97.119
+/// station ID — while holding `rx_stream` with nothing reading it. That is not an edge case: every
+/// compliant station sends an interval ID, so every station did this on a fixed schedule.
+///
+/// The station ID is the trigger here because it is the one tick-arm transmit reachable without
+/// injecting decodable audio: give the daemon a valid callsign and a 1 s interval and it keys itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_capture_stream_is_reopened_after_the_receive_tick_transmits() {
+    let backend = CountingBackend::new();
+    let counters = Arc::clone(&backend.counters);
+
+    let mut c = cfg(19146, 19147);
+    // Auto-ID on the fastest interval the timer accepts, so the tick arm keys within the test.
+    c.station.auto_id_interval_secs = 1;
+    spawn_daemon(c, backend);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let before = counters.opened_total.load(Ordering::SeqCst);
+    assert!(
+        before > 0,
+        "the receive tick never opened a capture stream, so nothing below is a reopen"
+    );
+
+    // ONE command produces TWO keyed transmits on two different arms:
+    //
+    //   1. the `SendMessage` itself, on the COMMAND arm — whose drop (#1007) is already correct;
+    //   2. the periodic §97.119 station ID, on the RECEIVE TICK arm — armed by (1), and due at once
+    //      because `last_id_ms` starts at zero.
+    //
+    // So the reopen count discriminates: 2 with the tick-arm drop, 1 without. Arming is required —
+    // §97.119 only obliges a station that has transmitted, so a daemon that has sent nothing never
+    // IDs and the test would pass vacuously.
+    let stream = TcpStream::connect("127.0.0.1:19146").await.unwrap();
+    let (_r, mut w) = stream.into_split();
+    send(
+        &mut w,
+        &ControlCommand::SendMessage {
+            to: "PEER".into(),
+            subject: "x".into(),
+            body: "arm the id timer".into(),
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    let reopens = counters.opened_total.load(Ordering::SeqCst) - before;
+    assert!(
+        reopens >= 2,
+        "only {reopens} reopen(s) after a command transmit AND the station ID it armed. The command \
+         arm drops its stream; the RECEIVE TICK arm did not, so the ID keyed the transmitter while \
+         `rx_stream` was held with nothing reading it, and the next tick was handed the audio \
+         captured during that transmit as one discontinuous blob (#1319). #1007 fixed this for the \
+         command arm; this arm was missed."
+    );
+    assert_eq!(
+        counters.open_peak.load(Ordering::SeqCst),
+        1,
+        "more than one concurrent capture stream — the drop must close the old one, not add a second"
+    );
+}

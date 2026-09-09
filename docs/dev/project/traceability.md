@@ -9,6 +9,39 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — The receive tick transmits and never dropped its capture stream (#1319)
+
+- **Requirement/change:** #1007 established that the daemon must not hold its capture stream across a
+  keyed transmit — nothing reads it, so on cpal the callback appends to an unbounded buffer and the
+  next tick gets one discontinuous blob of own-transmit audio. `rx_stream` is assigned at four sites,
+  all in `server::run`, and **none is on the rx tick arm** — yet that arm transmits.
+
+- **What it actually costs, which is worse than the issue's framing.** The tick arm keys the OTA ACK,
+  a CONACK or QSY reply out of `process_received_bytes`, and — established while building the
+  fixture — the **periodic §97.119 station ID**. That last one makes this unconditional: every
+  compliant station IDs on a schedule, so every station did this, not just one in a QSY exchange. A
+  QSY line at BPSK31 is tens of seconds of own-transmit audio; an ID is shorter but certain.
+
+- **Design decision:** snapshot `frames_transmitted()` at the top of the tick arm and drop on change
+  at the bottom — the same shape as the command arm's `:865` drop, and keyed on the counter rather
+  than the emission for the reason that comment already gives: a future keyed emission on this arm
+  must not silently miss it. Reviewed as part of #1312 with the caveat that a third drop site in
+  `server::run` is a patch on an ownership question, not an answer; #1308 remains the answer.
+
+- **Tests:** `the_capture_stream_is_reopened_after_the_receive_tick_transmits`, through a REAL daemon
+  over TCP on the counting backend #1007's own test built.
+
+- **The fixture took three attempts, and the first two passed against unfixed code.** §97.119 only
+  obliges a station that has transmitted, so `id_due` requires `tx_since_id` — a daemon that has sent
+  nothing never IDs, and both early versions were vacuous. The working shape uses ONE command that
+  produces TWO keyed transmits on two different arms: the `SendMessage` on the command arm (whose
+  drop is already correct) and the ID it arms on the tick arm, which fires at once because
+  `last_id_ms` starts at zero. The reopen count then discriminates directly.
+
+- **Test results:** 3 passed. Sabotage-verified: disabling the tick-arm drop yields **1** reopen
+  against the required 2, while the file's two pre-existing tests stay green — so the failure is
+  attributable to this arm and not to the command arm's drop.
+
 ## 2026-09-09 — The QSY scan's per-candidate receive was inert, and opened a second capture stream (#1312)
 
 - **Requirement/change:** `execute_qsy_actions` called `engine.receive(mode, None)` per scanned
