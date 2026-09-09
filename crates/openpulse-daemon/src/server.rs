@@ -866,6 +866,11 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                 }
             }
             _ = rx_ticker.tick() => {
+                // This arm TRANSMITS too — the OTA ACK, a CONACK or QSY reply out of
+                // `process_received_bytes`, and the periodic §97.119 station ID below — so it needs
+                // the same post-transmit stream drop the command arm has (#1319). Snapshot first;
+                // the drop is at the end of the arm.
+                let tx_frames_before_tick = engine.frames_transmitted();
                 // Belt-and-suspenders: also check the watchdog on the rx tick (idempotent — it fires
                 // once when the deadline passes). The dedicated `watchdog_ticker` arm and the
                 // independent watchdog thread are the primary, flood-/block-proof paths.
@@ -1248,6 +1253,16 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
                             tx_frames_seen = engine.frames_transmitted();
                         }
                     }
+                }
+                // #1007's rule, on this arm too (#1319). Anything keyed above — the OTA ACK, a
+                // CONACK or QSY reply, the station ID — blocked this loop while nothing read
+                // `rx_stream`. On cpal that capture buffer is unbounded, so whatever it holds is
+                // audio captured while this station was transmitting: never decodable, and handed to
+                // the next tick as one discontinuous blob. A QSY line at BPSK31 is tens of seconds
+                // of it. Keyed on the transmit counter, matching the command arm, so a future keyed
+                // emission on this arm cannot silently miss it.
+                if engine.frames_transmitted() != tx_frames_before_tick {
+                    rx_stream = None;
                 }
             }
         }
