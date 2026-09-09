@@ -250,6 +250,15 @@ impl CrossBandRepeater {
         result
     }
 
+    /// The mode this repeater receives and re-transmits.
+    ///
+    /// The daemon declares it to the engine as the relay rung so the RX burst cap covers it (#1308):
+    /// the repeater reads the engine's bursts, so a cap sized from `[modem] mode` alone would
+    /// truncate the frames it exists to forward.
+    pub fn mode(&self) -> &str {
+        &self.config.mode
+    }
+
     /// Return whether the repeater is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enabled

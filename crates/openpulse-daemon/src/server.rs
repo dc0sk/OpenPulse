@@ -111,6 +111,13 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
     if !cfg.audio.device.is_empty() {
         engine.set_default_device(Some(cfg.audio.device.clone()));
     }
+    // Declare the repeater's rung so the burst cap covers what IT must receive (#1308). Under that
+    // issue's decision the repeater reads the bursts THIS engine flushes rather than capturing its
+    // own audio, so a cap sized from `[modem] mode` alone would truncate exactly the frames the
+    // repeater exists to forward — the #1249 defect class, one consumer over.
+    if cfg.repeater.enabled {
+        engine.set_relay_mode(Some(cfg.repeater.mode.clone()));
+    }
 
     // Optional GPU acceleration: with `--features gpu` and a compatible adapter, the GPU-capable
     // plugins share one GpuContext; otherwise (or when no adapter is found) they use the CPU path.

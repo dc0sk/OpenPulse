@@ -678,6 +678,8 @@ pub struct ModemEngine {
     /// drops. Lets a tick-based daemon assemble a full frame from a streaming
     /// (cpal) backend instead of decoding one partial tick window.
     rx_burst: Vec<f32>,
+    /// Mode of a relay consumer reading this engine's bursts, for the runaway cap (#1308).
+    relay_mode: Option<String>,
     /// Whether the last burst was flushed by the runaway CAP rather than by a carrier drop (#1255).
     ///
     /// A cap flush means the carrier was still up when the accumulator hit its bound, so the slab is
@@ -950,6 +952,7 @@ impl ModemEngine {
             default_device: None,
             last_audio: Vec::new(),
             rx_burst: Vec::new(),
+            relay_mode: None,
             last_flush_capped: false,
             input_prerouted: false,
             suppress_afc_events: false,
@@ -2080,6 +2083,16 @@ impl ModemEngine {
     /// protected band, where a wrong mode makes an interferer un-notchable.
     fn active_burst_cap_samples(&self) -> usize {
         let base = self.burst_cap_samples(self.rx_mode.as_deref());
+        // A relay consumer reads the SAME bursts this accumulator flushes (#1308), so the cap must
+        // cover its rung too — otherwise a repeater configured slower than `rx_mode` has every frame
+        // it exists to forward force-flushed mid-frame. Same shape as the OTA candidates below, and
+        // the same defect class as #1249: the cap is sized from what may ARRIVE, never from the mode
+        // this station happens to be configured with.
+        let base = self
+            .relay_mode
+            .as_deref()
+            .map(|m| base.max(self.burst_cap_samples(Some(m))))
+            .unwrap_or(base);
         match self.ota.as_ref() {
             Some(ota) => ota
                 .rx_candidates()
@@ -2088,6 +2101,15 @@ impl ModemEngine {
                 .fold(base, usize::max),
             None => base,
         }
+    }
+
+    /// Declare a relay consumer's mode, so the burst cap covers what IT must receive (#1308).
+    ///
+    /// `None` clears it. Set while a cross-band repeater is enabled: the repeater reads the bursts
+    /// this engine flushes rather than capturing its own audio, so a cap sized without its rung would
+    /// truncate exactly the frames it exists to forward.
+    pub fn set_relay_mode(&mut self, mode: Option<String>) {
+        self.relay_mode = mode;
     }
 
     /// Burst-accumulate samples the CALLER already captured from a persistent input
