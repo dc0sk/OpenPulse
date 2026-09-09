@@ -9,6 +9,44 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — rig_b gets its own sound card, and the device scan stops being fooled (#1308, PR 3 of 3)
+
+- **Requirement/change:** REQ-DEV-01. The daemon's two repeater engines passed NO device to
+  `ModemEngine`, so they took the OS default — #1311's defect, inside the daemon #1311 cited as one
+  of the two surfaces that got it right. A cross-band repeater is by definition a two-card station,
+  so the OS default is very likely the MAIN rig: the repeater keys rig_b and puts audio into the
+  wrong radio. `front_ends_pin_the_audio_device` had excluded the daemon in a doc-comment, saying the
+  ruling on which device the repeater engines should use was open; #1308's three-PR plan settled it.
+
+- **Design decision:** `[repeater] tx_device`, pinned on BOTH repeater engines via
+  `set_default_device`. One name for both directions is deliberate — the same call is consulted by
+  `open_input` and `open_output`, which is what lets rig_b's band be listened to as well as
+  transmitted on, and is the mechanism #1325's carrier sense will use rather than a second sensor.
+  A collision with `[audio] device` is refused exactly as #1260 refuses a shared rigctld address
+  (hard at startup when the repeater is enabled, warning otherwise), because one card cannot carry
+  two capture streams (#1007); the predicate is factored out as
+  `repeater_tx_device_config_error` to match #1260's testable shape. Empty is warned about, not
+  refused — it is probably wrong rather than certainly so.
+
+- **Implementation:** `crates/openpulse-config/src/lib.rs` (`tx_device` field + template),
+  `crates/openpulse-daemon/src/server.rs` (`rep_device`, both `set_default_device` calls, the
+  refusal predicate), `crates/openpulse-modem/tests/front_ends_pin_the_audio_device.rs` (the daemon
+  joins the scan; the scanner learns to blank test modules and to match the binding).
+
+- **Tests:** `front_ends_pin_the_audio_device` now covers `openpulse-daemon/server.rs`;
+  `repeater_rig_b_tests::a_tx_device_equal_to_the_main_audio_device_is_refused` and
+  `a_distinct_or_unset_tx_device_is_accepted`.
+
+- **Test results:** 5 passed in `repeater_rig_b_tests`; the scan's 2 tests pass. **The scanner was
+  wrong first and sabotage caught it:** widening the line window to 24 to fit the daemon's main
+  engine (built at `:91`, pinned at `:112`) made the repeater entry VACUOUS — deleting
+  `rx.set_default_device` still passed, because the scan found `tx`'s pin 15 lines away, which is
+  precisely the failure mode the widening's own justification had dismissed as not occurring in any
+  front-end. Fixed by matching the pin to the constructed binding; re-verified with three
+  independent sabotages (`rx`, `tx`, `engine`), all CAUGHT. A third control also pins that
+  `("", "")` is not a collision, without which a stock config would refuse to start. Full
+  `scripts/gate.sh` verdict below.
+
 ## 2026-09-09 — The cross-band repeater hears the daemon, and can actually be started (#1308, PR 2 of 3)
 
 - **Requirement/change:** REQ-FUN-11. The repeater opened a capture stream of its own, from the

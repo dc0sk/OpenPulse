@@ -16,10 +16,13 @@
 ///
 /// NOT listed, deliberately:
 /// * `openpulse-cli` — correct by the other mechanism (threads `--device` per call).
-/// * `openpulse-daemon` — its main engine pins correctly; its two REPEATER engines do not, which is
-///   #1308 and is blocked on a maintainer ruling about which device they should even use. Adding it
-///   here would encode an answer that has not been decided.
 /// * `openpulse-mesh` — its real-audio capability was removed and `no_real_audio.rs` keeps it out.
+///
+/// `openpulse-daemon` IS scanned since #1308 PR 3. It was excluded while its two repeater engines
+/// passed nothing and the ruling on which device they should use was open; `[repeater] tx_device`
+/// settled that, so the exclusion's stated reason is spent. It is the sharpest entry in the list: a
+/// cross-band repeater is by definition a two-card station, so the OS default is very likely the
+/// MAIN rig — i.e. the repeater keying and transmitting into the wrong radio.
 const FRONT_ENDS: &[(&str, &str)] = &[
     (
         "openpulse-ardop",
@@ -33,23 +36,103 @@ const FRONT_ENDS: &[(&str, &str)] = &[
         "openpulse-tui",
         include_str!("../../openpulse-tui/src/main.rs"),
     ),
+    (
+        "openpulse-daemon/server.rs",
+        include_str!("../../openpulse-daemon/src/server.rs"),
+    ),
 ];
 
-/// Lines that construct an engine without pinning a device within `WINDOW` lines after it.
-const WINDOW: usize = 12;
+/// How far after a construction to look for that engine's own pin.
+///
+/// **A line window alone is not enough, and this was measured.** The window was briefly widened to
+/// 24 to accommodate the daemon's main engine (built at `server.rs:91`, pinned at `:112`), with the
+/// note that a wider window could only be fooled by a pin belonging to a *different* nearby engine
+/// "which no front-end currently has". The daemon has exactly that: its two repeater engines are
+/// built 15 lines apart, so deleting `rx.set_default_device` still PASSED — the scan found `tx`'s.
+/// Sabotage caught it immediately. The scan therefore matches the pin to the constructed
+/// BINDING (`let mut rx = …` must be followed by `rx.set_default_device`), and the window is only a
+/// bound on how far to search.
+const WINDOW: usize = 24;
+
+/// The binding a `ModemEngine::new` line assigns to, e.g. `rx` for `let mut rx = ModemEngine::new(`.
+///
+/// `None` when the construction is not a simple `let` binding (passed straight to a function, say),
+/// in which case the scan falls back to accepting any pin in the window rather than inventing a
+/// rule it cannot check.
+fn bound_name(line: &str) -> Option<&str> {
+    let after_let = line.trim_start().strip_prefix("let ")?;
+    let after_mut = after_let.strip_prefix("mut ").unwrap_or(after_let);
+    let name = after_mut.split('=').next()?.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name)
+}
+
+/// Blank out `#[cfg(test)]` modules, preserving line numbers so reported lines stay usable.
+///
+/// Without this the daemon is unscannable: `server.rs` has ten interleaved test modules whose
+/// fixtures build engines with no device on purpose, and every one reads as a violation. Blanking
+/// rather than deleting keeps the reported line numbers pointing at the real file.
+fn strip_test_modules(src: &str) -> String {
+    let mut out: Vec<String> = src.lines().map(|l| l.to_string()).collect();
+    let mut i = 0;
+    while i < out.len() {
+        if out[i].trim_start().starts_with("#[cfg(test)]") {
+            // Find the opening brace of the module, then brace-match to its close.
+            let mut j = i;
+            while j < out.len() && !out[j].contains('{') {
+                j += 1;
+            }
+            if j >= out.len() {
+                break;
+            }
+            let mut depth = 0i32;
+            let mut k = j;
+            loop {
+                for c in out[k].chars() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                }
+                if depth <= 0 || k + 1 >= out.len() {
+                    break;
+                }
+                k += 1;
+            }
+            for line in out.iter_mut().take(k + 1).skip(i) {
+                line.clear();
+            }
+            i = k + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out.join("\n")
+}
 
 fn unpinned_constructions(src: &str) -> Vec<usize> {
-    let lines: Vec<&str> = src.lines().collect();
+    let stripped = strip_test_modules(src);
+    let lines: Vec<&str> = stripped.lines().collect();
     let mut bad = Vec::new();
     for (i, l) in lines.iter().enumerate() {
         if !l.contains("ModemEngine::new(") {
             continue;
         }
         let end = (i + WINDOW).min(lines.len());
-        if !lines[i..end]
-            .iter()
-            .any(|w| w.contains("set_default_device"))
-        {
+        let pinned = match bound_name(l) {
+            // Require THIS engine's pin, not merely a pin nearby.
+            Some(name) => {
+                let needle = format!("{name}.set_default_device");
+                lines[i..end].iter().any(|w| w.contains(&needle))
+            }
+            None => lines[i..end]
+                .iter()
+                .any(|w| w.contains("set_default_device")),
+        };
+        if !pinned {
             bad.push(i + 1);
         }
     }
@@ -89,6 +172,25 @@ fn main() {
         vec![3],
         "the scanner did not flag an engine built with no device pinned — it would pass over any \
          regression, which is worse than having no scan"
+    );
+
+    // A violation INSIDE a test module must be ignored, and one outside it must still be caught —
+    // otherwise stripping could silently blank the whole file and the scan would pass vacuously.
+    let with_test_mod = "\
+fn main() {
+    let mut engine = ModemEngine::new(audio);
+}
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        let e = ModemEngine::new(LoopbackBackend::new());
+    }
+}";
+    assert_eq!(
+        unpinned_constructions(with_test_mod),
+        vec![2],
+        "stripping must ignore the fixture inside #[cfg(test)] and still flag the production \
+         construction — if this returns [] the stripper ate the whole file and the scan is vacuous"
     );
 
     let fixed = "\
