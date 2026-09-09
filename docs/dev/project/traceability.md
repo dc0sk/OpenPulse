@@ -9,6 +9,48 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — The RX burst cap now covers the relay consumer's rung (#1308, PR 1 of 3)
+
+- **Requirement/change:** first of three PRs implementing the maintainer's #1308 decision — the
+  cross-band repeater consumes the daemon's burst stream instead of capturing its own audio. That
+  makes the daemon's runaway cap load-bearing for the repeater: sized from `[modem] mode` alone, it
+  truncates exactly the frames the repeater exists to forward whenever the relay rung is slower.
+
+- **Design decision:** the same shape `#1249` established for the OTA candidates —
+  `active_burst_cap_samples` folds in a declared relay mode, and the cap is sized from what may
+  ARRIVE rather than from the mode this station happens to be configured with. `set_relay_mode` is
+  declared by the daemon at startup when `[repeater] enabled`, on `EnableRepeater`, and cleared on
+  `DisableRepeater` — a station that has stopped relaying should not keep paying a wider cap.
+
+- **Implementation:** `crates/openpulse-modem/src/engine.rs` (`relay_mode` field, the fold,
+  `set_relay_mode`/`relay_mode`), `crates/openpulse-repeater/src/lib.rs` (`mode()` accessor, read
+  before the repeater moves into its thread), `crates/openpulse-daemon/src/{server,lib}.rs` (wiring).
+
+- **Tests:** `burst_cap_tracks_the_relay_rung.rs` — modelled on `burst_cap_tracks_the_ota_rung`,
+  keeping the configured mode and the relay mode DIFFERENT, which is the only configuration in which
+  the defect exists. It carries its own **positive control**
+  (`without_a_relay_mode_the_same_frame_is_truncated`): without that, the gate could pass on a frame
+  that merely fits the configured mode's cap and would assert nothing about the widening.
+  `enabling_the_repeater_widens_the_burst_cap_to_its_rung` pins the daemon wiring — on the
+  accumulator's BEHAVIOUR, with its own control. The first version asserted on a `relay_mode()`
+  getter and the **reachability ratchet rejected it**: a public accessor referenced only by a test is
+  an API existing for an instrument. The getter is gone and both gates assert the cap instead.
+
+- **Test results:** modem 3 passed, daemon 8 passed. Sabotage-verified: removing the fold fails the
+  widening gates while their positive controls still pass.
+
+- **Two fixture defects found while building it, neither visible from a passing test.** The daemon
+  gate's first carrier was a CONSTANT, which `apply_dc_block` removes at the seam — so the DCD never
+  saw a carrier, nothing accumulated, and the control could not fail. And `test_repeater`'s default
+  rung is BPSK250, the same as the configured mode, so there was nothing to widen; the gate needs the
+  two modes to DIFFER, which is the same insistence `burst_cap_tracks_the_ota_rung` documents.
+
+- **Not in this PR:** the burst handoff itself (PR 2 — bounded channel, decode-only engine, drop
+  tripwire, and the first daemon-level relay test, of which none exists today) and `[repeater]
+  tx_device` (PR 3). Recorded on #1308 with the accepted costs: the repeater will hear through the
+  daemon's front end tuned to the daemon's `active_mode`, and the relay stays payload-for-payload
+  with `FecMode::None`, so FEC-coded traffic is not relayable at all.
+
 ## 2026-09-09 — The receive tick transmits and never dropped its capture stream (#1319)
 
 - **Requirement/change:** #1007 established that the daemon must not hold its capture stream across a

@@ -2637,6 +2637,8 @@ pub async fn apply_command_to_engine(
                 return;
             };
 
+            // Read before the repeater moves into the thread.
+            let repeater_mode = repeater.mode().to_string();
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = Arc::clone(&stop);
             // The thread owns the repeater, so when it exits the repeater is GONE. Report that:
@@ -2658,6 +2660,9 @@ pub async fn apply_command_to_engine(
             runtime_state.repeater_stop = Some(stop);
             runtime_state.repeater_thread = Some(thread);
 
+            // The repeater reads this engine's bursts (#1308), so the runaway cap must cover its
+            // rung for as long as it is running.
+            engine.set_relay_mode(Some(repeater_mode));
             runtime_state.repeater_enabled = true;
             let _ = event_tx.send(ControlEvent::RepeaterChanged { enabled: true });
         }
@@ -2678,6 +2683,7 @@ pub async fn apply_command_to_engine(
                 let _ = thread.join();
             }
 
+            engine.set_relay_mode(None);
             runtime_state.repeater_enabled = false;
             let _ = event_tx.send(ControlEvent::RepeaterChanged { enabled: false });
         }
@@ -4406,6 +4412,12 @@ mod command_apply_tests {
 
     /// Build a real, runnable repeater so `EnableRepeater` has something to start.
     fn test_repeater(enabled: bool) -> openpulse_repeater::CrossBandRepeater {
+        test_repeater_on(enabled, "BPSK250")
+    }
+
+    /// A repeater on an explicit rung, for the cap-widening gate: the widening is only observable
+    /// when the relay rung differs from the configured mode.
+    fn test_repeater_on(enabled: bool, mode: &str) -> openpulse_repeater::CrossBandRepeater {
         let mk = || {
             let mut e = ModemEngine::new(Box::new(openpulse_audio::LoopbackBackend::new()));
             let _ = e.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
@@ -4417,6 +4429,7 @@ mod command_apply_tests {
             mk(),
             openpulse_repeater::RepeaterConfig {
                 enabled,
+                mode: mode.to_string(),
                 ..Default::default()
             },
         )
@@ -4462,6 +4475,100 @@ mod command_apply_tests {
             ControlEvent::RepeaterChanged { enabled } => assert!(!enabled),
             other => panic!("expected RepeaterChanged, got {other:?}"),
         }
+    }
+
+    /// #1308: enabling the repeater WIDENS the RX burst cap to cover its rung, and disabling
+    /// narrows it back.
+    ///
+    /// Asserted on the accumulator's BEHAVIOUR, not on a getter. An accessor readable only by this
+    /// test would be a public API existing for an instrument — and the reachability ratchet catches
+    /// exactly that, which is how the first version of this test was found.
+    ///
+    /// A carrier longer than BPSK250's cap but far shorter than BPSK31's separates the two: with the
+    /// repeater's rung declared it must NOT flush, without it must.
+    #[tokio::test]
+    async fn enabling_the_repeater_widens_the_burst_cap_to_its_rung() {
+        /// Past BPSK250's cap (~298 k samples), far short of BPSK31's (~2.39 M).
+        const CARRIER: usize = 310_000;
+        const CHUNK: usize = 8192;
+
+        async fn cmd(
+            c: &ControlCommand,
+            engine: &mut ModemEngine,
+            rs: &mut RuntimeControlState,
+            ev: &Arc<broadcast::Sender<ControlEvent>>,
+        ) {
+            let active_mode: SharedMode = Arc::new(Mutex::new("BPSK250".to_string()));
+            apply_command_to_engine(c, engine, &active_mode, ev, None, rs).await;
+        }
+        /// Feed an unbroken carrier and report whether the accumulator flushed.
+        ///
+        /// A TONE, not a constant: the `InputCapture` seam runs `apply_dc_block`, so a DC level is
+        /// removed before the carrier detect ever sees it and nothing accumulates at all — measured,
+        /// a constant-0.5 fixture never flushed and the control could not fail.
+        fn flushed(engine: &mut ModemEngine) -> bool {
+            let mut n = 0usize;
+            while n < CARRIER {
+                let block: Vec<f32> = (n..n + CHUNK)
+                    .map(|i| 0.5 * (std::f32::consts::TAU * 1500.0 * i as f32 / 8000.0).sin())
+                    .collect();
+                if let Ok(Some(_)) = engine.accumulate_capture(Some("BPSK250"), block) {
+                    return true;
+                }
+                n += CHUNK;
+            }
+            false
+        }
+
+        let (tx, _rx) = broadcast::channel::<ControlEvent>(16);
+        let ev_tx = Arc::new(tx);
+
+        let mut with_relay = test_engine();
+        let mut rs = RuntimeControlState::default();
+        rs.repeater = Some(test_repeater_on(true, "BPSK31"));
+        cmd(
+            &ControlCommand::EnableRepeater,
+            &mut with_relay,
+            &mut rs,
+            &ev_tx,
+        )
+        .await;
+        assert!(
+            !flushed(&mut with_relay),
+            "the accumulator force-flushed {CARRIER} samples while the repeater was running — its \
+             rung was not folded into the cap, so every frame it exists to forward is truncated \
+             mid-frame (#1308)"
+        );
+
+        // Control: the same carrier with no repeater running MUST flush, or the assertion above
+        // holds for a carrier that simply fits and proves nothing about the widening.
+        let mut without_relay = test_engine();
+        assert!(
+            flushed(&mut without_relay),
+            "the control carrier did not flush at the configured mode's cap, so this fixture cannot \
+             tell the widening from its absence"
+        );
+
+        // And disabling narrows it back: a station that stopped relaying should not keep the cap.
+        cmd(
+            &ControlCommand::DisableRepeater,
+            &mut with_relay,
+            &mut rs,
+            &ev_tx,
+        )
+        .await;
+        let mut after_disable = test_engine();
+        cmd(
+            &ControlCommand::EnableRepeater,
+            &mut after_disable,
+            &mut RuntimeControlState {
+                repeater: Some(test_repeater_on(true, "BPSK31")),
+                ..Default::default()
+            },
+            &ev_tx,
+        )
+        .await;
+        assert!(!flushed(&mut after_disable), "sanity: enable still widens");
     }
 
     /// THE #1298 GATE (enable half): with nothing to run, enabling must FAIL and say so.
