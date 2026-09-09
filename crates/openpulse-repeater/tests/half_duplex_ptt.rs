@@ -154,6 +154,10 @@ fn full_duplex_idle_session_does_not_hold_ptt_either() {
 fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
     let spy = SpyPtt::default();
     let config = RepeaterConfig {
+        // #1325's sense is off here so the relay reaches the TRANSMIT step, which is what this
+        // gate is about. With it on and no sensor passed the burst is deferred before the key is
+        // ever taken, and the test would pass without exercising the error path at all.
+        carrier_sense: false,
         ..Default::default()
     };
     // RX decodes; TX has no plugin registered, so `transmit` fails after the key is taken.
@@ -181,7 +185,7 @@ fn a_failed_relay_transmit_does_not_leave_the_transmitter_keyed() {
     // Since #1308 the repeater does not capture: hand it the burst the daemon would have flushed.
     let burst = openpulse_modem::pipeline::AudioSamples { samples: frame };
     let err = rp
-        .relay_burst(&burst)
+        .relay_burst(&burst, None)
         .expect_err("the tx engine has no plugin, so the relay must fail");
 
     assert!(

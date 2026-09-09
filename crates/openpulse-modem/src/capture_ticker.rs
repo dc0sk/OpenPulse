@@ -1,12 +1,11 @@
 //! One held-open capture stream, read a tick at a time and folded into the engine's burst
 //! accumulator (#1297).
 //!
-//! DORMANT(#1310): this has no production caller since #1308 moved the cross-band repeater onto the
-//! daemon's flushed bursts — the repeater was its only consumer, and it no longer captures at all.
-//! Retained rather than deleted because #1310 is the open decision to adopt it in the ARDOP and KISS
-//! front-ends, which still open a capture stream, read once and drop it: the exact window-of-one-poll
-//! defect against a seconds-long frame that this exists to close (#1297). It stays compiled and
-//! tested so that adoption is a wiring change rather than a rewrite. Delete it if #1310 is declined.
+//! Its consumer is the cross-band repeater's CARRIER SENSE (#1325): the repeater no longer captures
+//! its input — the daemon hands it bursts (#1308) — but it must listen to rig_b's *output* band
+//! before keying it, and this is what holds that stream across relays. It was briefly dormant
+//! between those two changes. #1310 (adopting it in the ARDOP and KISS front-ends, which still open
+//! a stream, read once and drop it) remains open and is a second consumer, not the only one.
 //!
 //! **Why this exists rather than `ModemEngine::receive`.** `receive` opens an input stream, reads
 //! once, and drops the stream — so on a callback backend each call sees a fresh, nearly-empty buffer

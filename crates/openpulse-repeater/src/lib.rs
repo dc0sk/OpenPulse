@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use openpulse_core::station_id::StationIdTimer;
+use openpulse_modem::capture_ticker::CaptureTicker;
 use openpulse_modem::pipeline::AudioSamples;
 use openpulse_modem::ModemEngine;
 use openpulse_radio::{PttController, PttKeyGuard, SharedPtt, DEFAULT_PTT_MAX};
@@ -56,6 +57,35 @@ pub struct CrossBandRepeater {
     id_timer: Option<StationIdTimer>,
     /// Monotonic clock origin for the ID timer.
     start: Instant,
+    /// Consecutive senses that could not read the band. Reset by any successful sense.
+    sense_faults: u32,
+    /// Bursts dropped because rig_b's band was busy — the tripwire that makes the sense falsifiable.
+    bursts_deferred: u64,
+}
+
+/// How many capture ticks one sense may spend before deciding.
+///
+/// Bounded so a relay cannot stall on a silent device: the read is the blocking part, and a faulted
+/// stream returns immediately, so this is a work bound rather than a time bound (#1066's lesson —
+/// a wall-clock budget makes the verdict depend on machine load).
+const SENSE_TICKS: usize = 4;
+
+/// Consecutive unreadable senses before the session gives up.
+///
+/// A transient read failure counts as BUSY and drops the burst; a persistent one means the station
+/// cannot tell whether it is interfering, which for an unattended transmitter is a reason to stop
+/// rather than to keep keying. #1298 reports the exit, so this is not a silent death.
+const MAX_SENSE_FAULTS: u32 = 10;
+
+/// What one carrier sense concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum Sense {
+    /// The band is clear, or sensing is switched off.
+    Clear,
+    /// Something is using rig_b's band.
+    Busy,
+    /// The band could not be read at all.
+    Unreadable,
 }
 
 impl CrossBandRepeater {
@@ -91,6 +121,8 @@ impl CrossBandRepeater {
             config,
             id_timer,
             start: Instant::now(),
+            sense_faults: 0,
+            bursts_deferred: 0,
         }
     }
 
@@ -98,9 +130,54 @@ impl CrossBandRepeater {
     ///
     /// Returns the number of bytes relayed, or `None` if no frame was available.
     /// FEC is not applied on the relay path (raw mode).
-    pub fn relay_burst(&mut self, burst: &AudioSamples) -> Result<Option<usize>, RepeaterError> {
+    pub fn relay_burst(
+        &mut self,
+        burst: &AudioSamples,
+        sensor: Option<&mut CaptureTicker>,
+    ) -> Result<Option<usize>, RepeaterError> {
         let now_ms = self.start.elapsed().as_millis() as u64;
-        self.relay_burst_at(burst, now_ms)
+        self.relay_burst_at(burst, now_ms, sensor)
+    }
+
+    /// Bursts dropped because rig_b's band was busy (#1325).
+    ///
+    /// A test that only shows a relay on a clear band cannot tell sensing from a no-op; this is what
+    /// lets one assert the REFUSAL.
+    pub fn bursts_deferred(&self) -> u64 {
+        self.bursts_deferred
+    }
+
+    /// Listen to rig_b's band and decide whether it is free.
+    ///
+    /// Ticks the capture into `engine_tx`, which updates that engine's DCD at the `InputCapture`
+    /// seam, then reads the verdict. Stops early on a busy verdict — there is nothing more to learn.
+    fn sense_output_band(&mut self, sensor: Option<&mut CaptureTicker>) -> Sense {
+        if !self.config.carrier_sense {
+            return Sense::Clear;
+        }
+        let Some(sensor) = sensor else {
+            // Sensing is ON but the caller supplied no capture. Fail SAFE: an unattended station
+            // that cannot hear its output band must not key it. This is a wiring error, and the
+            // deferral counter is what makes it visible instead of silently permissive.
+            return Sense::Unreadable;
+        };
+        let mode = self.config.mode.clone();
+        let mut read_anything = false;
+        for _ in 0..SENSE_TICKS {
+            let tick = sensor.tick(&mut self.engine_tx, &mode);
+            if !tick.raw.is_empty() {
+                read_anything = true;
+            }
+            if self.engine_tx.is_channel_busy() {
+                return Sense::Busy;
+            }
+        }
+        // A faulted stream reads nothing, and "heard nothing" from a device that is not working is
+        // not evidence that the band is clear. Silence from a HEALTHY device is.
+        if sensor.is_faulted() || !read_anything {
+            return Sense::Unreadable;
+        }
+        Sense::Clear
     }
 
     /// [`relay_one_frame`] with an explicit monotonic clock (for deterministic ID-timing tests).
@@ -108,6 +185,7 @@ impl CrossBandRepeater {
         &mut self,
         burst: &AudioSamples,
         now_ms: u64,
+        sensor: Option<&mut CaptureTicker>,
     ) -> Result<Option<usize>, RepeaterError> {
         // The burst arrives from the DAEMON's accumulator (#1308). This engine holds no capture
         // stream: the receive rig has exactly one, and it is the daemon's — #1007's rule. The burst
@@ -132,6 +210,43 @@ impl CrossBandRepeater {
         }
 
         let n = bytes.len();
+
+        // Carrier-sense rig_b BEFORE acquiring the key (#1325). Skipped while a full-duplex session
+        // already holds it: sensing governs channel acquisition, not continuation, and a station
+        // that sensed while keyed would read its own carrier and never relay again.
+        if self.session_guard.is_none() {
+            match self.sense_output_band(sensor) {
+                Sense::Clear => self.sense_faults = 0,
+                Sense::Busy => {
+                    self.sense_faults = 0;
+                    self.bursts_deferred = self.bursts_deferred.saturating_add(1);
+                    tracing::info!(
+                        deferred = self.bursts_deferred,
+                        "cross-band relay: rig_b's band is busy — dropped this burst rather than \
+                         doubling with whoever is already there"
+                    );
+                    return Ok(None);
+                }
+                Sense::Unreadable => {
+                    self.sense_faults = self.sense_faults.saturating_add(1);
+                    self.bursts_deferred = self.bursts_deferred.saturating_add(1);
+                    if self.sense_faults >= MAX_SENSE_FAULTS {
+                        return Err(RepeaterError::Modem(format!(
+                            "cannot read rig_b's band after {MAX_SENSE_FAULTS} consecutive \
+                             attempts; refusing to keep transmitting blind on an unattended \
+                             station. Check [repeater] tx_device, or set carrier_sense = false to \
+                             accept the risk deliberately"
+                        )));
+                    }
+                    tracing::warn!(
+                        faults = self.sense_faults,
+                        "cross-band relay: could not read rig_b's band; treating as busy"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
         // ONE key covers the relayed frame AND the §97.119 ID that may follow it, in both modes.
         // Before #1260 the half-duplex path asserted here and `maybe_identify` asserted again
         // underneath it, releasing rig_b mid-scope while this scope still believed it held the key.
@@ -221,6 +336,10 @@ impl CrossBandRepeater {
     /// A capture with no decodable frame is not an error and does not end the session (#1297).
     /// PTT is released when the loop returns, on the error path too.
     pub fn run_full_duplex(&mut self, stop: Arc<AtomicBool>) -> Result<u64, RepeaterError> {
+        // Created HERE rather than stored on the struct: it holds a `Box<dyn AudioInputStream>`,
+        // and `cpal::Stream` is `!Send`, so a repeater carrying one could not be moved into the
+        // daemon's thread at all. This function already runs on that thread.
+        let mut sensor = self.config.carrier_sense.then(|| CaptureTicker::new(None));
         let mut count = 0u64;
         let result = loop {
             if stop.load(Ordering::Relaxed) {
@@ -239,7 +358,7 @@ impl CrossBandRepeater {
                 // Ending the session is right, and #1298 reports the exit.
                 Err(RecvTimeoutError::Disconnected) => break Ok(count),
             };
-            match self.relay_burst(&burst) {
+            match self.relay_burst(&burst, sensor.as_mut()) {
                 Ok(Some(_)) => count += 1,
                 Ok(None) => {}
                 Err(e) => break Err(e),
@@ -320,6 +439,10 @@ mod full_duplex_silence_tests {
             rx,
             RepeaterConfig {
                 full_duplex,
+                // These tests are about the PTT edges, not the output band; #1325's gate is
+                // `tests/carrier_sense.rs`. With sensing on and no sensor passed, every burst is
+                // deferred by design (fail-safe), which would make them assert nothing about keying.
+                carrier_sense: false,
                 ..Default::default()
             },
         )
@@ -331,7 +454,7 @@ mod full_duplex_silence_tests {
         let burst = AudioSamples {
             samples: audio.to_vec(),
         };
-        rp.relay_burst_at(&burst, now_ms)
+        rp.relay_burst_at(&burst, now_ms, None)
             .expect("relay")
             .expect("the burst must relay");
     }

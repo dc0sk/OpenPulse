@@ -38,6 +38,10 @@
 # and is recorded here rather than resolved silently. Covered: agc_blocks_processed,
 # dc_blocks_processed, dcd_blocks_processed, notch_blocks_processed (all
 # crates/openpulse-modem/src/engine.rs). They were grandfathered with NO rationale until #1271.
+# Joined 2026-09-09 by bursts_deferred (crates/openpulse-repeater/src/lib.rs), the same shape for
+# #1325's carrier sense: a test that only shows a relay happening on a clear band cannot tell
+# sensing from a no-op, so the REFUSAL has to be countable, and tests/carrier_sense.rs is an
+# integration test in another crate.
 #
 # The collision is narrower than it first looked, and the correction is worth keeping: these are
 # `pub` because the asserting tests are INTEGRATION tests in crates/openpulse-modem/tests/, which
@@ -80,7 +84,6 @@ BundleSpec	crates/openpulse-cli/src/commands/audit_bundle.rs
 ByteRange	crates/openpulse-core/src/fec.rs
 CRC12_POLY	plugins/js8/src/crc.rs
 CalibrationResult	crates/openpulse-cli/src/commands/calibrate.rs
-CaptureTicker	crates/openpulse-modem/src/capture_ticker.rs
 CaseDiff	apps/openpulse-testmatrix/src/compare.rs
 CatBackend	crates/openpulse-daemon/src/server.rs
 CessbConfig	crates/openpulse-dsp/src/cessb.rs
@@ -285,6 +288,7 @@ build_cat_controller	crates/openpulse-daemon/src/server.rs
 build_item8_lab_profiles	apps/openpulse-testmatrix/src/bench.rs
 build_snapshot	crates/openpulse-daemon/src/audit.rs
 burst_cap_samples	crates/openpulse-modem/src/engine.rs
+bursts_deferred	crates/openpulse-repeater/src/lib.rs
 bw_hz	crates/openpulse-modem/src/ofdm_sim.rs
 bytes_per_symbol	plugins/ofdm/src/params.rs
 capture_burst	crates/openpulse-modem/src/engine.rs

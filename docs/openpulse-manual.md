@@ -705,6 +705,7 @@ mode = "BPSK250"
 tx_hang_ms = 500
 full_duplex = false
 tx_device = "plughw:2,0"  # rig_b's card; must differ from [audio] device
+carrier_sense = true      # listen to rig_b's band before keying it
 ```
 
 Behavior highlights:
