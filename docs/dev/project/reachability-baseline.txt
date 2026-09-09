@@ -41,7 +41,9 @@
 # Joined 2026-09-09 by bursts_deferred (crates/openpulse-repeater/src/lib.rs), the same shape for
 # #1325's carrier sense: a test that only shows a relay happening on a clear band cannot tell
 # sensing from a no-op, so the REFUSAL has to be countable, and tests/carrier_sense.rs is an
-# integration test in another crate.
+# integration test in another crate. bursts_discarded_at_start joined it the same day for #1324's
+# start-of-session drain, for the same reason: a drain that never runs is indistinguishable from one
+# that finds nothing, so the count has to be assertable.
 #
 # The collision is narrower than it first looked, and the correction is worth keeping: these are
 # `pub` because the asserting tests are INTEGRATION tests in crates/openpulse-modem/tests/, which
@@ -289,6 +291,7 @@ build_item8_lab_profiles	apps/openpulse-testmatrix/src/bench.rs
 build_snapshot	crates/openpulse-daemon/src/audit.rs
 burst_cap_samples	crates/openpulse-modem/src/engine.rs
 bursts_deferred	crates/openpulse-repeater/src/lib.rs
+bursts_discarded_at_start	crates/openpulse-repeater/src/lib.rs
 bw_hz	crates/openpulse-modem/src/ofdm_sim.rs
 bytes_per_symbol	plugins/ofdm/src/params.rs
 capture_burst	crates/openpulse-modem/src/engine.rs

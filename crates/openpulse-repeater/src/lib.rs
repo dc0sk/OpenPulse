@@ -61,6 +61,10 @@ pub struct CrossBandRepeater {
     sense_faults: u32,
     /// Bursts dropped because rig_b's band was busy — the tripwire that makes the sense falsifiable.
     bursts_deferred: u64,
+    /// Bursts discarded at session start because they predate it (#1324) — the tripwire that makes
+    /// the drain falsifiable, since a drain that never runs looks exactly like one that finds
+    /// nothing.
+    bursts_discarded_at_start: u64,
 }
 
 /// How many capture ticks one sense may spend before deciding.
@@ -123,6 +127,7 @@ impl CrossBandRepeater {
             start: Instant::now(),
             sense_faults: 0,
             bursts_deferred: 0,
+            bursts_discarded_at_start: 0,
         }
     }
 
@@ -145,6 +150,11 @@ impl CrossBandRepeater {
     /// lets one assert the REFUSAL.
     pub fn bursts_deferred(&self) -> u64 {
         self.bursts_deferred
+    }
+
+    /// Bursts discarded at session start because they predate it (#1324).
+    pub fn bursts_discarded_at_start(&self) -> u64 {
+        self.bursts_discarded_at_start
     }
 
     /// Listen to rig_b's band and decide whether it is free.
@@ -336,9 +346,37 @@ impl CrossBandRepeater {
     /// A capture with no decodable frame is not an error and does not end the session (#1297).
     /// PTT is released when the loop returns, on the error path too.
     pub fn run_full_duplex(&mut self, stop: Arc<AtomicBool>) -> Result<u64, RepeaterError> {
+        // Discard anything queued before this session began (#1324).
+        //
+        // The repeater is handed back to the daemon on disable and re-used on the next enable, and
+        // the burst channel travels WITH it while the sender stays in `RuntimeControlState`. So
+        // bursts flushed in the moments before a disable survive the pause and would go on the air
+        // when it resumes — measured at 4 bursts and 4 keyings, carrying audio as old as the gap.
+        // Draining here rather than in the daemon because the daemon does not hold this receiver;
+        // on a first start it is a no-op by construction, since the rx tick only sends while
+        // `repeater_stop.is_some()` and that is set by the same task that starts us.
+        let mut discarded = 0u64;
+        while self.bursts.try_recv().is_ok() {
+            discarded += 1;
+        }
+        if discarded > 0 {
+            tracing::info!(
+                discarded,
+                "cross-band relay: dropped bursts queued before this session — they are older than \
+                 the pause and must not be transmitted now"
+            );
+        }
+        self.bursts_discarded_at_start = self.bursts_discarded_at_start.saturating_add(discarded);
+
+        // A fresh session gets a fresh fault budget (#1324). `sense_faults` is cleared only by a
+        // `Clear` verdict, so a repeater handed back after `MAX_SENSE_FAULTS` would otherwise resume
+        // with a budget of ONE — it would exit again on the next unreadable sense, which is exactly
+        // the case an operator re-enabling after fixing a cable is trying to escape.
+        self.sense_faults = 0;
+
         // Created HERE rather than stored on the struct: it holds a `Box<dyn AudioInputStream>`,
-        // and `cpal::Stream` is `!Send`, so a repeater carrying one could not be moved into the
-        // daemon's thread at all. This function already runs on that thread.
+        // which is `!Send` as a trait object, so a repeater carrying one could not be moved into
+        // the daemon's thread at all. This function already runs on that thread.
         let mut sensor = self.config.carrier_sense.then(|| CaptureTicker::new(None));
         let mut count = 0u64;
         let result = loop {
@@ -354,8 +392,10 @@ impl CrossBandRepeater {
             {
                 Ok(b) => b,
                 Err(RecvTimeoutError::Timeout) => continue,
-                // The daemon dropped the sender: it is shutting down or the repeater was disabled.
-                // Ending the session is right, and #1298 reports the exit.
+                // The daemon dropped the sender, which means the daemon itself is going away —
+                // `DisableRepeater` does NOT drop it (the sender lives in `RuntimeControlState` and
+                // outlives any one session), so this is shutdown, not a disable. Ending the session
+                // is right, and #1298 reports the exit.
                 Err(RecvTimeoutError::Disconnected) => break Ok(count),
             };
             match self.relay_burst(&burst, sensor.as_mut()) {
