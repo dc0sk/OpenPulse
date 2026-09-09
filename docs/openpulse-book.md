@@ -4042,7 +4042,7 @@ strong authentication".
 
 ```toml
 [repeater]
-enabled = false
+enabled = true       # STARTS the repeater at daemon startup; defaults to false
 mode = "BPSK250"     # same mode both directions
 tx_hang_ms = 500     # ignored when full_duplex
 full_duplex = false  # true = hold the key ACROSS frames (dropped after silence),
@@ -4054,12 +4054,23 @@ backend = "rigctld"               # refuses to start on a collision, because two
 serial_port = ""                  # SharedPtts would key and release one transmitter
 ```
 
-Then, with the daemon running:
+`enabled = true` means *running*: the daemon starts the repeater at startup, exactly as the JS8
+discovery beacon starts from its own config. The default is `false`, so the automatic transmit
+service is off unless you write the line.
+
+The runtime commands are a switch on top of that, for stopping and restarting it without editing
+config and bouncing the daemon:
 
 ```sh
-openpulse daemon enable-repeater
 openpulse daemon disable-repeater
+openpulse daemon enable-repeater
 ```
+
+Note the order. Until 2026-09 this section documented `enabled = false` followed by
+`enable-repeater`, and that sequence relayed nothing: the runtime command spawned a thread that
+exited immediately on a config flag it also consulted. Neither `enabled = true` nor
+`enable-repeater` worked on its own. Both do now, and each is gated
+(`openpulse-daemon --test repeater_relays_a_daemon_burst`).
 
 (`[radio.rig_a]` exists in the template but is explicitly documented as "Currently unused" —
 the primary rig is the top-level `[radio]` section; `rig_a` is kept for a planned multi-rig

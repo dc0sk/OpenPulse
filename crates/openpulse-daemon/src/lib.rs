@@ -230,6 +230,12 @@ pub struct RuntimeControlState {
     pub repeater: Option<CrossBandRepeater>,
     /// Stop flag for the running repeater thread.
     pub repeater_stop: Option<Arc<AtomicBool>>,
+    /// Bursts handed to the running repeater (#1308). Bounded and lossy: the repeater spends rig_b
+    /// airtime per burst while the daemon keeps hearing, so a slow relay must drop rather than grow.
+    pub repeater_bursts:
+        Option<std::sync::mpsc::SyncSender<openpulse_modem::pipeline::AudioSamples>>,
+    /// Bursts dropped because the repeater was still busy — a tripwire, not a statistic.
+    pub repeater_bursts_dropped: u64,
     /// Handle for the running repeater thread.
     pub repeater_thread: Option<std::thread::JoinHandle<()>>,
     /// PTT hardware + watchdog deadline behind a shared lock, so an independent watchdog thread can
@@ -462,6 +468,8 @@ impl Default for RuntimeControlState {
             qsy_switchover_offset_s: 5,
             repeater: None,
             repeater_stop: None,
+            repeater_bursts: None,
+            repeater_bursts_dropped: 0,
             repeater_thread: None,
             ptt: crate::ptt::SharedPtt::default(),
             trust_store: InMemoryTrustStore::default(),
@@ -512,6 +520,7 @@ impl std::fmt::Debug for RuntimeControlState {
             .field("qsy_switchover_offset_s", &self.qsy_switchover_offset_s)
             .field("repeater", &self.repeater.is_some())
             .field("repeater_stop", &self.repeater_stop.is_some())
+            .field("repeater_bursts_dropped", &self.repeater_bursts_dropped)
             .field("repeater_thread", &self.repeater_thread.is_some())
             .field("ptt", &self.ptt)
             .field("trust_store_entries", &"<opaque>")
@@ -1656,6 +1665,77 @@ fn reap_finished_repeater(
     }
 }
 
+/// Spawn the cross-band repeater thread and record its handles; returns the mode it will relay at.
+///
+/// **One helper for both entry points on purpose.** The daemon starts the repeater at startup when
+/// `[repeater] enabled`, and `EnableRepeater` starts it on command. Those two drifted before: only
+/// the command arm ever spawned a thread, while startup set `repeater_enabled = true` on its own —
+/// so a config-enabled repeater was reported running, `EnableRepeater` answered "already enabled",
+/// and no sequence short of `DisableRepeater` first could start it. Sharing the spawn is what stops
+/// that from recurring; it is not a tidiness refactor.
+///
+/// Returns `None` when no repeater was built at startup (no usable `[radio.rig_b]`).
+fn spawn_repeater(
+    runtime_state: &mut RuntimeControlState,
+    event_tx: &Arc<broadcast::Sender<ControlEvent>>,
+) -> Option<String> {
+    let mut repeater = runtime_state.repeater.take()?;
+    // Read before the repeater moves into the thread.
+    let repeater_mode = repeater.mode().to_string();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
+    // The thread owns the repeater, so when it exits the repeater is GONE. Report that: without it,
+    // "relaying nothing because the band is quiet" and "the thread died" are the same observation
+    // from outside (#1298).
+    let thread_tx = Arc::clone(event_tx);
+    let thread = std::thread::spawn(move || {
+        if let Err(e) = repeater.run_full_duplex(stop_clone) {
+            tracing::warn!(error = %e, "cross-band repeater exited with error");
+            let _ = thread_tx.send(ControlEvent::CommandError {
+                command: "repeater".to_string(),
+                reason: format!("cross-band repeater stopped: {e}"),
+            });
+            // Only on the error path: a clean stop is already reported by DisableRepeater, and
+            // emitting there too would put two `false` edges on one transition.
+            let _ = thread_tx.send(ControlEvent::RepeaterChanged { enabled: false });
+        }
+    });
+    runtime_state.repeater_stop = Some(stop);
+    runtime_state.repeater_thread = Some(thread);
+    runtime_state.repeater_enabled = true;
+    Some(repeater_mode)
+}
+
+/// Start the repeater at daemon startup when `[repeater] enabled` is set.
+///
+/// Config means RUNNING, matching the JS8 discovery beacon — the other §97.221 automatic
+/// transmitter in this daemon, which likewise starts from config alone with the runtime command as
+/// a switch on top. `[repeater] enabled` defaults to `false`, so the automatic transmit service is
+/// still off unless an operator writes the line, and `DisableRepeater` remains the control point.
+pub(crate) fn start_repeater_if_configured(
+    enabled: bool,
+    runtime_state: &mut RuntimeControlState,
+    event_tx: &Arc<broadcast::Sender<ControlEvent>>,
+) {
+    if !enabled {
+        // Startup must not claim a repeater it did not start (#1298's rule, at the startup boundary).
+        runtime_state.repeater_enabled = false;
+        return;
+    }
+    match spawn_repeater(runtime_state, event_tx) {
+        Some(mode) => {
+            tracing::info!(mode = %mode, "cross-band repeater started from config");
+            let _ = event_tx.send(ControlEvent::RepeaterChanged { enabled: true });
+        }
+        None => {
+            runtime_state.repeater_enabled = false;
+            tracing::warn!(
+                "[repeater] enabled = true but no repeater was built; see the startup log for why"
+            );
+        }
+    }
+}
+
 pub(crate) fn keyed_transmit<T>(
     ptt: &crate::ptt::SharedPtt,
     event_tx: Option<&broadcast::Sender<ControlEvent>>,
@@ -2627,7 +2707,7 @@ pub async fn apply_command_to_engine(
             // at `tracing::warn!` and then set `repeater_enabled = true` and emit
             // `RepeaterChanged { enabled: true }` anyway — so a daemon with no repeater reported one
             // as running, and no command sequence could get back to a truthful state.
-            let Some(mut repeater) = runtime_state.repeater.take() else {
+            let Some(repeater_mode) = spawn_repeater(runtime_state, event_tx) else {
                 let _ = event_tx.send(ControlEvent::CommandError {
                     command: "enable_repeater".to_string(),
                     reason: "no repeater is available — it was not built at startup (see the \
@@ -2637,33 +2717,9 @@ pub async fn apply_command_to_engine(
                 return;
             };
 
-            // Read before the repeater moves into the thread.
-            let repeater_mode = repeater.mode().to_string();
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_clone = Arc::clone(&stop);
-            // The thread owns the repeater, so when it exits the repeater is GONE. Report that:
-            // without it, "relaying nothing because the band is quiet" and "the thread died" are
-            // the same observation from outside (#1298).
-            let thread_tx = Arc::clone(event_tx);
-            let thread = std::thread::spawn(move || {
-                if let Err(e) = repeater.run_full_duplex(stop_clone) {
-                    tracing::warn!(error = %e, "cross-band repeater exited with error");
-                    let _ = thread_tx.send(ControlEvent::CommandError {
-                        command: "repeater".to_string(),
-                        reason: format!("cross-band repeater stopped: {e}"),
-                    });
-                    // Only on the error path: a clean stop is already reported by DisableRepeater,
-                    // and emitting there too would put two `false` edges on one transition.
-                    let _ = thread_tx.send(ControlEvent::RepeaterChanged { enabled: false });
-                }
-            });
-            runtime_state.repeater_stop = Some(stop);
-            runtime_state.repeater_thread = Some(thread);
-
             // The repeater reads this engine's bursts (#1308), so the runaway cap must cover its
             // rung for as long as it is running.
             engine.set_relay_mode(Some(repeater_mode));
-            runtime_state.repeater_enabled = true;
             let _ = event_tx.send(ControlEvent::RepeaterChanged { enabled: true });
         }
         ControlCommand::DisableRepeater => {
@@ -4411,28 +4467,43 @@ mod command_apply_tests {
     }
 
     /// Build a real, runnable repeater so `EnableRepeater` has something to start.
-    fn test_repeater(enabled: bool) -> openpulse_repeater::CrossBandRepeater {
-        test_repeater_on(enabled, "BPSK250")
+    ///
+    /// Returns the burst SENDER with it, and the caller must hold it: since #1308 the repeater
+    /// blocks on that channel, and a dropped sender ends its session on the `Disconnected` arm. A
+    /// helper that dropped it internally would make every test's repeater exit instantly — which is
+    /// only what the reap test wants.
+    fn test_repeater() -> (
+        openpulse_repeater::CrossBandRepeater,
+        std::sync::mpsc::SyncSender<openpulse_modem::pipeline::AudioSamples>,
+    ) {
+        test_repeater_on("BPSK250")
     }
 
     /// A repeater on an explicit rung, for the cap-widening gate: the widening is only observable
     /// when the relay rung differs from the configured mode.
-    fn test_repeater_on(enabled: bool, mode: &str) -> openpulse_repeater::CrossBandRepeater {
+    fn test_repeater_on(
+        mode: &str,
+    ) -> (
+        openpulse_repeater::CrossBandRepeater,
+        std::sync::mpsc::SyncSender<openpulse_modem::pipeline::AudioSamples>,
+    ) {
         let mk = || {
             let mut e = ModemEngine::new(Box::new(openpulse_audio::LoopbackBackend::new()));
             let _ = e.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
             e
         };
-        openpulse_repeater::CrossBandRepeater::new(
+        let (burst_tx, burst_rx) = std::sync::mpsc::sync_channel(1);
+        let rp = openpulse_repeater::CrossBandRepeater::new(
             Box::new(openpulse_radio::NoOpPtt::new()),
             mk(),
             mk(),
+            burst_rx,
             openpulse_repeater::RepeaterConfig {
-                enabled,
                 mode: mode.to_string(),
                 ..Default::default()
             },
-        )
+        );
+        (rp, burst_tx)
     }
 
     #[tokio::test]
@@ -4444,7 +4515,8 @@ mod command_apply_tests {
         let mut runtime_state = RuntimeControlState::default();
         // #1298: this test used to run with `repeater: None` and assert that enabling SUCCEEDED —
         // it was pinning the defect. A daemon with nothing to run must not report a running repeater.
-        runtime_state.repeater = Some(test_repeater(true));
+        let (rp, _burst_tx) = test_repeater();
+        runtime_state.repeater = Some(rp);
 
         apply_command_to_engine(
             &ControlCommand::EnableRepeater,
@@ -4525,7 +4597,8 @@ mod command_apply_tests {
 
         let mut with_relay = test_engine();
         let mut rs = RuntimeControlState::default();
-        rs.repeater = Some(test_repeater_on(true, "BPSK31"));
+        let (rp, _burst_tx) = test_repeater_on("BPSK31");
+        rs.repeater = Some(rp);
         cmd(
             &ControlCommand::EnableRepeater,
             &mut with_relay,
@@ -4562,7 +4635,7 @@ mod command_apply_tests {
             &ControlCommand::EnableRepeater,
             &mut after_disable,
             &mut RuntimeControlState {
-                repeater: Some(test_repeater_on(true, "BPSK31")),
+                repeater: Some(test_repeater_on("BPSK31").0),
                 ..Default::default()
             },
             &ev_tx,
@@ -4624,9 +4697,14 @@ mod command_apply_tests {
         let (tx, mut rx) = broadcast::channel::<ControlEvent>(64);
         let ev_tx = Arc::new(tx);
         let mut runtime_state = RuntimeControlState::default();
-        // A DISABLED repeater's `run_full_duplex` returns Ok(0) at once, so the thread exits
-        // immediately — standing in for any exit the daemon did not ask for.
-        runtime_state.repeater = Some(test_repeater(false));
+        // Dropping the burst sender ends `run_full_duplex` on its `Disconnected` arm, so the thread
+        // exits at once — standing in for any exit the daemon did not ask for. This used to be
+        // `test_repeater(false)`, leaning on `RepeaterConfig.enabled`; that flag was the #1308
+        // review's defect (it made `EnableRepeater` report success while relaying nothing) and is
+        // gone. A dropped sender is the honest stand-in: it is what a shutdown actually does.
+        let (rp, burst_tx) = test_repeater();
+        drop(burst_tx);
+        runtime_state.repeater = Some(rp);
 
         apply_command_to_engine(
             &ControlCommand::EnableRepeater,
@@ -5308,7 +5386,6 @@ mod command_apply_tests {
         let rep_rx = ModemEngine::new(Box::new(LoopbackBackend::new()));
         let rep_tx = ModemEngine::new(Box::new(LoopbackBackend::new()));
         let rep_cfg = openpulse_repeater::RepeaterConfig {
-            enabled: true,
             mode: "BPSK250".to_string(),
             tx_hang_ms: 0,
             full_duplex: false,
@@ -5318,6 +5395,7 @@ mod command_apply_tests {
             Box::new(openpulse_radio::NoOpPtt::new()),
             rep_rx,
             rep_tx,
+            std::sync::mpsc::sync_channel(1).1,
             rep_cfg,
         ));
 

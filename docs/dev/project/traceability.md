@@ -9,6 +9,57 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — The cross-band repeater hears the daemon, and can actually be started (#1308, PR 2 of 3)
+
+- **Requirement/change:** REQ-FUN-11. The repeater opened a capture stream of its own, from the
+  fresh `LoopbackBackend` that `build_audio_backend` hands it — so through `server::run` it heard
+  nothing the daemon heard, in production and in every test. Writing the first daemon-level relay
+  gate then surfaced a second, older defect: **no reachable path through `server::run` started the
+  repeater at all.** `[repeater] enabled = true` set `repeater_enabled` while spawning no thread, so
+  `EnableRepeater` answered "already enabled"; `enabled = false` + `EnableRepeater` spawned a thread
+  that returned `Ok(0)` at once on `RepeaterConfig.enabled` while reporting success. Only the
+  CLI-only `disable`-then-`enable` dance worked, and the panel cannot express it.
+
+- **Design decision:** one accumulator, one flush, two consumers — the daemon `try_send`s the burst
+  it already flushed for the monitor to the repeater over a bounded (4) `sync_channel`, lossy on
+  purpose with a drop tripwire, because the relay spends rig_b airtime per burst while the daemon
+  keeps hearing and a queue would put minutes-old audio on the air. For the lifecycle, options A
+  (startup spawns) and B (command-only) were both **rejected on review** in favour of **C**: config
+  means running, the runtime command is an independent switch, and the crate's own
+  `RepeaterConfig.enabled` is deleted because the daemon owns the lifecycle. The precedent is the
+  JS8 discovery beacon — the other §97.221 automatic transmitter here — which already starts from
+  config alone with `DisableDiscovery` as the switch on top. The spawn is extracted into a single
+  `spawn_repeater` helper called by both entry points, since the defect was those paths drifting.
+  Review artifact: `docs/dev/reviews/artifacts/1308-repeater-startup-unreachable.md`.
+
+- **Implementation:** `crates/openpulse-daemon/src/server.rs` (burst channel at repeater
+  construction; `try_send` beside the monitor in the rx tick; `start_repeater_if_configured` after
+  the PTT watchdog, deliberately after it because nothing should key before the watchdog that bounds
+  a stuck carrier); `crates/openpulse-daemon/src/lib.rs` (`spawn_repeater` +
+  `start_repeater_if_configured`; `repeater_bursts` / `repeater_bursts_dropped` state);
+  `crates/openpulse-repeater/src/lib.rs` + `config.rs` (`bursts` receiver replaces the capture;
+  `relay_burst`/`relay_burst_at` replace `relay_one_frame`; the `enabled` field and its three gates
+  removed, including the zero-caller `is_enabled`).
+
+- **Tests:** `crates/openpulse-daemon/tests/repeater_relays_a_daemon_burst.rs` — the first
+  daemon-level relay gate, three cases through the real `server::run` with a mock rigctld on
+  `[radio.rig_b]` counting `T 1`: config-enabled relays with no command; `enable_repeater` starts a
+  config-disabled one; an "already enabled" refusal is issued only when it is true. The observable is
+  the transmitter, not a count or an event, and nothing else in the daemon keys rig_b (the §97.119 ID
+  cannot key first — `id_due` requires a prior transmit). `repeater_integration::
+  a_repeater_whose_sender_is_dropped_ends_its_session` replaces `relay_disabled_returns_none`.
+  `a_frame_split_across_several_reads_is_still_relayed` (#1297) was removed with a note: its property
+  moved to the daemon gate, which delivers the frame in 4096-sample reads and exercises the
+  accumulator where it now lives.
+
+- **Test results:** the three daemon gates pass in 2.42 s. Sabotage-verified twice and in a
+  discriminating pattern: forcing the burst `try_send` to fail turns a 1.9 s pass into a 25 s
+  failure; disabling the startup spawn fails cases (a) and (c) and leaves (b) green, which is exactly
+  the attribution claimed. `openpulse-repeater` 14 passed / 0 failed. `REACH: PASS` (2328 public
+  items, 0 new unreferenced) after renaming the two stale `relay_one_frame*` baseline entries and
+  tagging `CaptureTicker` `DORMANT(#1310)` — it lost its only consumer here and is retained for the
+  ARDOP/KISS adoption decision. Full `scripts/gate.sh` verdict below.
+
 ## 2026-09-09 — The RX burst cap now covers the relay consumer's rung (#1308, PR 1 of 3)
 
 - **Requirement/change:** first of three PRs implementing the maintainer's #1308 decision — the

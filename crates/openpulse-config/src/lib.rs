@@ -555,7 +555,13 @@ pub struct RadioConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RepeaterConfig {
-    /// Enable the cross-band repeater.  Requires `[radio.rig_a]` and `[radio.rig_b]`.
+    /// Start the cross-band repeater at daemon startup. Requires `[radio.rig_b]`; the daemon
+    /// refuses to start when this is set and rig_b is missing or unusable.
+    ///
+    /// `true` means RUNNING, not merely "available to enable" — the same contract the JS8 discovery
+    /// beacon has. `DisableRepeater` / `EnableRepeater` are a runtime switch on top. (`[radio.rig_a]`
+    /// is NOT required despite older wording: it is unread; the primary rig is the top-level
+    /// `[radio]` section.)
     pub enabled: bool,
     /// Modulation mode used for both RX (rig_a) and TX (rig_b).
     pub mode: String,
