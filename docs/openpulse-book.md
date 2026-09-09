@@ -4044,6 +4044,7 @@ strong authentication".
 [repeater]
 enabled = true       # STARTS the repeater at daemon startup; defaults to false
 tx_device = "plughw:2,0"  # rig_b's sound card — see below
+carrier_sense = true      # do not key rig_b over somebody else's QSO
 mode = "BPSK250"     # same mode both directions
 tx_hang_ms = 500     # ignored when full_duplex
 full_duplex = false  # true = hold the key ACROSS frames (dropped after silence),
@@ -4079,6 +4080,16 @@ repeater would key rig_b and put audio into the wrong radio. It must differ from
 one card cannot carry two capture streams (#1007), and the daemon refuses to start on a collision
 while the repeater is enabled. The name covers both directions, which is what lets rig_b's band be
 listened to as well as transmitted on.
+
+`carrier_sense` makes the repeater listen to rig_b's band before keying it. This matters more here
+than for any other transmit path in the project: a cross-band relay is an unattended §97.221 station
+transmitting on a band it never otherwise hears, so without it the repeater doubles with whatever
+QSO is already on its output — repeatedly, for as long as traffic keeps arriving on its input. It
+listens through the same `InputCapture` seam and calibrated noise-floor tracker the receiver uses,
+on rig_b's own card, which is why `tx_device` matters. A band it cannot read counts as busy, not as
+clear: a station that cannot hear its output must not transmit blind. Sensing applies when the
+repeater ACQUIRES the channel, not while a `full_duplex` session already holds the key — otherwise
+it would hear its own carrier and fall silent after one frame.
 
 (`[radio.rig_a]` exists in the template but is explicitly documented as "Currently unused" —
 the primary rig is the top-level `[radio]` section; `rig_a` is kept for a planned multi-rig

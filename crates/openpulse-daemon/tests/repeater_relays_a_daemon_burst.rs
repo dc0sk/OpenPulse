@@ -169,6 +169,14 @@ fn cfg(tcp_port: u16, ws_port: u16, rig_b_addr: &str, autostart: bool) -> Openpu
     c.modem.ptt_backend = "none".into();
     c.radio.cat_backend = "none".into();
     c.repeater.enabled = autostart;
+    // This file gates the LIFECYCLE and the burst handoff, not rig_b's band. #1325's carrier sense
+    // is off here for a reason worth stating: the repeater's engines get their own backend from
+    // `build_audio_backend`, which under the test config is an empty `LoopbackBackend` — so the
+    // sense reads nothing, correctly calls that "unreadable" rather than "clear", and fail-safes by
+    // refusing to key. That is the designed behaviour, and it would make every case here fail for a
+    // reason that has nothing to do with what they assert. Sensing is gated by
+    // `openpulse-repeater --test carrier_sense`.
+    c.repeater.carrier_sense = false;
     c.repeater.mode = MODE.into();
     c.repeater.full_duplex = false;
     c.radio.rig_b = Some(openpulse_config::RigConfig {

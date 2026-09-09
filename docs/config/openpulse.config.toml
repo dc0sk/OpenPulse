@@ -43,6 +43,8 @@ tx_hang_ms = 500
 # rig_b's sound card. Empty = OS default, which on a two-card station is probably the main
 # rig. Must not equal [audio] device (#1007: one card, one capture stream).
 tx_device = ""
+# Carrier-sense rig_b's band before keying it (#1325). Default true.
+carrier_sense = true
 # true = hold PTT ACROSS relayed frames rather than dropping it between them. The key is
 # taken on the first frame, extended by each subsequent one, and released after 180 s of
 # silence — not held from session start (#1260).

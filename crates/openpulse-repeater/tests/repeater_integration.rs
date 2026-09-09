@@ -22,7 +22,7 @@ fn relay_burst(rp: &mut CrossBandRepeater, audio: &[f32], now_ms: u64) -> usize 
     let burst = openpulse_modem::pipeline::AudioSamples {
         samples: audio.to_vec(),
     };
-    rp.relay_burst_at(&burst, now_ms)
+    rp.relay_burst_at(&burst, now_ms, None)
         .expect("relay")
         .expect("the burst must relay")
 }
@@ -85,6 +85,9 @@ fn a_repeater_whose_sender_is_dropped_ends_its_session() {
     let (engine_rx, _lb_rx) = make_engine_with_plugin();
     let (engine_tx, _lb_tx) = make_engine_with_plugin();
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
@@ -129,6 +132,9 @@ fn relay_loopback_cross_band() {
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
@@ -226,6 +232,9 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
         full_duplex: false,
         callsign: "N0CALL".into(),
         id_interval_secs: 600,
+        // These tests are about relaying and keying, not about the output band; #1325's own gate is
+        // `carrier_sense.rs`. Leaving it on here would defer every burst, since no sensor is passed.
+        carrier_sense: false,
     };
     let mut repeater = CrossBandRepeater::new(
         Box::new(rig_b),
@@ -285,6 +294,9 @@ fn relay_empty_buffer_returns_none() {
     let (engine_rx, _lb_rx) = make_engine_with_plugin();
     let (engine_tx, lb_tx) = make_engine_with_plugin();
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: false,
@@ -306,7 +318,7 @@ fn relay_empty_buffer_returns_none() {
     let burst = openpulse_modem::pipeline::AudioSamples {
         samples: vec![0.0; 8000],
     };
-    match repeater.relay_burst(&burst) {
+    match repeater.relay_burst(&burst, None) {
         Ok(None) => {}
         Ok(Some(n)) => panic!("relayed {n} bytes from a burst of silence"),
         Err(_) => {} // a decode error on silence is acceptable
@@ -332,6 +344,9 @@ fn full_duplex_idle_session_never_keys_and_a_held_key_is_released_at_session_end
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 500, // ignored in full-duplex
         full_duplex: true,
@@ -373,6 +388,9 @@ fn full_duplex_holds_one_key_across_frames_and_releases_it_at_session_end() {
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: true,
@@ -419,6 +437,9 @@ fn full_duplex_disabled_returns_zero_immediately() {
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: true,
@@ -462,6 +483,9 @@ fn full_duplex_relay_one_frame_keys_rather_than_transmitting_into_an_unkeyed_rig
     let rig_b = openpulse_radio::RigctldController::connect(&mock_addr).expect("connect");
 
     let config = RepeaterConfig {
+        // #1325's sense is off: this file tests relaying and keying, not the
+        // output band. `tests/carrier_sense.rs` is that gate.
+        carrier_sense: false,
         mode: "BPSK250".into(),
         tx_hang_ms: 0,
         full_duplex: true,

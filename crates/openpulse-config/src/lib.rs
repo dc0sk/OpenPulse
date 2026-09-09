@@ -579,6 +579,14 @@ pub struct RepeaterConfig {
     /// when carrier sense lands (#1325). It must not equal `[audio] device` — that would put two
     /// capture streams on one device, which is #1007's rule.
     pub tx_device: String,
+    /// Carrier-sense rig_b's band before keying it (#1325). Default `true`.
+    ///
+    /// A cross-band relay is an unattended §97.221 station transmitting on a band it never listens
+    /// to, so without this it doubles with whatever QSO is already there, repeatedly, for as long
+    /// as traffic keeps arriving on its input. Turn it off only for an assignment where this
+    /// station is entitled to transmit regardless; the daemon refuses to start an enabled repeater
+    /// that can neither sense its output band nor has been told not to.
+    pub carrier_sense: bool,
 }
 
 /// ARDOP TNC service settings.
@@ -754,6 +762,7 @@ impl Default for RepeaterConfig {
             tx_hang_ms: 500,
             full_duplex: false,
             tx_device: String::new(),
+            carrier_sense: true,
         }
     }
 }
@@ -1169,6 +1178,10 @@ enabled = false
 # cross-band station is very likely the MAIN rig's card. Must differ from [audio] device:
 # one card cannot carry two capture streams, and the daemon refuses to start on a collision.
 tx_device = ""
+# Listen to rig_b's band before keying it. A cross-band relay is an unattended station
+# transmitting on a band it never hears, so without this it doubles with whatever QSO is
+# already there. Turn off only for an assignment entitled to transmit regardless.
+carrier_sense = true
 # Modulation mode used for both RX (rig_a) and TX (rig_b).
 mode = "BPSK250"
 # Milliseconds to hold PTT after the last byte is transmitted (half-duplex only).

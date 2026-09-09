@@ -9,6 +9,49 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — the cross-band repeater listens before it keys rig_b (#1325)
+
+- **Requirement/change:** REQ-FUN-11 / §97.221. `relay_burst_at` keyed rig_b whenever a burst decoded
+  on the input side, with no check on rig_b's band. It is the only automatic transmitter in this
+  daemon that keys a rig the daemon never listens to, so it would double with whatever QSO was on
+  its output, repeatedly, for as long as input traffic arrived. `openpulse-mesh`'s auto-transmit was
+  REMOVED rather than guarded and "no carrier sense" was one of four stated reasons; the repeater had
+  the other three.
+
+- **Design decision:** reviewed, and BOTH of my proposals were rejected. I argued the issue might
+  dissolve because coordinated repeaters do not sense their output — true of §97.205 FM repeaters,
+  but this is filed as a §97.221 digital relay on a *shared* automatic segment, `RigConfig` has no
+  frequency field at all, and a §97.205 repeater cannot exist below 29.5 MHz; the right analogue is
+  the cross-port digipeater, which does sense. My mechanism (CAT S-meter on rig_b) was disqualified:
+  `full_duplex` holds the key across frames, so a read while keyed returns TX-meter garbage and the
+  guard could never fire — the very archetype the rejected CSMA option fails by. Adopted instead:
+  `engine_tx` already owns a full audio backend, and #1308 PR 3's `tx_device` names rig_b's card for
+  `open_input` as well as `open_output`, so a `CaptureTicker` on that card feeds the DCD at the
+  existing `InputCapture` seam — the calibrated `NoiseFloorTracker`, no second sensor, no new
+  threshold constant. Failure policy is two-tier per review: an unreadable band counts as BUSY, and
+  `MAX_SENSE_FAULTS` consecutive unreadable senses exit the session (#1298 reports it) rather than
+  fail open. Review artifact: `docs/dev/reviews/artifacts/1325-repeater-carrier-sense.md`.
+
+- **Implementation:** `crates/openpulse-repeater/src/{lib.rs,config.rs}` (`sense_output_band`,
+  `Sense`, `SENSE_TICKS`, `MAX_SENSE_FAULTS`, `carrier_sense`, `bursts_deferred`);
+  `crates/openpulse-config/src/lib.rs` + `crates/openpulse-daemon/src/server.rs` (the switch).
+  The sensor is created inside `run_full_duplex`, NOT stored on the struct: it holds a
+  `Box<dyn AudioInputStream>` and `cpal::Stream` is `!Send`, so a repeater carrying one could not be
+  moved into the daemon's thread at all. `CaptureTicker` is un-dormanted — this is its consumer.
+
+- **Tests:** `crates/openpulse-repeater/tests/carrier_sense.rs` — busy band defers and does not key
+  (asserted on the PTT counter, not a return value); the identical burst and band DO relay with
+  sensing off; a full-duplex session does not sense against its own carrier; an unreadable band is
+  busy, not clear.
+
+- **Test results:** 4 passed. **Sabotage-verified with discrimination**, which is the point: never
+  reporting busy fails only the busy case; treating unreadable as clear fails only the unreadable
+  case; sensing while keyed fails only the full-duplex case. The third sabotage initially PASSED —
+  the fixture queued 8 quiet blocks and `push_frame` returns one per read, so the backlog sat in
+  front of the busy signal and the second sense read quiet. Corrected to a single block; the
+  sabotage then fails as it should. `REACH: PASS` after baselining `bursts_deferred` alongside the
+  existing tripwire counters, with the same recorded rationale. Full `scripts/gate.sh` verdict below.
+
 ## 2026-09-09 — rig_b gets its own sound card, and the device scan stops being fooled (#1308, PR 3 of 3)
 
 - **Requirement/change:** REQ-DEV-01. The daemon's two repeater engines passed NO device to
