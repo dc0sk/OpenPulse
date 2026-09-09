@@ -700,10 +700,11 @@ rigctld_addr = "127.0.0.1:4533"
 backend = "rigctld"
 
 [repeater]
-enabled = true
+enabled = true          # starts at daemon startup
 mode = "BPSK250"
 tx_hang_ms = 500
 full_duplex = false
+tx_device = "plughw:2,0"  # rig_b's card; must differ from [audio] device
 ```
 
 Behavior highlights:

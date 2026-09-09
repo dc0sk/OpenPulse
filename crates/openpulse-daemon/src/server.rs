@@ -309,7 +309,32 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
         std::sync::mpsc::SyncSender<openpulse_modem::pipeline::AudioSamples>,
     >;
     let repeater = {
+        // Pin rig_b's card on both repeater engines. They used to pass NOTHING, so on a multi-card
+        // host they took the OS default — #1311's defect, inside the daemon #1311 held up as one of
+        // the two surfaces that got this right. A cross-band repeater is by definition a two-card
+        // station, so the default is very likely the WRONG rig.
+        let rep_device = if cfg.repeater.tx_device.is_empty() {
+            if cfg.repeater.enabled {
+                tracing::warn!(
+                    "[repeater] tx_device is unset, so rig_b's engines fall back to the OS default \
+                     audio device — on a two-card cross-band station that is very likely the MAIN \
+                     rig's card, i.e. the repeater transmits into the wrong radio"
+                );
+            }
+            None
+        } else {
+            if let Some(why) =
+                repeater_tx_device_config_error(&cfg.repeater.tx_device, &cfg.audio.device)
+            {
+                if cfg.repeater.enabled {
+                    return Err(format!("refusing to start: {why}"));
+                }
+                tracing::warn!("{why}; the repeater cannot be enabled with this config");
+            }
+            Some(cfg.repeater.tx_device.clone())
+        };
         let mut rx = ModemEngine::new(build_audio_backend(&cfg.audio.backend));
+        rx.set_default_device(rep_device.clone());
         for (name, plugin) in [
             (
                 "BPSK",
@@ -323,6 +348,7 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
             }
         }
         let mut tx = ModemEngine::new(build_audio_backend(&cfg.audio.backend));
+        tx.set_default_device(rep_device.clone());
         for (name, plugin) in [
             (
                 "BPSK",
@@ -2198,6 +2224,27 @@ fn front_end_state(
 /// transmitter: the daemon's guard drop sends `T 0` under the repeater's frame and vice versa, and
 /// neither watchdog can see the other's key. #1263's refusal rule protects only *within* one
 /// `SharedPtt`, so it cannot reach this — the construction site has to.
+/// Why `[repeater] tx_device` cannot be used, or `None` when it is fine.
+///
+/// One sound card cannot carry two capture streams (#1007), and rig_b's engine captures as well as
+/// transmits — `set_default_device` names the device for `open_input` and `open_output` alike, which
+/// is what lets carrier sense read rig_b's band (#1325). So pointing `tx_device` at the main rig's
+/// card is the same class of error as pointing `[radio.rig_b] rigctld_addr` at the main rig's
+/// rigctld, and is refused the same way: hard at startup when the repeater is enabled, a warning
+/// otherwise.
+///
+/// Empty is not an error here — it means "OS default" and is warned about at the call site, because
+/// unlike a collision it is merely *probably* wrong rather than certainly so.
+fn repeater_tx_device_config_error(tx_device: &str, audio_device: &str) -> Option<String> {
+    if tx_device.is_empty() || tx_device != audio_device {
+        return None;
+    }
+    Some(format!(
+        "[repeater] tx_device = \"{tx_device}\" is the same device as [audio] device — rig_b would \
+         share one sound card with the main rig, which cannot carry two capture streams"
+    ))
+}
+
 fn repeater_rig_b_config_error(
     rig_b_backend: &str,
     rig_b_addr: &str,
@@ -3262,8 +3309,37 @@ mod ws_auth_gate_tests {
 
 #[cfg(test)]
 mod repeater_rig_b_tests {
-    use super::repeater_rig_b_config_error;
+    use super::{repeater_rig_b_config_error, repeater_tx_device_config_error};
     use openpulse_config::{RadioConfig, RigConfig};
+
+    /// #1308 PR 3: rig_b sharing the main rig's sound card is #1007's rule, one device over.
+    #[test]
+    fn a_tx_device_equal_to_the_main_audio_device_is_refused() {
+        let why = repeater_tx_device_config_error("plughw:1,0", "plughw:1,0")
+            .expect("one card cannot carry the main rig's capture and rig_b's at once");
+        assert!(
+            why.contains("plughw:1,0"),
+            "the error must name the device: {why}"
+        );
+    }
+
+    /// The two controls that stop the refusal being indiscriminate.
+    #[test]
+    fn a_distinct_or_unset_tx_device_is_accepted() {
+        assert!(
+            repeater_tx_device_config_error("plughw:2,0", "plughw:1,0").is_none(),
+            "two different cards are the whole point of a cross-band repeater"
+        );
+        assert!(
+            repeater_tx_device_config_error("", "plughw:1,0").is_none(),
+            "empty means OS default — probably wrong, but warned about, not refused"
+        );
+        assert!(
+            repeater_tx_device_config_error("", "").is_none(),
+            "two empties are both the OS default and must not read as a collision, or a stock \
+             config would refuse to start"
+        );
+    }
 
     /// #1260: the aliasing case is not exotic — it is what an empty `[radio.rig_b]` header produces,
     /// because both defaults carry the same rigctld address.

@@ -35,9 +35,14 @@ rig_file = ""
 # rig_file = ""
 
 [repeater]
+# `true` starts the repeater at daemon startup; the runtime enable/disable commands are a
+# switch on top of it, not a second thing you must also do.
 enabled = false
 mode = "BPSK250"
 tx_hang_ms = 500
+# rig_b's sound card. Empty = OS default, which on a two-card station is probably the main
+# rig. Must not equal [audio] device (#1007: one card, one capture stream).
+tx_device = ""
 # true = hold PTT ACROSS relayed frames rather than dropping it between them. The key is
 # taken on the first frame, extended by each subsequent one, and released after 180 s of
 # silence — not held from session start (#1260).

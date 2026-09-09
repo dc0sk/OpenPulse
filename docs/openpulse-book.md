@@ -4043,6 +4043,7 @@ strong authentication".
 ```toml
 [repeater]
 enabled = true       # STARTS the repeater at daemon startup; defaults to false
+tx_device = "plughw:2,0"  # rig_b's sound card — see below
 mode = "BPSK250"     # same mode both directions
 tx_hang_ms = 500     # ignored when full_duplex
 full_duplex = false  # true = hold the key ACROSS frames (dropped after silence),
@@ -4071,6 +4072,13 @@ Note the order. Until 2026-09 this section documented `enabled = false` followed
 exited immediately on a config flag it also consulted. Neither `enabled = true` nor
 `enable-repeater` worked on its own. Both do now, and each is gated
 (`openpulse-daemon --test repeater_relays_a_daemon_burst`).
+
+`tx_device` names rig_b's sound card. Leaving it empty takes the OS default, and a cross-band
+repeater is by definition a two-card station, so the default is very likely the **main** rig — the
+repeater would key rig_b and put audio into the wrong radio. It must differ from `[audio] device`:
+one card cannot carry two capture streams (#1007), and the daemon refuses to start on a collision
+while the repeater is enabled. The name covers both directions, which is what lets rig_b's band be
+listened to as well as transmitted on.
 
 (`[radio.rig_a]` exists in the template but is explicitly documented as "Currently unused" —
 the primary rig is the top-level `[radio]` section; `rig_a` is kept for a planned multi-rig

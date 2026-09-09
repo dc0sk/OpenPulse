@@ -569,6 +569,16 @@ pub struct RepeaterConfig {
     pub tx_hang_ms: u64,
     /// When true, PTT is held for the entire relay session.  `tx_hang_ms` is ignored.
     pub full_duplex: bool,
+    /// Audio device for rig_b, the repeater's TRANSMIT rig. Empty = the OS default, which on a
+    /// multi-card host is whatever card the OS happens to prefer — the #1311 defect, and a
+    /// cross-band repeater is by definition a two-card station, so leaving this empty is very
+    /// likely wrong.
+    ///
+    /// It names the device for BOTH directions: `ModemEngine::set_default_device` is consulted by
+    /// `open_output` and `open_input` alike, so this is also where rig_b's receive audio comes from
+    /// when carrier sense lands (#1325). It must not equal `[audio] device` — that would put two
+    /// capture streams on one device, which is #1007's rule.
+    pub tx_device: String,
 }
 
 /// ARDOP TNC service settings.
@@ -743,6 +753,7 @@ impl Default for RepeaterConfig {
             mode: "BPSK250".into(),
             tx_hang_ms: 500,
             full_duplex: false,
+            tx_device: String::new(),
         }
     }
 }
@@ -1152,7 +1163,12 @@ meter_poll_ms = 500
 
 [repeater]
 # Enable the cross-band repeater (RX uses the top-level [radio] rig; TX uses [radio.rig_b]).
+# `true` STARTS it at daemon startup — config means running, as it does for the JS8 beacon.
 enabled = false
+# Audio device for rig_b, the TRANSMIT rig. Empty = the OS default, which on a two-card
+# cross-band station is very likely the MAIN rig's card. Must differ from [audio] device:
+# one card cannot carry two capture streams, and the daemon refuses to start on a collision.
+tx_device = ""
 # Modulation mode used for both RX (rig_a) and TX (rig_b).
 mode = "BPSK250"
 # Milliseconds to hold PTT after the last byte is transmitted (half-duplex only).
