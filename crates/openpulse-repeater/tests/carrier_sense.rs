@@ -275,3 +275,66 @@ fn an_unreadable_band_is_treated_as_busy_not_as_clear() {
     assert_eq!(r.keys.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(r.repeater.bursts_deferred(), 1);
 }
+
+/// THE #1324 DRAIN GATE: bursts queued before a session must not be transmitted by the next one.
+///
+/// The repeater is handed back to the daemon on disable and re-used on the next enable, and the
+/// burst channel travels WITH it while the sender stays in the daemon. So bursts flushed in the
+/// moments before a disable survive the pause. Measured before the drain: 4 bursts, 4 keyings,
+/// carrying audio as old as the operator's gap between disable and enable.
+///
+/// The assertion is on the PTT counter, because "did not relay" and "relayed silently" are the same
+/// return value.
+#[test]
+fn bursts_queued_before_a_session_are_discarded_not_transmitted() {
+    let frame = input_frame();
+    let ptt = CountingPtt::default();
+    let keys = Arc::clone(&ptt.keys);
+    let (tx, rx) = std::sync::mpsc::sync_channel(4);
+    for _ in 0..4 {
+        tx.send(AudioSamples {
+            samples: frame.clone(),
+        })
+        .expect("queue a burst the daemon flushed before the pause");
+    }
+
+    let mut rp = CrossBandRepeater::new(
+        Box::new(ptt),
+        engine_on(&LoopbackBackend::new()),
+        engine_on(&LoopbackBackend::new()),
+        rx,
+        RepeaterConfig {
+            mode: "BPSK250".into(),
+            tx_hang_ms: 0,
+            carrier_sense: false,
+            ..Default::default()
+        },
+    );
+
+    // Start a session and let it run briefly with nothing new arriving.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let s2 = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        s2.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    drop(tx);
+    let relayed = rp.run_full_duplex(stop).expect("session ends cleanly");
+
+    assert_eq!(
+        relayed, 0,
+        "the session relayed bursts that predate it — stale audio on the air"
+    );
+    assert_eq!(
+        keys.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the transmitter was keyed for audio queued before this session began. Measured at 4 keyings \
+         before the drain; the age of that audio is however long the repeater was disabled."
+    );
+    assert_eq!(
+        rp.bursts_discarded_at_start(),
+        4,
+        "the drain must COUNT what it dropped — a drain that never runs looks exactly like one that \
+         found nothing, and this gate would pass either way"
+    );
+}

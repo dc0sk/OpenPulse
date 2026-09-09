@@ -9,6 +9,46 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-09 — a stopped cross-band repeater can be started again (#1324)
+
+- **Requirement/change:** REQ-FUN-11 / §97.221. `spawn_repeater` moved the repeater into a thread
+  whose closure returned `()`, so it was dropped the moment `run_full_duplex` returned.
+  `DisableRepeater` joined a thread whose payload was already gone and the next `EnableRepeater`
+  answered "no repeater is available … a previous session ended and consumed it". Only a daemon
+  restart recovered — the control point could stop the transmitter but not start it. This got worse
+  in practice once #1326 made the repeater startable and #1328 gave it a reason to stop on its own.
+
+- **Design decision:** the thread returns the repeater (`JoinHandle<CrossBandRepeater>`) and both
+  join sites put it back. Reviewed, and the review corrected the reasoning rather than the choice:
+  my stated reason (a rebuild would tear down rig_b's PTT "mid-release") was wrong — the guard
+  releases synchronously before return — and the real reason is the **§97.119 ID timer**, whose
+  `tx_since_id` carries across a pause under this design, where a rebuild would forget that un-IDed
+  transmissions had happened. Handing back after an ERROR exit is deliberate: #1285's refuse-to-start
+  ruling covers a silent degrade at start, whereas this failure is loud, the transmitter is off, and
+  restarting needs an explicit command — but `sense_faults` must be reset per session or a repeater
+  returned after `MAX_SENSE_FAULTS` resumes with a budget of one. Review artifact:
+  `docs/dev/reviews/artifacts/1324-repeater-single-use.md`.
+
+- **Implementation:** `crates/openpulse-daemon/src/lib.rs` (`JoinHandle<CrossBandRepeater>`,
+  `repeater_exit_reported`, restore in both `reap_finished_repeater` and the `DisableRepeater` arm,
+  `set_relay_mode(None)` on the error-exit path where it never ran);
+  `crates/openpulse-repeater/src/lib.rs` (start-of-session drain + `bursts_discarded_at_start`
+  tripwire, per-session `sense_faults` reset, and a `Disconnected` comment that claimed disable drops
+  the sender — it does not).
+
+- **Tests:** `command_apply_tests::a_disabled_repeater_can_be_enabled_again` (two full rounds, and no
+  `CommandError` anywhere, since the failure mode was a refusal);
+  `::an_error_exit_reports_once_and_still_returns_the_repeater`;
+  `carrier_sense::bursts_queued_before_a_session_are_discarded_not_transmitted`.
+
+- **Test results:** all pass; 12 repeater-related daemon tests green. Sabotage-verified, each failing
+  only its own case: restoring the `()` closure fails the round-trip gate; disabling the drain fails
+  the stale-burst gate and nothing else; letting the reap emit unconditionally fails the
+  single-edge gate. Two measurements shaped the change — 4 stale bursts produce 4 keyings without the
+  drain, and the error-exit test first timed out because the burst was sent before the session's own
+  drain had run, which is a real (benign, one-moment) race at startup and is noted in the test. Full
+  `scripts/gate.sh` verdict below.
+
 ## 2026-09-09 — the cross-band repeater listens before it keys rig_b (#1325)
 
 - **Requirement/change:** REQ-FUN-11 / §97.221. `relay_burst_at` keyed rig_b whenever a burst decoded
