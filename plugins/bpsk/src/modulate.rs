@@ -232,7 +232,11 @@ pub const PREAMBLE_RHO_THRESHOLD: f32 = 0.40;
 ///
 /// **What would falsify it:** a delivered frame below 0.50 on any channel this mode runs on. The
 /// measurement behind it is one channel model, one band, one payload size, and a brick-wall mask
-/// sharper than a real receive filter. A decode-conditioned sweep across bands is tracked in #1059;
+/// sharper than a real receive filter. A decode-conditioned sweep across bands is tracked in
+/// **#1337** (it was #1059, which is titled for the QPSK thresholds and does not own this). #1337
+/// also records that 600 UNCONDITIONED seeds of the shipped template already reach 0.491 through a
+/// 1250-1750 Hz mask at 6 dB — not a falsification, since those windows' decode is unknown, but the
+/// 0.618 support figure is a min-of-180 and does not bound what it is used to bound;
 /// until then a station whose noise pushes the derived threshold past this stands the veto down,
 /// which is the conservative direction — it reverts to energy-only detection rather than discarding
 /// frames.
