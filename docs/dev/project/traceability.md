@@ -9,6 +9,50 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-10 — a panicking repeater is recovered, and does not come back keyed (#1324 follow-on)
+
+- **Requirement/change:** REQ-FUN-11 / §97.119. #1324 handed the repeater back on the clean and
+  error paths; a PANIC still lost it, because `join()` returns the payload rather than the value.
+  The maintainer asked for that path covered.
+
+- **Design decision:** wrap the session in `catch_unwind(AssertUnwindSafe(..))` at SESSION level and
+  return the repeater from all three outcomes. Session level, not per burst: a catch inside the
+  relay loop that continued would be a genuine hidden crash loop, whereas this exits and reports and
+  every restart is an explicit operator command with no auto-retry. A panic is reported at `error!`
+  with a `PANICKED` reason prefix rather than a new `ControlEvent` variant (the panel destructures
+  exhaustively), so it stays distinguishable from #1328's designed stop.
+
+  **The review caught a regression the proposal would have introduced, and my own supporting fact was
+  why I missed it.** In full duplex the live `PttKeyGuard` is stored in `session_guard`, not on the
+  stack, and unwinding does not run `run_full_duplex`'s `session_guard = None`. rig_b was released
+  before only because the closure DROPPED the repeater. Keeping it alive would hand back a
+  transmitter still keyed, bounded only by the silence watchdog, with the next enable extending the
+  stale key. I had cited `shared_ptt.rs:870` as proof that a panic cannot strand the key — true for
+  a stack guard, false as generalised, and the artificially-easy fixture for exactly this design.
+  `release_after_abnormal_exit` clears the guard (and `sense_faults`) in the panic arm.
+
+- **Also in this change, and NOT claimed as a fix:** `note_tx` moves before `transmit`, so a
+  transmit that emits audio and then errs (the `cpal` flush timeout) still arms the §97.119 bit.
+  Measured to be **unobservable today** — `tx_since_id`'s only reader is `maybe_identify`, whose
+  single caller sits immediately after the `transmit` that arms it. A gate written for it passed
+  with the old ordering too and was DELETED rather than kept; #1332 is what makes it load-bearing.
+
+- **Implementation:** `crates/openpulse-daemon/src/lib.rs` (`catch_unwind`, `panic_message`, the
+  three-outcome match); `crates/openpulse-repeater/src/lib.rs` (`release_after_abnormal_exit`, the
+  `note_tx` reorder).
+
+- **Tests:** `abnormal_exit_release::an_abnormal_exit_releases_a_key_the_session_was_holding` (real
+  full-duplex stored guard, asserted on the transmitter); `command_apply_tests::
+  a_panicking_session_is_reported_as_a_panic_and_returns_the_repeater`.
+
+- **Test results:** both pass; sabotage-verified — removing `catch_unwind` fails the daemon gate,
+  and removing the `session_guard = None` fails the release gate. **A retraction rode along:**
+  #1324's stated rationale ("a rebuilt `StationIdTimer` forgets that un-IDed transmissions happened")
+  is about `tx_since_id` and is unobservable for the reason measured here. What the hand-back
+  actually preserves is the ID CLOCK — `StationIdTimer::new` re-seeds `last_id_ms = now`, deferring
+  the next ID by up to a full interval. #1324 was right in effect and wrong about the field;
+  corrected in place in its design note and its ledger entry above. Full `scripts/gate.sh` below.
+
 ## 2026-09-09 — a stopped cross-band repeater can be started again (#1324)
 
 - **Requirement/change:** REQ-FUN-11 / §97.221. `spawn_repeater` moved the repeater into a thread
@@ -22,8 +66,12 @@ and the actually-observed results per change.
   join sites put it back. Reviewed, and the review corrected the reasoning rather than the choice:
   my stated reason (a rebuild would tear down rig_b's PTT "mid-release") was wrong — the guard
   releases synchronously before return — and the real reason is the **§97.119 ID timer**, whose
-  `tx_since_id` carries across a pause under this design, where a rebuild would forget that un-IDed
-  transmissions had happened. Handing back after an ERROR exit is deliberate: #1285's refuse-to-start
+  ID **clock** (`last_id_ms`) carries across a pause under this design, where
+  `StationIdTimer::new` re-seeds it to `now` and so defers the next ID by up to a full interval.
+  (Corrected 2026-09-10: this first named `tx_since_id` and said a rebuild "forgets un-IDed
+  transmissions". Measured — `maybe_identify` has one caller, immediately after the `transmit` that
+  arms the bit, so `tx_since_id` is written and read inside one call and its value across a pause is
+  unobservable. The choice stands; the field named was wrong.) Handing back after an ERROR exit is deliberate: #1285's refuse-to-start
   ruling covers a silent degrade at start, whereas this failure is loud, the transmitter is off, and
   restarting needs an explicit command — but `sense_faults` must be reset per session or a repeater
   returned after `MAX_SENSE_FAULTS` resumes with a budget of one. Review artifact:

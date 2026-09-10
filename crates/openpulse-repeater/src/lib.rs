@@ -157,6 +157,23 @@ impl CrossBandRepeater {
         self.bursts_discarded_at_start
     }
 
+    /// Release anything this repeater still holds after its session ended abnormally.
+    ///
+    /// **Only a panic needs this**, and only because the repeater now SURVIVES one. In full duplex
+    /// the live `PttKeyGuard` is stored in `self.session_guard`, not on the stack, and unwinding
+    /// does not run `run_full_duplex`'s own `session_guard = None`. Until the thread started handing
+    /// the repeater back, rig_b was released anyway — by the closure dropping the whole struct,
+    /// which dropped the guard. Keeping the object alive removes that, so a panic anywhere between
+    /// taking the full-duplex key and the next `acquire_key` — the idle `recv_timeout` and the whole
+    /// `decode_burst` surface, i.e. most of a session — would hand back a repeater still holding
+    /// rig_b KEYED, bounded only by the silence watchdog, and the next enable would `extend()` that
+    /// stale key and carry on.
+    pub fn release_after_abnormal_exit(&mut self) {
+        // Dropping the guard releases the transmitter; the watchdog is a backstop, not the mechanism.
+        self.session_guard = None;
+        self.sense_faults = 0;
+    }
+
     /// Listen to rig_b's band and decide whether it is free.
     ///
     /// Ticks the capture into `engine_tx`, which updates that engine's DCD at the `InputCapture`
@@ -262,12 +279,27 @@ impl CrossBandRepeater {
         // underneath it, releasing rig_b mid-scope while this scope still believed it held the key.
         // The guard also closes the leak this issue was filed for: every `?` below releases.
         let guard = self.acquire_key()?;
-        self.engine_tx
-            .transmit(&bytes, &self.config.mode.clone(), None)
-            .map_err(|e| RepeaterError::Modem(e.to_string()))?;
+        // Arm the §97.119 timer BEFORE transmitting, not after.
+        //
+        // `note_tx` used to follow `transmit`, so a `transmit` returning `Err` skipped it via `?` —
+        // and `Err` does NOT mean nothing went on the air: `CpalOutputStream::flush` returns
+        // `Err("flush timeout …")` precisely when the queued samples have not finished draining,
+        // i.e. while the card is still playing them. Recording intent rather than completion makes
+        // the bit right for that case. Over-arming on a failed transmit costs at most one extra ID
+        // under a later key, which is legal; omitting a required one is not.
+        //
+        // **This has no observable effect today, and the change does not claim one.** `tx_since_id`
+        // is read only by `maybe_identify`, whose single caller sits immediately after the
+        // `transmit` that arms it — so the bit is written and read inside one call and its value
+        // across sessions cannot be seen. Measured: a gate written for this passed with the old
+        // ordering too. It becomes load-bearing when something reads the timer WITHOUT a preceding
+        // successful transmit — an idle or sign-off ID path, which this repeater does not have.
         if let Some(t) = self.id_timer.as_mut() {
             t.note_tx(now_ms);
         }
+        self.engine_tx
+            .transmit(&bytes, &self.config.mode.clone(), None)
+            .map_err(|e| RepeaterError::Modem(e.to_string()))?;
         self.maybe_identify(now_ms)?;
 
         if self.config.full_duplex {
