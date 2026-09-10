@@ -2160,11 +2160,20 @@ fn f13_fade_cost_of_doubling_the_preamble() {
         Some((a.parse().ok()?, b.parse().ok()?))
     });
     let grid32 = std::env::var("F13_GRID32").is_ok();
+    // `F13_LEAD=n` prepends n samples of the SAME `--++` run before both windows and starts both n
+    // later. Only the 64 window contains buffer sample 0 — the FFT-Hilbert edge, the delayed ray's
+    // zero fill, and (masked) brick-wall ringing — so a penalty measured against the 32 arm could be
+    // that edge rather than fade coherence. Use a multiple of 4 samples/symbol x 4 symbols so the
+    // run is periodic and the buffer RMS, hence the SNR label, is unchanged.
+    let lead_pad: usize = std::env::var("F13_LEAD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let dump = std::env::var("F13_DUMP").is_ok();
 
     println!("\nF13: fade cost of 32 -> 64 preamble symbols, {seeds} seeds @ {snr} dB, same-END alignment");
     println!(
-        "  band={}  grid={}",
+        "  band={}  grid={}  lead_pad={lead_pad}",
         band.map(|(l, h)| format!("{l}-{h} Hz"))
             .unwrap_or_else(|| "unfiltered (NOT a receiver's regime)".into()),
         if grid32 {
@@ -2184,7 +2193,12 @@ fn f13_fade_cost_of_doubling_the_preamble() {
         // ONE buffer, ONE fade: the 64 window is [0, len64) and the 32 window is [lead, len64), so
         // they share an end and one noise realisation. Two passes would need "same seed => same
         // fade" as a premise; this construction has no premise to prove.
-        let mut clean = t64.clone();
+        let mut clean: Vec<f32> = if lead_pad > 0 {
+            t64.iter().cycle().take(lead_pad).copied().collect()
+        } else {
+            Vec::new()
+        };
+        clean.extend_from_slice(&t64);
         clean.extend(std::iter::repeat_n(0.0f32, 64)); // lag room for the correlator
         let mut c = WattersonConfig::moderate_f1(Some(seed));
         c.snr_db = snr;
@@ -2209,15 +2223,16 @@ fn f13_fade_cost_of_doubling_the_preamble() {
         // receiver would use the finer grid — but it is a SECOND difference between the arms, and
         // it turned out to carry most of the apparent tail gain in the unfiltered cells. `F13_GRID32`
         // gives the 64 arm the 32 arm's grid so the two effects can be told apart.
+        let w64 = &faded[lead_pad..];
         let r64_v = if grid32 {
-            rho_of_on_grid(&t64, &faded, &engine_grid(t32.len(), 20.0))
+            rho_of_on_grid(&t64, w64, &engine_grid(t32.len(), 20.0))
         } else {
-            rho_of(&t64, &faded, 20.0)
+            rho_of(&t64, w64, 20.0)
         };
         if let Some(v) = r64_v {
             r64.push(v);
         }
-        if let Some(v) = rho_of(&t32, &faded[lead..], 20.0) {
+        if let Some(v) = rho_of(&t32, &faded[lead_pad + lead..], 20.0) {
             r32.push(v);
         }
         if dump {
