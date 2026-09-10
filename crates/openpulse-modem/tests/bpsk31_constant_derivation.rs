@@ -36,6 +36,8 @@
 
 use openpulse_core::plugin::{ModulationConfig, ModulationPlugin};
 use openpulse_dsp::acquisition::DdcMatchedFilter;
+
+mod common;
 use std::f32::consts::PI;
 
 const FS: f32 = 8_000.0;
@@ -859,5 +861,169 @@ fn r10_do_correlators_converge_in_the_deciding_band() {
     println!("\n  Convergence in the deciding band means the elimination does not depend on which");
     println!(
         "  correlator runs. Divergence there would mean the headline must be scoped to the DDC."
+    );
+}
+
+/// R6: does a PN successor actually remove the grid constraint that blocks BPSK31? (#1062)
+///
+/// **This tests a PREDICTION the issue body explicitly refuses to assume.** The `baud/4` grid bound
+/// exists *because* the shipped preamble is a period-4 run with discrete spectral lines: a grid wide
+/// enough to rotate some line onto an arbitrary tone lets the veto corroborate that tone. The body
+/// says a spread sequence "has no such line structure, so the constraint that blocks BPSK31/63 would
+/// not carry over in that form — treat that as a prediction to test in the design pass, not as a
+/// settled benefit. The replacement's own grid bound has to be derived, not assumed absent."
+///
+/// So this runs R1's sweep unchanged over BOTH templates at BPSK31. The shipped column is the
+/// positive control: if it does not reproduce R1's published numbers (worst tone ~0.70, 100 %
+/// vulnerable at ±20 Hz) then this harness is not measuring what R1 measured and the PN column means
+/// nothing.
+///
+/// Templates are proper maximal-length sequences (balance-checked), built at the plugin's own symbol
+/// rate — see `the_pn_generator_uses_the_shipped_symbol_rate`, which fails if that drifts.
+///
+/// **The sweep is +/-60 Hz, not R1's one line spacing.** R1 sweeps 0..baud/2 and justifies it with
+/// "the pattern repeats in position" — true for a period-4 run, whose spectrum IS periodic lines
+/// every baud/2, and false for PN, whose spectrum is a continuous main lobe out to +/-baud. Reusing
+/// R1's range for PN would report the maximum over a 15.6 Hz sliver and call it the worst tone.
+///
+/// Two grids rather than R1's four: the narrow sweep already showed PN's response is flat across
+/// 20/6/2/0.5 Hz, which is the grid-independence this measures; the widest and a narrow one keep
+/// that check while the wide sweep costs 4x the correlations.
+/// Runtime ~78 min: eight rows, each sweeping 241 tone frequencies through a DDC correlation over a
+/// template up to 32 k samples. `#[ignore]`d accordingly.
+#[test]
+#[ignore = "verification (#1062), ~78 min"]
+fn r6_does_a_pn_template_remove_the_grid_constraint() {
+    let baud = 31.25f32;
+    let occ = 2.0 * baud;
+    let first_line = baud / 4.0;
+
+    let shipped =
+        bpsk_plugin::modulate::bpsk_preamble_template(&cfg("BPSK31")).expect("shipped template");
+    let sym = shipped.len() / (FS / baud).round() as usize;
+    // Same length as the shipped template: that isolates the SEQUENCE, which is the variable this
+    // prediction is about. But 31 symbols is the N=31 the thread vetted and REJECTED — the design
+    // sets N >= 63 — so the deployed length is measured too, and the two answer different questions.
+    // Proper maximal-length sequences, not prefixes of a longer one: truncation destroys the flat
+    // autocorrelation that is the reason to choose PN at all, and would understate it. N is the CHIP
+    // count, matching the thread's notation — a 31-chip sequence yields a 30-symbol template.
+    let pn31 = common::preamble::pn_template("BPSK31", &common::preamble::m_sequence_of_len(31))
+        .expect("pn31 template");
+    let pn63 = common::preamble::pn_template("BPSK31", &common::preamble::m_sequence_of_len(63))
+        .expect("pn63 template");
+    // A third length, so any scaling statement rests on more than two points.
+    let pn127 = common::preamble::pn_template("BPSK31", &common::preamble::m_sequence_of_len(127))
+        .expect("pn127 template");
+    // N=255 is deliberately NOT measured. It was added to separate two candidate scaling laws in N,
+    // and that question died when the D column went in: `cutoff_and_decim` sets D = ceil(len/2048),
+    // so D runs 4/8/16 across these rows and the decimated template stays ~2000 samples. The rows
+    // are not a clean sweep in N, so no law can be read off them however many points are added — and
+    // a 65k-sample template costs about an hour per grid to sweep. Holding D constant is a different
+    // experiment; this one answers the grid question.
+
+    println!("\nR6: does a spread sequence remove BPSK31's grid constraint?");
+    println!(
+        "    shipped {} samples ({sym} sym), PN-31 {}, PN-63 {}, PN-127 {}; lines at odd multiples of {first_line:.2} Hz",
+        shipped.len(),
+        pn31.len(),
+        pn63.len(),
+        pn127.len()
+    );
+    println!(
+        "\n{:>10} {:>8} {:>6} {:>8} {:>12} {:>14} {:>12}",
+        "template", "grid", "D", "dec len", "worst tone", "vulnerable %", "verdict"
+    );
+
+    for (name, template) in [
+        ("shipped", &shipped),
+        ("PN-31", &pn31),
+        ("PN-63", &pn63),
+        ("PN-127", &pn127),
+    ] {
+        for grid_hz in [20.0f32, 2.0] {
+            let (cutoff, d) = cutoff_and_decim(occ, grid_hz, template.len());
+            let mf = DdcMatchedFilter::new(template, FC, FS, cutoff, d);
+            let grid = grid_for(template.len(), d, grid_hz);
+
+            let mut worst = 0.0f32;
+            let (mut over, mut pts) = (0usize, 0usize);
+            let mut f = -60.0f32;
+            while f <= 60.0 {
+                let tone: Vec<f32> = (0..template.len() + 400)
+                    .map(|k| 0.25 * (2.0 * PI * (FC + f) * k as f32 / FS).cos())
+                    .collect();
+                if let Some((r, _)) = mf.search_normalized_over_frequency(&tone, 0.05, &grid) {
+                    worst = worst.max(r.rho);
+                    if r.rho >= 0.40 {
+                        over += 1;
+                    }
+                    pts += 1;
+                }
+                f += 0.5;
+            }
+            let vulnerable = 100.0 * over as f32 / pts.max(1) as f32;
+            let verdict = if worst < 0.40 {
+                "no tone clears 0.40"
+            } else if grid_hz >= first_line {
+                "grid reaches a line"
+            } else {
+                "residual bands"
+            };
+            println!(
+                "{name:>10} {grid_hz:>7.1} {d:>6} {:>8} {worst:>12.3} {vulnerable:>13.0}% {verdict:>12}",
+                template.len() / d,
+            );
+            let _ = cutoff;
+        }
+    }
+    println!("\n  D and 'dec len' are printed because they are NOT constant across these rows.");
+    println!("  `cutoff_and_decim` sets D = ceil(tmpl_len / 2048), so the DECIMATED template is");
+    println!(
+        "  ~2000 samples for every N: the correlator's sample budget is fixed and the time it"
+    );
+    println!(
+        "  spans grows. That is what would ship, but it means these rows are not a clean sweep"
+    );
+    println!("  in N, and no scaling law should be read off them without holding D constant.");
+    println!(
+        "\n  The shipped rows check the LOOP is unchanged from R1 (~0.70 worst tone). They are"
+    );
+    println!("  a self-consistency check, NOT a control for the PN rows: neither the symbol-rate");
+    println!("  defect nor R1's narrow sweep touched the shipped template, so reproduction there");
+    println!("  could not have revealed either. 0.40 is a BPSK250 32-symbol `--++` decode-cliff");
+    println!("  constant; no PN template has derived one, so worst-tone rho is the primary figure");
+    println!(
+        "  and the percentage is derivative. The interferer class is a single noise-free tone."
+    );
+}
+
+/// The PN generator builds at the SHIPPED symbol rate — asserted in the default gate, at BPSK31.
+///
+/// `pn_template` used to derive samples-per-symbol by parsing digits out of the mode string, which
+/// gives 258 at "BPSK31" where the plugin uses 256 (`parse_baud_rate` maps "31" to 31.25). Every PN
+/// template at this baud was then a quarter-symbol late and drifting two samples per symbol. It was
+/// invisible at BPSK250 because 8000/250 is exact — so the check has to run at a mode where it is
+/// not, and it has to run by DEFAULT: a comment cannot fail, and this is the construct CLAUDE.md
+/// rule 5 bans.
+///
+/// A lag-search correlation would NOT catch it: the offset is exactly the 64-sample lag pad, so a
+/// peak search finds the template anyway. The length is the falsifiable thing.
+#[test]
+fn the_pn_generator_uses_the_shipped_symbol_rate() {
+    let c = cfg("BPSK31");
+    let shipped = bpsk_plugin::modulate::bpsk_preamble_template(&c).expect("shipped");
+    let syms = bpsk_plugin::modulate::PREAMBLE_SYMS - 1;
+    let sps = shipped.len() / syms;
+    assert_eq!(sps, 256, "BPSK31 runs at 31.25 baud = 256 sps, not 8000/31");
+
+    // A 32-chip run yields 31 symbols, the shipped template's own symbol count.
+    let built = common::preamble::pn_template("BPSK31", &[1.0f32; 32]).expect("pn");
+    assert_eq!(
+        built.len(),
+        shipped.len(),
+        "the PN generator built {} samples where the shipped template is {} — it is not using the \
+         plugin's symbol rate, so every PN measurement at this baud is a drifting slice",
+        built.len(),
+        shipped.len()
     );
 }
