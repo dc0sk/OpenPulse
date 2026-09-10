@@ -981,7 +981,7 @@ and the actually-observed results per change.
   frame as delivered that never went out. Pre-existing, and now reachable more often; worth its own
   issue rather than a silent change here.
 
-## 2026-09-07 — #1062: doubling the preamble costs almost nothing on a fade (f13)
+## 2026-09-07 — #1062: doubling the preamble costs almost nothing on a fade (f13) [CORRECTED 2026-09-10]
 
 - **Requirement/change:** #1062's unmeasured half. f7/f12 measured what length **buys** — the
   idle-noise ρ ceiling falls ×0.68–0.73, matching 1/√T. This is the other side of the subtraction: a
@@ -1010,6 +1010,17 @@ and the actually-observed results per change.
   median −1.5 %, p10 −9 %, min −5 %, consistent with an in-window phase rotation costing coherence at
   any SNR while a flat null costs ρ only through local SNR. It reaches **no** threshold the CFAR
   stand-down uses: the worst window in 400 seeds still scores 0.630 against a top candidate of 0.55.
+
+  **CORRECTED 2026-09-10.** That sentence, and this entry's heading, hold only for the **unfiltered
+  30 dB** cell this ran — which is outside the regime the bound is read in (the stand-down is
+  consulted at <= 500 Hz filters) and is no receiver's regime at all. Re-run masked at the rung's
+  own floor, the unconditioned minima are **0.531 (64 sym) and 0.491 (32 sym)** through 1250-1750 Hz
+  at 6 dB — *both under the 0.55 candidate*, and the 32-symbol arm under the shipped 0.50 bound.
+  The tail measure was also wrong: `min` is one draw and not resolvable at 400-600 seeds; p10 is,
+  and masked it moves **0.808 -> 0.764** (6 dB) with a paired CI of [-0.064, -0.016] — so the
+  coherence penalty is real and in-band rather than "almost nothing". What survives is the
+  *conditioned* statement: on windows where the 32-symbol arm scored >= 0.50, no 64-symbol window in
+  ~600 fell under 0.50 in any masked cell. See #1062.
 - **The cheap arm was decisive, which is the process point.** The review's ordering put an
   envelope-only arm before an f8-style unconditioned run before the conditioned decode sweep, on the
   reasoning that unconditioned is the **pessimistic** side (it includes null windows no receiver
