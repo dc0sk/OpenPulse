@@ -491,6 +491,15 @@ fn pn_template(mode: &str, chips: &[f32]) -> Option<Vec<f32>> {
 }
 
 /// Peak normalised correlation of `template` against `window`, engine-style.
+fn rho_of_on_grid(template: &[f32], window: &[f32], grid: &[f32]) -> Option<f32> {
+    let mf = IqMatchedFilter::new(template.to_vec());
+    if window.len() <= mf.len() {
+        return None;
+    }
+    mf.search_normalized_over_frequency(window, window.len() - mf.len(), 0.05, FS, grid)
+        .map(|(r, _)| r.rho)
+}
+
 fn rho_of(template: &[f32], window: &[f32], grid_hz: f32) -> Option<f32> {
     let grid = engine_grid(template.len(), grid_hz);
     let mf = IqMatchedFilter::new(template.to_vec());
@@ -1280,7 +1289,10 @@ impl ChannelModel for FadeThenFilter {
 }
 
 /// `BpskPlugin` with the preamble veto switched OFF — the arm #1088 named as the fix for f9's
-/// circularity and did not build.
+/// circularity. (STALE as written: the arm now EXISTS — `NoVetoBpsk` below — and `modulate.rs`
+/// records that the shipped bound was derived with it. What remains impossible is a
+/// decode-conditioned run at 64 symbols, since no 64-symbol receiver exists: `PREAMBLE_SYMS` is
+/// consumed at six-plus receiver sites.)
 ///
 /// f9's decoded-only column is a tautology while the shipped 0.40 veto runs inside the decode: a
 /// frame scoring under 0.40 is vetoed, fails, and leaves the conditioned set, so the miss rate at
@@ -2141,7 +2153,26 @@ fn f13_fade_cost_of_doubling_the_preamble() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(30.0);
 
+    // `F13_BAND=lo:hi` applies the same brick-wall mask `band_noise` uses. Default OFF preserves
+    // the historical cells, but see the header: unfiltered is not the regime that reads the bound.
+    let band: Option<(f32, f32)> = std::env::var("F13_BAND").ok().and_then(|v| {
+        let (a, b) = v.split_once(':')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    });
+    let grid32 = std::env::var("F13_GRID32").is_ok();
+    let dump = std::env::var("F13_DUMP").is_ok();
+
     println!("\nF13: fade cost of 32 -> 64 preamble symbols, {seeds} seeds @ {snr} dB, same-END alignment");
+    println!(
+        "  band={}  grid={}",
+        band.map(|(l, h)| format!("{l}-{h} Hz"))
+            .unwrap_or_else(|| "unfiltered (NOT a receiver's regime)".into()),
+        if grid32 {
+            "32-arm grid on both (ablation)"
+        } else {
+            "engine-derived per template"
+        }
+    );
     println!(
         "  unconditioned = the PESSIMISTIC side: it includes null windows no receiver delivers."
     );
@@ -2159,11 +2190,44 @@ fn f13_fade_cost_of_doubling_the_preamble() {
         c.snr_db = snr;
         let faded = WattersonChannel::new(c).expect("channel").apply(&clean);
 
-        if let Some(v) = rho_of(&t64, &faded, 20.0) {
+        // The receive filter is the whole point of the masked arm: the stand-down is only ever
+        // consulted when the derived threshold exceeds the bound, which the #1157 rig data puts at
+        // <= 500 Hz filters. An UNFILTERED cell is therefore outside the regime that reads the bound
+        // — and it is no receiver's regime either, since even a wide station sits at SSB 300-2700.
+        let faded = match band {
+            Some((lo, hi)) => {
+                let mut m = band_limit(&faded, lo, hi);
+                m.truncate(faded.len());
+                m
+            }
+            None => faded,
+        };
+
+        // `engine_grid` derives its step from the template length (engine.rs:6993,
+        // `step = (0.25 * fs / tlen).max(0.5)`), so the 64-symbol template gets 41 hypotheses at
+        // 0.99 Hz where the 32 gets 21 at 2.02 Hz. That is engine-faithful — a real 64-symbol
+        // receiver would use the finer grid — but it is a SECOND difference between the arms, and
+        // it turned out to carry most of the apparent tail gain in the unfiltered cells. `F13_GRID32`
+        // gives the 64 arm the 32 arm's grid so the two effects can be told apart.
+        let r64_v = if grid32 {
+            rho_of_on_grid(&t64, &faded, &engine_grid(t32.len(), 20.0))
+        } else {
+            rho_of(&t64, &faded, 20.0)
+        };
+        if let Some(v) = r64_v {
             r64.push(v);
         }
         if let Some(v) = rho_of(&t32, &faded[lead..], 20.0) {
             r32.push(v);
+        }
+        if dump {
+            // Per-seed PAIRED dump. The arms share one buffer, one fade and one noise realisation,
+            // so the difference is paired and an unpaired summary understates the resolution.
+            println!(
+                "  PAIR {seed} {:.4} {:.4}",
+                r32.last().copied().unwrap_or(f32::NAN),
+                r64.last().copied().unwrap_or(f32::NAN)
+            );
         }
     }
 
@@ -2212,11 +2276,22 @@ fn f13_fade_cost_of_doubling_the_preamble() {
         "  discovery — unconditioned already includes the null windows a receiver never delivers."
     );
     println!(
-        "\n  RESULT (400 seeds, 30 dB, 67 s): miss rate 0.000 at EVERY theta 0.40..0.55, both"
+        "\n  RESULT, CORRECTED 2026-09-10 — the original block reported the 30 dB UNFILTERED cell"
     );
     println!(
-        "  templates. Worst 64-sym window 0.630. The fade cost is real but small and lives in"
+        "  and quoted `min`, which is one draw and not resolvable at these seed counts. Use p10."
     );
-    println!("  the tail as predicted (min -5%, p10 -9%, median -1.5%) — it does not reach the");
+    println!(
+        "  Run masked (F13_BAND): the stand-down is only consulted at <= 500 Hz filters, so an"
+    );
+    println!("  unfiltered cell is outside the regime that reads the bound — and is no receiver's");
+    println!(
+        "  regime either. Masked, 600 seeds, p10 32 -> 64: 0.808 -> 0.764 (6 dB, 1250-1750) and"
+    );
+    println!("  0.847 -> 0.797 (10 dB) — the coherence penalty is REAL and in-band, paired CI");
+    println!(
+        "  [-0.064,-0.016]. Unfiltered the tail appears to RISE, but F13_GRID32 shows most of"
+    );
+    println!("  that is the finer frequency grid the longer template earns, not noise averaging.");
     println!("  thresholds the CFAR stand-down decision uses.");
 }
