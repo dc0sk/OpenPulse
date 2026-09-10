@@ -437,6 +437,7 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
             full_duplex: cfg.repeater.full_duplex,
             callsign: cfg.station.callsign.clone(),
             id_interval_secs: cfg.station.auto_id_interval_secs,
+            id_signoff_idle_secs: cfg.station.auto_id_signoff_idle_secs,
             carrier_sense: cfg.repeater.carrier_sense,
         };
         // Bounded and lossy on purpose (#1308): the repeater spends rig_b airtime per burst while

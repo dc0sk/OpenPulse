@@ -232,6 +232,7 @@ fn transmitting_rig_is_station_identified_when_the_interval_elapses() {
         full_duplex: false,
         callsign: "N0CALL".into(),
         id_interval_secs: 600,
+        id_signoff_idle_secs: 10,
         // These tests are about relaying and keying, not about the output band; #1325's own gate is
         // `carrier_sense.rs`. Leaving it on here would defer every burst, since no sensor is passed.
         carrier_sense: false,

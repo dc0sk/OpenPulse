@@ -109,8 +109,11 @@ impl CrossBandRepeater {
     ) -> Self {
         // Auto-ID only with a callsign and a positive interval; rig_b is an automatically-controlled
         // station (§97.221) that must ID per §97.119, and the daemon's main-engine timer never sees it.
-        let id_timer = (!config.callsign.trim().is_empty() && config.id_interval_secs > 0)
-            .then(|| StationIdTimer::new(config.id_interval_secs.saturating_mul(1000), 0));
+        let id_timer =
+            (!config.callsign.trim().is_empty() && config.id_interval_secs > 0).then(|| {
+                StationIdTimer::new(config.id_interval_secs.saturating_mul(1000), 0)
+                    .with_signoff_idle_ms(config.id_signoff_idle_secs.saturating_mul(1000))
+            });
         // A `SharedPtt` with no watchdog thread is a bare `Box` with extra steps. No observer: the
         // daemon's `PttChanged` carries no rig identity, so rig_b's edges would flip the panel's
         // main-rig indicator (#1298).
@@ -360,6 +363,86 @@ impl CrossBandRepeater {
         Ok(())
     }
 
+    /// Transmit a §97.119 ID if one is due, taking the key itself. Returns whether it identified.
+    ///
+    /// **This is the path that runs when nothing is being relayed**, which is the case the repeater
+    /// had no answer for: `maybe_identify` transmits under the CALLER's key and its only caller was
+    /// `relay_burst_at`, so a station that relayed once and then heard silence never identified —
+    /// the end-of-communication half of §97.119(a) was unreachable, and the interval half fired only
+    /// by accident of traffic.
+    ///
+    /// **It deliberately does NOT carrier-sense**, unlike a relay. §97.119(a) has no busy-channel
+    /// exemption and stopping relaying does not discharge it, since the obligation is owed for
+    /// transmissions already made. The "wait for a gap, force at the deadline" pattern collapses
+    /// here anyway: `id_due` fires *at* `last_id + interval` and the configured interval is normally
+    /// the legal maximum, so at the moment an ID becomes due there is no polite window left. Carrier
+    /// sense governs discretionary relaying; a brief mandatory ID is not discretionary.
+    ///
+    /// Takes `now_ms` rather than reading the clock so the caller — and a test — decides when
+    /// "later" is.
+    pub fn identify_if_due_at(&mut self, now_ms: u64) -> Result<bool, RepeaterError> {
+        let Some(reason) = self.id_timer.as_ref().and_then(|t| {
+            if t.id_due(now_ms) {
+                Some("interval")
+            } else if t.signoff_due(now_ms) {
+                Some("sign-off")
+            } else {
+                None
+            }
+        }) else {
+            return Ok(false);
+        };
+
+        // A failure to take the key ends the session: an unattended station that cannot key cannot
+        // meet its obligation, and retrying every tick would be a busy-loop against dead hardware.
+        let guard = self.acquire_key()?;
+        let id_body = format!("DE {}", self.config.callsign);
+        let outcome = self
+            .engine_tx
+            .transmit(id_body.as_bytes(), &self.config.mode.clone(), None);
+
+        // Mark IDENTIFIED even when the transmit reports an error, and do it before propagating.
+        // `mark_identified` is what clears `tx_since_id`; leaving it armed on an error would make
+        // the next tick — 100 ms later — try again, and again, for as long as the fault lasts. The
+        // daemon marks on transmit error for exactly this reason. It also matches the reason
+        // `note_tx` moved ahead of `transmit`: a transmit that errs may still have put audio out.
+        if let Some(t) = self.id_timer.as_mut() {
+            t.mark_identified(now_ms);
+        }
+
+        match outcome {
+            Ok(_) => tracing::info!(
+                callsign = %self.config.callsign,
+                reason,
+                "cross-band relay: transmitted station ID while idle"
+            ),
+            Err(e) => tracing::error!(
+                error = %e,
+                callsign = %self.config.callsign,
+                reason,
+                "cross-band relay: the §97.119 station ID failed to transmit"
+            ),
+        }
+
+        if self.config.full_duplex && reason == "sign-off" {
+            // The sign-off ID IS the end-of-communication marker, so the held carrier has no reason
+            // to continue. Extending here instead would re-stamp the watchdog and hold a DEAD
+            // carrier for another full timeout past the last relay.
+            guard.release();
+            self.session_guard = None;
+        } else if self.config.full_duplex {
+            // An interval ID means traffic is still in progress: keep the session key.
+            let _ = guard.extend();
+            self.session_guard = Some(guard);
+        } else {
+            if self.config.tx_hang_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.config.tx_hang_ms));
+            }
+            guard.release();
+        }
+        Ok(true)
+    }
+
     /// Run the relay loop until `stop` is set, returning the total number of frames relayed.
     ///
     /// In **half-duplex** (the default) each relayed frame keys, transmits, IDs if due, and releases.
@@ -423,7 +506,15 @@ impl CrossBandRepeater {
                 .recv_timeout(Duration::from_millis(IDLE_POLL_MS))
             {
                 Ok(b) => b,
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    // The tick that used to do nothing. Without it the ID rides relay traffic, so a
+                    // quiet band means a station that has transmitted never identifies (#1332).
+                    let now_ms = self.start.elapsed().as_millis() as u64;
+                    match self.identify_if_due_at(now_ms) {
+                        Ok(_) => continue,
+                        Err(e) => break Err(e),
+                    }
+                }
                 // The daemon dropped the sender, which means the daemon itself is going away —
                 // `DisableRepeater` does NOT drop it (the sender lives in `RuntimeControlState` and
                 // outlives any one session), so this is shutdown, not a disable. Ending the session

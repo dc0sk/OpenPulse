@@ -385,6 +385,7 @@ hpx_pilot_fast	crates/openpulse-core/src/profile.rs
 hpx_pilot_fast_rrc	crates/openpulse-core/src/profile.rs
 hpx_pilot_rrc	crates/openpulse-core/src/profile.rs
 hpx_wideband_hd	crates/openpulse-core/src/profile.rs
+identify_if_due_at	crates/openpulse-repeater/src/lib.rs
 invalid	crates/openpulse-freedv-auth/src/verdict.rs
 iq_sequence	crates/openpulse-dsp/src/preamble.rs
 is_complete	crates/openpulse-filexfer/src/blocks.rs

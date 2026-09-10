@@ -17,6 +17,10 @@ pub struct RepeaterConfig {
     pub callsign: String,
     /// Auto-ID interval in seconds (Part-97 §97.119 = 600 = 10 min). `0` disables auto-ID.
     pub id_interval_secs: u64,
+    /// Seconds of transmit silence after which the END-OF-COMMUNICATION ID is due (§97.119(a)).
+    /// `0` disables it, which is what the repeater shipped with — so the half of §97.119(a) that
+    /// actually requires a sign-off was unreachable. Fed from `[station] auto_id_signoff_idle_secs`.
+    pub id_signoff_idle_secs: u64,
     /// Carrier-sense rig_b's band before ACQUIRING the key (#1325).
     ///
     /// Sensing governs channel acquisition, not continuation: while `full_duplex` holds the key
@@ -34,6 +38,7 @@ impl Default for RepeaterConfig {
             full_duplex: false,
             callsign: String::new(),
             id_interval_secs: 600,
+            id_signoff_idle_secs: 10,
             carrier_sense: true,
         }
     }
