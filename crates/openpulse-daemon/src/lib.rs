@@ -1700,6 +1700,17 @@ fn reap_finished_repeater(
 /// that from recurring; it is not a tidiness refactor.
 ///
 /// Returns `None` when no repeater was built at startup (no usable `[radio.rig_b]`).
+/// Best-effort text of a panic payload, for reporting a repeater panic to the operator.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 fn spawn_repeater(
     runtime_state: &mut RuntimeControlState,
     event_tx: &Arc<broadcast::Sender<ControlEvent>>,
@@ -1716,13 +1727,46 @@ fn spawn_repeater(
     let reported = Arc::new(AtomicBool::new(false));
     let reported_clone = Arc::clone(&reported);
     let thread = std::thread::spawn(move || {
-        if let Err(e) = repeater.run_full_duplex(stop_clone) {
-            tracing::warn!(error = %e, "cross-band repeater exited with error");
+        // The session is caught so a PANIC does not cost the repeater. `join()` returns the panic
+        // payload rather than the value, so before this the object died with the thread and only a
+        // daemon restart brought it back — the condition #1324 exists to remove, surviving on its
+        // last path.
+        //
+        // The catch is at SESSION level on purpose. Catching per burst inside the relay loop and
+        // continuing would be a genuine hidden crash loop; this exits and reports, exactly as a
+        // clean error does, and every restart is an explicit operator command with no auto-retry.
+        // `AssertUnwindSafe` is needed because the repeater owns `ModemEngine`s and a `SharedPtt`;
+        // it is honest only because the panic arm below restores the one invariant that matters.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            repeater.run_full_duplex(stop_clone)
+        }));
+        let failure = match outcome {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "cross-band repeater exited with error");
+                Some(format!("cross-band repeater stopped: {e}"))
+            }
+            Err(payload) => {
+                // A panic is a BUG, not a channel condition, so it is reported at error! and named
+                // as such — #1328's MAX_SENSE_FAULTS exit is a designed stop and must stay
+                // distinguishable from this. The default panic hook has already printed to stderr.
+                let msg = panic_message(&payload);
+                tracing::error!(panic = %msg, "cross-band repeater PANICKED");
+                // Unwind does NOT run `run_full_duplex`'s own `session_guard = None`, and the
+                // full-duplex key lives in that field rather than on the stack. Releasing it here is
+                // what stops the repeater being handed back with rig_b still keyed.
+                repeater.release_after_abnormal_exit();
+                Some(format!(
+                    "cross-band repeater PANICKED (this is a bug): {msg}"
+                ))
+            }
+        };
+        if let Some(reason) = failure {
             let _ = thread_tx.send(ControlEvent::CommandError {
                 command: "repeater".to_string(),
-                reason: format!("cross-band repeater stopped: {e}"),
+                reason,
             });
-            // Only on the error path: a clean stop is already reported by DisableRepeater, and
+            // Only on the failure paths: a clean stop is already reported by DisableRepeater, and
             // emitting there too would put two `false` edges on one transition. Recorded so the
             // reap does not add a third — it used to, because it cannot see this send (#1324).
             reported_clone.store(true, Ordering::Relaxed);
@@ -4542,6 +4586,140 @@ mod command_apply_tests {
             },
         );
         (rp, burst_tx)
+    }
+
+    /// A PANICKING session must not cost the repeater either.
+    ///
+    /// `join()` returns the panic payload rather than the value, so before the session was wrapped
+    /// in `catch_unwind` the repeater died with the thread and only a daemon restart brought it
+    /// back — the exact condition #1324 exists to remove, surviving on its last path.
+    ///
+    /// The panic is induced through the PTT, which is the one collaborator a test can make fail
+    /// arbitrarily: it keys once and then panics, so the second relay panics inside `acquire_key`.
+    #[tokio::test]
+    async fn a_panicking_session_is_reported_as_a_panic_and_returns_the_repeater() {
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone, Default)]
+        struct PanicOnSecondKey {
+            keys: Arc<AtomicUsize>,
+        }
+        impl openpulse_radio::PttController for PanicOnSecondKey {
+            fn assert_ptt(&mut self) -> Result<(), openpulse_radio::PttError> {
+                if self.keys.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    panic!("simulated rig fault");
+                }
+                Ok(())
+            }
+            fn release_ptt(&mut self) -> Result<(), openpulse_radio::PttError> {
+                Ok(())
+            }
+            fn is_asserted(&self) -> bool {
+                false
+            }
+        }
+
+        let mut engine = test_engine();
+        let active_mode: SharedMode = Arc::new(Mutex::new("BPSK250".to_string()));
+        let (tx, mut rx) = broadcast::channel::<ControlEvent>(64);
+        let ev_tx = Arc::new(tx);
+        let mut runtime_state = RuntimeControlState::default();
+
+        let lb = openpulse_audio::LoopbackBackend::new();
+        let mut src = ModemEngine::new(Box::new(lb.clone_shared()));
+        let _ = src.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
+        src.transmit(b"boom", "BPSK250", None).expect("fixture tx");
+        let frame = lb.drain_samples();
+
+        let mut rep_rx = ModemEngine::new(Box::new(openpulse_audio::LoopbackBackend::new()));
+        let _ = rep_rx.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
+        let mut rep_tx = ModemEngine::new(Box::new(openpulse_audio::LoopbackBackend::new()));
+        let _ = rep_tx.register_plugin(Box::new(bpsk_plugin::BpskPlugin::new()));
+        let (burst_tx, burst_rx) = std::sync::mpsc::sync_channel(4);
+        runtime_state.repeater = Some(openpulse_repeater::CrossBandRepeater::new(
+            Box::new(PanicOnSecondKey::default()),
+            rep_rx,
+            rep_tx,
+            burst_rx,
+            openpulse_repeater::RepeaterConfig {
+                mode: "BPSK250".to_string(),
+                tx_hang_ms: 0,
+                carrier_sense: false,
+                ..Default::default()
+            },
+        ));
+
+        apply_command_to_engine(
+            &ControlCommand::EnableRepeater,
+            &mut engine,
+            &active_mode,
+            &ev_tx,
+            None,
+            &mut runtime_state,
+        )
+        .await;
+        // After the session's own start-of-session drain (#1324), or these are swallowed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        for _ in 0..2 {
+            let _ = burst_tx.send(openpulse_modem::pipeline::AudioSamples {
+                samples: frame.clone(),
+            });
+        }
+
+        for _ in 0..400 {
+            if runtime_state
+                .repeater_thread
+                .as_ref()
+                .is_some_and(|t| t.is_finished())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            runtime_state
+                .repeater_thread
+                .as_ref()
+                .is_some_and(|t| t.is_finished()),
+            "the session never panicked, so this test proves nothing"
+        );
+
+        apply_command_to_engine(
+            &ControlCommand::EnableRepeater,
+            &mut engine,
+            &active_mode,
+            &ev_tx,
+            None,
+            &mut runtime_state,
+        )
+        .await;
+
+        let mut saw_panic_reason = false;
+        let mut disabled_edges = 0;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ControlEvent::CommandError { ref reason, .. } if reason.contains("PANICKED") => {
+                    saw_panic_reason = true;
+                }
+                ControlEvent::RepeaterChanged { enabled: false } => disabled_edges += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_panic_reason,
+            "a panic was reported like an ordinary error. #1328's MAX_SENSE_FAULTS exit is a \
+             DESIGNED stop with a diagnosis; a panic is a bug, and the operator must be able to \
+             tell them apart"
+        );
+        assert_eq!(
+            disabled_edges, 1,
+            "one panic produced {disabled_edges} disabled edges"
+        );
+        assert!(
+            runtime_state.repeater_stop.is_some(),
+            "the repeater was not restartable after a panic — join() returns the payload, not the \
+             value, so without catching it the object is gone until the daemon restarts"
+        );
     }
 
     /// An error exit must put exactly ONE `RepeaterChanged { false }` on the wire, and must still

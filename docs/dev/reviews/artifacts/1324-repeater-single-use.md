@@ -114,9 +114,16 @@ operator who toggles it off currently cannot get it back from the GUI at all.
    rig_b, and `RigctldPtt` has no `Drop`. That applies only to B-rebuild-everything, not to the
    "keep the PTT, rebuild the engines" variant, so my "A for one reason" was not decisive.
 4. **The real reason for A is the §97.119 ID timer, which I never mentioned.**
-   `StationIdTimer.tx_since_id` carries across a pause under A, so an interval ID that fell due
-   during it goes out on the first relay after re-enable. B rebuilds the timer `false` and *forgets
-   that un-IDed transmissions happened* — a regulatory regression, not a convenience one.
+   `StationIdTimer`'s ID **clock** carries across a pause under A. B calls
+   `StationIdTimer::new(interval, now)`, which re-seeds `last_id_ms = now`, so the next ID is
+   deferred by up to a **full interval** measured from the rebuild.
+
+   **CORRECTED 2026-09-10.** This originally said the carried field was `tx_since_id`, and that a
+   rebuild "forgets that un-IDed transmissions happened". Measured: `tx_since_id` is written and read
+   inside the same call — `maybe_identify` has one caller, immediately after the `transmit` that
+   armed it — so its value across a pause is unobservable. The conclusion (prefer A) is unchanged and
+   the §97.119 argument still carries it; the FIELD was wrong. A rebuild that carried `last_id_ms`
+   forward would not have this defect, which also changes the rebuild option's cost.
 5. **The stale-burst hazard is a property of OPTION A, not of the system.** Under B with a rebuilt
    channel it vanishes. My Twins section listed the channel only as a B cost and the note framed the
    hazard as universal.
