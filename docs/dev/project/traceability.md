@@ -68,11 +68,13 @@ and the actually-observed results per change.
   against the 0.900 the criterion promises. The true worst case is 0.637 at the 0.512 Hz mid-bin. At the sampled 0.50 Hz — 0.012 Hz short of the
   mid-bin — the derivation predicts |sinc(0.50 × 7808/8000)| = 0.652, so the sampling offset alone
   accounts for 0.637 → 0.652; the remaining 0.015 is lag slack, modelled in review, not run.
-  **Workspace gate on this entry's code: NOT RUN at time of writing.** Last completed run:
-  `GATE: FAIL 93cf07583a740667694cc7c210c39dfdd54398c6 clean 20260911T062709Z`
-  (`target/gate-verdict.json`; the gate log itself does not carry the `GATE:` line) — the
-  requirements-trailer lint alone (2535 passed, 0 failed), on an earlier form of these commits since
-  re-made. To be amended after the run.
+  **Workspace gate:** `GATE: PASS 83ceda3cba582cc2ce55d6c8674fe5a5ab76d683 clean 20260911T112854Z`
+  (`target/gate-verdict.json`; the gate log does not carry the `GATE:` line), on `83ceda3c`, this
+  entry's first committed form — suites=332, tests_passed=2535, tests_failed=0. The delta from
+  `83ceda3c` to the commit carrying this sentence is docs-only: this sentence. Held out by #1274 and
+  not re-proven: `notch_rescues_interferer`, `ota_channel_adaptation`. An earlier run,
+  `GATE: FAIL 93cf07583a740667694cc7c210c39dfdd54398c6 clean 20260911T062709Z`, failed on the
+  requirements-trailer lint alone, on an earlier form of these commits since re-made.
 
   **Correction, recorded where the claim was made:** an earlier draft of this entry, committed locally
   and never pushed, stated `GATE: PASS` with a test count. No gate had passed, and the SHA it cited was
