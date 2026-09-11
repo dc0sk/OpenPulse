@@ -141,8 +141,45 @@ fn r1_how_narrow_can_bpsk31_grid_be() {
 /// A pass here needs rho to stay high across the residual the settle actually leaves. Measured for
 /// BPSK250 at <= 0.3 Hz over a 1056-sample window; BPSK31's settle window is far longer, so its
 /// residual should be no worse — but "should" is why this is measured rather than assumed.
+///
+/// # DO NOT READ THIS TABLE — the fixture is amplitude modulation, not a carrier offset (#1062)
+///
+/// `s * cos(2*pi*delta*t)` on a real bandpass frame is DSB-AM: it leaves half-amplitude copies at
+/// `fc - delta` AND `fc + delta`. The correlator can rotate onto only one, while the other sits in
+/// rho's denominator, so rho is capped near `1/sqrt(2)` — and, fatally for this probe's purpose,
+/// capped there almost INDEPENDENTLY of the grid. Measured at HEAD on 2026-09-11:
+///
+/// | residual | ±20 Hz | ±4 Hz | ±2 Hz | ±1 Hz | ±0.5 Hz |
+/// |---|---|---|---|---|---|
+/// | 0.1 | 0.998 | 0.998 | 0.998 | 0.998 | 0.998 |
+/// | 0.3 | 0.788 | 0.788 | 0.788 | 0.788 | 0.788 |
+/// | 1.0 | **0.704** | **0.704** | **0.704** | 0.704 | 0.392 |
+/// | 2.0 | **0.704** | **0.704** | 0.705 | 0.391 | 0.363 |
+///
+/// Three columns agreeing to three decimals while differing 9x in hypothesis count (159, 33 and 17
+/// at this probe's 0.252 Hz step) is not a result about grids — and at 0.3 Hz all five agree, across a
+/// 32x range. It is the signature of the artifact. The columns that do move are the ones
+/// too narrow to REACH the offset, which is a different failure from the coherence loss this
+/// measures. So the table invites exactly the wrong conclusion — "a narrow grid costs nothing" —
+/// which is the conclusion a derivation would like to hear.
+///
+/// **This fixture's number has been posted before.** #1062's comment of 2026-08-04 ("Phase-0 result:
+/// BPSK31 publishes no preamble template"), which names this harness, gives the false-reject half of
+/// its ±2 Hz grid derivation as "a real frame holding ρ ≥ 0.704 out to a 2 Hz residual". That is this
+/// fixture's AM cap: the ±2 Hz column's minimum over residuals ≤ 2 Hz is 0.704 (at 1 Hz; 0.705 at
+/// 2 Hz), the quoted figure to the digit, and the fixture was already `s * cos(…)` in the harness's
+/// first commit on the branch that comment names (`22828192`, 2026-08-04T09:46Z, four hours earlier),
+/// unchanged through `610da162`. That half of the derivation is withdrawn; R1's false-accept half
+/// stands.
+///
+/// The fix is the repo's own idiom: build the frame at `center_frequency = FC + delta`
+/// (`demod_parity.rs:225`, `carrier_offset_matrix.rs:56`, `ChannelSimHarness::route_with_cfo`).
+/// Left in place rather than silently corrected because the numbers above are the evidence, and
+/// because the repair needs a second thing this probe never had: BPSK31's OWN settle residual. The
+/// `<= 0.3 Hz` above is a **BPSK250** measurement over a 1056-sample window, so the grid's lower
+/// bound for this mode is UNCHECKED.
 #[test]
-#[ignore = "verification"]
+#[ignore = "DEFECTIVE FIXTURE, see doc comment (#1062)"]
 fn r2_does_a_real_frame_survive_the_narrow_grid() {
     let template = bpsk_plugin::modulate::bpsk_preamble_template(&cfg("BPSK31")).expect("template");
     let frame = bpsk_plugin::BpskPlugin::new()
@@ -297,7 +334,20 @@ fn band_noise(n: usize, lo: f32, hi: f32, a: f32, seed: u64) -> Vec<f32> {
 /// Expensive by construction: `Rs` emits a 255-byte block, so a BPSK31 frame is ~65 s of audio.
 /// That cost is the reason this column gets skipped, and skipping it is what withdrew #1053.
 ///
-/// **Measured 2026-08-04, 48 seeds (`R4_SEEDS=48`), 40 decoded:**
+/// # SUPERSEDED — the 48-seed table below is an interim value, not this column's result
+///
+/// The same day, 150 seeds (118 decoded) gave a weakest decodable ρ of **0.569**, and #1062's
+/// pre-registered rule (`T ≥ 1.15 × 0.426 = 0.490`, `T ≤ 0.85 × 0.569 = 0.484`) admits no threshold:
+/// BPSK31 publishes `None` (#1062, 2026-08-04, "Phase-0 result: BPSK31 publishes no preamble
+/// template"). The minimum fell 0.693 → 0.625 → 0.569 at 6 / 48 / 150 seeds with no sign of a floor.
+/// This comment kept the 48-seed value until 2026-09-11, and a design pass that day proposed a 0.51
+/// threshold from it without reading the thread.
+///
+/// Also: R4's ρ is not the engine's ρ. It is scored at the TRUE onset on a grid centred at zero
+/// residual (`grid_for`), where the engine scores at the settle's onset around the settle's own
+/// estimate — so any weakest-decodable value here is an upper bound on what the engine computes.
+///
+/// **Interim, 2026-08-04, 48 seeds (`R4_SEEDS=48`), 40 decoded — superseded above:**
 ///
 /// | | ρ |
 /// |---|---|
@@ -562,7 +612,8 @@ fn r6_what_decimation_costs_the_noise_ceiling() {
 /// sits in ρ's **denominator**, so removing it raises ρ — for the signal *and* for the noise. I
 /// recorded the signal half as "an interference-rejection stage you get paid for" (P2: an
 /// out-of-band tone costs the passband correlator 1.000 → 0.945 while the DDC path stays at 1.000)
-/// without measuring the noise half, and R6 then found the noise ceiling rising by *more*.
+/// without measuring the noise half, and R6 (`r6_what_decimation_costs_the_noise_ceiling`) then
+/// found the noise ceiling rising by *more*.
 ///
 /// If noise rises further than signal, the DDC is not rejecting interference in any useful sense —
 /// it is renormalising both, and the detector is worse off. What matters is
@@ -864,7 +915,11 @@ fn r10_do_correlators_converge_in_the_deciding_band() {
     );
 }
 
-/// R6: does a PN successor actually remove the grid constraint that blocks BPSK31? (#1062)
+/// R11: does a PN successor actually remove the grid constraint that blocks BPSK31? (#1062)
+///
+/// Numbered R11 because R6 was already taken by `r6_what_decimation_costs_the_noise_ceiling`,
+/// which R7's doc comment cites by number. **PR #1340 published this table as "R6"**; the table
+/// is unchanged, only the round number here is.
 ///
 /// **This tests a PREDICTION the issue body explicitly refuses to assume.** The `baud/4` grid bound
 /// exists *because* the shipped preamble is a period-4 run with discrete spectral lines: a grid wide
@@ -893,7 +948,7 @@ fn r10_do_correlators_converge_in_the_deciding_band() {
 /// template up to 32 k samples. `#[ignore]`d accordingly.
 #[test]
 #[ignore = "verification (#1062), ~78 min"]
-fn r6_does_a_pn_template_remove_the_grid_constraint() {
+fn r11_does_a_pn_template_remove_the_grid_constraint() {
     let baud = 31.25f32;
     let occ = 2.0 * baud;
     let first_line = baud / 4.0;
@@ -921,7 +976,7 @@ fn r6_does_a_pn_template_remove_the_grid_constraint() {
     // a 65k-sample template costs about an hour per grid to sweep. Holding D constant is a different
     // experiment; this one answers the grid question.
 
-    println!("\nR6: does a spread sequence remove BPSK31's grid constraint?");
+    println!("\nR11: does a spread sequence remove BPSK31's grid constraint?");
     println!(
         "    shipped {} samples ({sym} sym), PN-31 {}, PN-63 {}, PN-127 {}; lines at odd multiples of {first_line:.2} Hz",
         shipped.len(),
