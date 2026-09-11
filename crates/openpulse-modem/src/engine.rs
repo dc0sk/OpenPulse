@@ -459,6 +459,30 @@ impl PreambleVeto {
     }
 }
 
+/// What the correlation veto decided for one settle query (#1049, REQ-RX-02/03).
+///
+/// Returned by [`ModemEngine::decide_preamble_veto`], the one decide-and-record step both acquisition
+/// paths share, so each call site can do its own path-specific work without re-deriving the decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VetoVerdict {
+    /// The preamble correlation cleared the (calibrated) threshold.
+    Corroborated,
+    /// The veto is standing down (REQ-RX-03): the settle is let through without a verdict on ρ.
+    StoodDown,
+    /// ρ fell below the threshold — energy without a preamble.
+    Rejected {
+        /// The threshold it was compared against, for the caller's log line.
+        threshold: f32,
+    },
+}
+
+impl VetoVerdict {
+    /// Whether the settle proceeds: corroborated, or let through by a stand-down.
+    fn accepted(self) -> bool {
+        !matches!(self, Self::Rejected { .. })
+    }
+}
+
 /// Result of [`ModemEngine::afc_mini_settle`].
 struct AfcSettleOutcome {
     /// Correction after the one-shot wide-scan anchor pass.
@@ -853,7 +877,9 @@ pub struct ModemEngine {
     /// delivered frames (REQ-RX-03). Latched per transition so the log says it once.
     rho_stand_down: bool,
     /// Settles the veto let through *because* it was standing down — the count that distinguishes
-    /// "the veto agreed" from "the veto was not running".
+    /// "the veto agreed" from "the veto was not running". Counted on both acquisition paths since
+    /// #1342; on the daemon's phase-2 path the unit is one coarse-grid settle query, the unit
+    /// `rho_accepted_settles` already has there.
     rho_stand_down_settles: u64,
     /// Monotonic count of frames emitted at the single TX seam (`stage_emit_output`) — every
     /// transmit path (data, FEC, ACK, retransmit, QSY, ID) increments it once. A pollable
@@ -2499,23 +2525,11 @@ impl ModemEngine {
         let Some((rho, _)) = self.preamble_rho(v, &samples[start..settle_end], outcome.fine) else {
             return true;
         };
-        // Feed the #1060 calibration from this call site too, or the threshold it derives stays
-        // CLI-fed and the `DORMANT(#1118)` note on the engine's `rho_*` getters never comes true.
-        self.rho_calibration.push_at(rho, start);
-        let threshold = self.rho_calibration.effective_threshold(v.rho_threshold);
-        let stand_down = self
-            .rho_calibration
-            .stands_down(v.rho_threshold, v.delivered_frame_rho_bound);
-        let accepted = stand_down || rho >= threshold;
-        // Report the decision on the same counters the CLI path uses. Without this the daemon's
-        // veto runs unobservably, and a gate on those counters cannot tell "the veto ran and
-        // accepted" from "the veto never ran" — the half-wiring hole the #1118 seam gate exists for.
-        if accepted {
-            self.rho_accepted_settles += 1;
-        } else {
-            self.rho_rejected_settles += 1;
-        }
-        accepted
+        // Decide and record through the one step the CLI path uses too (#1342): the calibration
+        // sample, the stand-down latch and its log line, and all three counters. Without the counters
+        // the daemon's veto runs unobservably — the half-wiring the #1118 seam gate exists for — and
+        // without the latch a stand-down here was neither reported nor logged.
+        self.decide_preamble_veto(v, rho, start).accepted()
     }
 
     /// One onset scan over a gathered burst, optionally acquiring the carrier at each onset.
@@ -4228,41 +4242,14 @@ impl ModemEngine {
                                 // REQ-RX-02 / REQ-RX-03. Every query is a calibration sample: the
                                 // stream this compares against is the stream it is built from, which
                                 // is why it costs no extra correlation. See `rho_calibration`.
-                                self.rho_calibration.push_at(rho, onset);
-                                let threshold =
-                                    self.rho_calibration.effective_threshold(veto.rho_threshold);
-                                let stand_down = self.rho_calibration.stands_down(
-                                    veto.rho_threshold,
-                                    veto.delivered_frame_rho_bound,
-                                );
-                                if stand_down != self.rho_stand_down {
-                                    self.rho_stand_down = stand_down;
-                                    if stand_down {
-                                        warn!(
-                                            "preamble veto STANDING DOWN: derived threshold \
-                                             {threshold:.3} exceeds the delivered-frame bound \
-                                             {:.3} — no threshold separates this station's noise \
-                                             from a frame it could decode, so frame start falls \
-                                             back to energy alone",
-                                            veto.delivered_frame_rho_bound.unwrap_or(f32::NAN)
-                                        );
-                                    } else {
-                                        warn!(
-                                            "preamble veto re-engaged: derived threshold \
-                                             {threshold:.3} is back under the delivered-frame bound"
-                                        );
-                                    }
-                                }
-                                if stand_down {
-                                    self.rho_stand_down_settles += 1;
-                                } else if rho < threshold {
+                                let verdict = self.decide_preamble_veto(veto, rho, onset);
+                                if let VetoVerdict::Rejected { threshold } = verdict {
                                     debug!(
                                         "settle at onset={onset} rejected: preamble correlation \
                                          rho={rho:.3} < {threshold:.2} (published {:.2}, \
                                          correction={:.1}Hz) — energy without a preamble",
                                         veto.rho_threshold, settle.fine
                                     );
-                                    self.rho_rejected_settles += 1;
                                     self.afc_correction_hz = 0.0;
                                     continue;
                                 }
@@ -4295,11 +4282,17 @@ impl ModemEngine {
                                 // micro-sweep and condemnation recovery already exist to handle.
                                 // Placing the onset properly needs a preamble whose autocorrelation
                                 // is not periodic — a PN or chirp sync word, a wire-format change.
-                                self.rho_accepted_settles += 1;
                                 if self.accepted_settle_positions.len() < 4_096 {
                                     self.accepted_settle_positions.push(onset);
                                 }
-                                debug!("settle at onset={onset} corroborated: rho={rho:.3}");
+                                if matches!(verdict, VetoVerdict::StoodDown) {
+                                    debug!(
+                                        "settle at onset={onset} let through: the veto is \
+                                         standing down (rho={rho:.3})"
+                                    );
+                                } else {
+                                    debug!("settle at onset={onset} corroborated: rho={rho:.3}");
+                                }
                             }
                         }
                         planner.note_settled(onset);
@@ -6888,17 +6881,54 @@ impl ModemEngine {
         Ok(AudioSamples { samples })
     }
 
-    /// Fast AFC settle over one acquisition window: a one-shot wide-scan
-    /// anchor pass (`afc_step = 1.0` sets the correction directly to the
-    /// Goertzel peak — iterative passes diverge for carriers at the scan
-    /// boundary) followed by 5 fine-tracking passes at `afc_step = 0.7`.
+    /// Decide and RECORD one correlation-veto query — the single step both acquisition paths share.
     ///
-    /// Saves and restores `afc_step` internally; `afc_correction_hz` is left
-    /// at the fine estimate so the caller can accept it or restore its own
-    /// saved value.  This is the ONLY place that temporarily mutates the AFC
-    /// state for settling — the previous inline copies of this sequence each
-    /// hand-rolled the save/restore and had already caused >1000 Hz of
-    /// accumulated drift once (review E5).
+    /// It exists because the two copies drifted twice: #1168 wired the accept/reject counters to the
+    /// daemon's phase-2 site after its gate caught the veto deciding invisibly, and the stand-down
+    /// latch, its log lines and its counter stayed CLI-only (#1342). It owns the calibration sample,
+    /// the effective threshold, the stand-down decision (whose hysteresis lives in `RhoCalibration`),
+    /// the engine's announce latch with its two `warn!` lines, and all three counters. A stood-down
+    /// settle counts as accepted — `rho_accepted_settles` means "the gate passed this input", which
+    /// it did — and also in `rho_stand_down_settles`, which tells a stand-down apart from agreement.
+    /// Each caller keeps only its path-specific work (the CLI's rejection log, correction reset and
+    /// accepted-position record; the daemon's caller-side rollback).
+    fn decide_preamble_veto(&mut self, veto: &PreambleVeto, rho: f32, onset: usize) -> VetoVerdict {
+        // REQ-RX-02: every query is a calibration sample — the stream this compares against is the
+        // stream it is built from, so it costs no extra correlation.
+        self.rho_calibration.push_at(rho, onset);
+        let threshold = self.rho_calibration.effective_threshold(veto.rho_threshold);
+        let stand_down = self
+            .rho_calibration
+            .stands_down(veto.rho_threshold, veto.delivered_frame_rho_bound);
+        if stand_down != self.rho_stand_down {
+            self.rho_stand_down = stand_down;
+            if stand_down {
+                warn!(
+                    "preamble veto STANDING DOWN: derived threshold {threshold:.3} exceeds the \
+                     delivered-frame bound {:.3} — no threshold separates this station's noise from \
+                     a frame it could decode, so frame start falls back to energy alone",
+                    veto.delivered_frame_rho_bound.unwrap_or(f32::NAN)
+                );
+            } else {
+                warn!(
+                    "preamble veto re-engaged: derived threshold {threshold:.3} is back under the \
+                     delivered-frame bound"
+                );
+            }
+        }
+        if stand_down {
+            self.rho_stand_down_settles += 1;
+            self.rho_accepted_settles += 1;
+            VetoVerdict::StoodDown
+        } else if rho < threshold {
+            self.rho_rejected_settles += 1;
+            VetoVerdict::Rejected { threshold }
+        } else {
+            self.rho_accepted_settles += 1;
+            VetoVerdict::Corroborated
+        }
+    }
+
     /// Peak normalised preamble correlation in `window`, searched around the settled correction.
     ///
     /// `None` when the window is too short to hold the template — not a rejection: a candidate that
@@ -7023,6 +7053,17 @@ impl ModemEngine {
         Some((freqs, window.len() - tlen))
     }
 
+    /// Fast AFC settle over one acquisition window: a one-shot wide-scan
+    /// anchor pass (`afc_step = 1.0` sets the correction directly to the
+    /// Goertzel peak — iterative passes diverge for carriers at the scan
+    /// boundary) followed by 5 fine-tracking passes at `afc_step = 0.7`.
+    ///
+    /// Saves and restores `afc_step` internally; `afc_correction_hz` is left
+    /// at the fine estimate so the caller can accept it or restore its own
+    /// saved value.  This is the ONLY place that temporarily mutates the AFC
+    /// state for settling — the previous inline copies of this sequence each
+    /// hand-rolled the save/restore and had already caused >1000 Hz of
+    /// accumulated drift once (review E5).
     fn afc_mini_settle(&mut self, mode: &str, window: &[f32]) -> AfcSettleOutcome {
         self.afc_settle_attempts = self.afc_settle_attempts.wrapping_add(1);
         let saved_step = self.afc_step;
@@ -8354,6 +8395,179 @@ mod ddc_veto_arm {
             "worst rho over one grid step is {worst:.3} at a {worst_at:.2} Hz residual. The              quarter-cycle criterion this grid is derived from promises 0.900; 0.637 is what a grid              {decim}x too coarse gives, and a real frame that far off frequency would be vetoed as              noise.",
             decim = TEMPLATE_SAMPLES / veto.filter.len()
         );
+    }
+}
+
+/// A veto stand-down is RECORDED on every path that decides the veto (#1342).
+///
+/// **A recording gate, not evidence that a real station stands down on the daemon path.** It primes
+/// the calibration directly — 64 samples at ρ 0.40 give an anchor of 0.40, so the derived level is
+/// 0.40 × 1.8 = 0.72, above BPSK250's delivered-frame bound of 0.50, and every query stands down —
+/// which skips how a station's median would get there. How often a real station does is unmeasured
+/// (#1342). Priming needs the private `rho_calibration`, which is why this is an in-crate unit test
+/// rather than an exported accessor.
+///
+/// **The fixture is copied, not shared by reference**: a lib unit test cannot import the integration
+/// test's helpers. The geometry constants — mode, FEC, the 200 Hz `CfoChannel` shift that stops phase 1
+/// decoding so phase 2 must run, the 8000-sample silence either side, the work budget and the daemon's
+/// tick — are `tests/daemon_runs_acquisition_chain.rs`'s; the payload differs. Fidelity to that
+/// fixture is not load-bearing: the arms carry their own executable pins — `prime`'s derived level
+/// above the bound, `afc_settle_attempts() > 0`, and the counters.
+///
+/// Three arms. The CLI arm is the control for the instrument: that site wrote the latch and the
+/// counter before #1342, and the arm passes with the daemon site's pre-fix inline code restored
+/// (sabotage A), proving the fixture reaches a stand-down at all. The two daemon arms, one per
+/// `server::run` decode arm, fail with that code restored. With every query standing down, each must
+/// count as a stand-down AND as an accept and none as a reject, which pins the shared counting rule
+/// as well as the latch.
+#[cfg(test)]
+mod stand_down_is_recorded_on_every_path {
+    use super::*;
+    use bpsk_plugin::BpskPlugin;
+    use openpulse_audio::LoopbackBackend;
+    use openpulse_channel::ChannelModel;
+    use openpulse_core::fec::FecMode;
+    use openpulse_core::profile::SessionProfile;
+    use std::time::Duration;
+
+    const MODE: &str = "BPSK250";
+    const FEC: FecMode = FecMode::Rs;
+    const PAYLOAD: &[u8] = b"stand-down recording probe";
+    const SAMPLE_RATE: u64 = 8_000;
+    const LEAD_SAMPLES: usize = 8_000;
+    const OFFSET_HZ: f32 = 200.0;
+    const SCAN_POSITIONS: usize = 3_000;
+    const MAX_ITERATIONS: usize = 400;
+    const PRIME_RHO: f32 = 0.40;
+    const PRIME_SAMPLES: usize = 64;
+
+    fn engine() -> (LoopbackBackend, ModemEngine) {
+        let backend = LoopbackBackend::new();
+        let mut e = ModemEngine::new(Box::new(backend.clone_shared()));
+        e.register_plugin(Box::new(BpskPlugin::new()))
+            .expect("register bpsk");
+        e.set_deterministic_scan_positions(Some(SCAN_POSITIONS));
+        e.set_deterministic_max_iterations(Some(MAX_ITERATIONS));
+        (backend, e)
+    }
+
+    /// Prime the calibration so the veto must stand down, and ASSERT that it must — otherwise the
+    /// arms below would measure something other than a stand-down.
+    fn prime(e: &mut ModemEngine) {
+        for _ in 0..PRIME_SAMPLES {
+            e.rho_calibration.push(PRIME_RHO);
+        }
+        assert_eq!(
+            e.rho_calibration.anchor(),
+            Some(PRIME_RHO),
+            "priming did not reach the calibration's minimum sample count"
+        );
+        let derived = e
+            .rho_calibration
+            .effective_threshold(bpsk_plugin::modulate::PREAMBLE_RHO_THRESHOLD);
+        assert!(
+            derived > bpsk_plugin::modulate::DELIVERED_FRAME_RHO_BOUND,
+            "primed derived level {derived:.3} is not above the delivered-frame bound, so the veto \
+             would not stand down and this fixture would not exercise the stand-down at all"
+        );
+    }
+
+    fn signal_with_frame() -> Vec<f32> {
+        let (backend, mut e) = engine();
+        e.transmit_with_fec_mode(PAYLOAD, MODE, FEC, None)
+            .expect("transmit");
+        let tx = backend.drain_samples();
+        let mut cfo = openpulse_channel::cfo::CfoChannel::new(
+            openpulse_channel::cfo::CfoConfig::new(OFFSET_HZ, SAMPLE_RATE as f32),
+        )
+        .expect("finite offset");
+        let shifted = cfo.apply(&tx);
+        let mut out = vec![0.0f32; LEAD_SAMPLES];
+        out.extend_from_slice(&shifted);
+        out.extend(std::iter::repeat_n(0.0f32, LEAD_SAMPLES));
+        out
+    }
+
+    /// Feed the signal the way `server::run`'s receive tick does, then silence so the burst flushes.
+    fn capture_via_daemon_path(e: &mut ModemEngine, signal: &[f32]) -> AudioSamples {
+        let tick_ms = openpulse_config::DaemonConfig::default().receive_tick_ms;
+        let tick = (SAMPLE_RATE * tick_ms / 1_000) as usize;
+        let mut flushed = None;
+        for chunk in signal.chunks(tick) {
+            if let Ok(Some(b)) = e.accumulate_capture(Some(MODE), chunk.to_vec()) {
+                flushed = Some(b);
+            }
+        }
+        for _ in 0..6 {
+            if let Ok(Some(b)) = e.accumulate_capture(Some(MODE), vec![0.0f32; tick]) {
+                flushed = Some(b);
+            }
+        }
+        flushed.expect("the carrier rose and dropped, so a burst must flush")
+    }
+
+    fn assert_recorded(arm: &str, e: &ModemEngine) {
+        assert!(
+            e.afc_settle_attempts() > 0,
+            "{arm}: the AFC settle never ran (settle_attempts=0) — on a daemon arm, phase 2 was not \
+             reached — so the veto was never asked and nothing \
+             below means anything"
+        );
+        let (latched, stood_down) = e.rho_stand_down();
+        assert!(
+            latched,
+            "{arm}: the veto stood down (derived 0.72 > bound 0.50) but the engine's announce latch \
+             reads false — the stand-down is neither reported nor logged on this path (#1342)"
+        );
+        assert!(
+            stood_down >= 1
+                && stood_down == e.rho_accepted_settles()
+                && e.rho_rejected_settles() == 0,
+            "{arm}: with every query standing down, each must count as a stand-down AND as an \
+             accept, and none as a reject; got stand_down_settles={stood_down} accepted={} \
+             rejected={}",
+            e.rho_accepted_settles(),
+            e.rho_rejected_settles()
+        );
+    }
+
+    /// CONTROL: the CLI path recorded stand-downs before #1342, so this proves the fixture reaches one.
+    #[test]
+    fn the_cli_path_records_a_stand_down() {
+        let signal = signal_with_frame();
+        let (backend, mut e) = engine();
+        prime(&mut e);
+        backend.fill_samples(&signal);
+        let _ = e.receive_with_fec_mode_timeout(MODE, FEC, None, Duration::from_millis(20_000));
+        assert_recorded("CLI receive", &e);
+    }
+
+    /// The default daemon's decode arm (`ota_enabled` off): `server::run` calls `decode_burst`.
+    #[test]
+    fn the_daemon_decode_burst_arm_records_a_stand_down() {
+        let signal = signal_with_frame();
+        let (_backend, mut e) = engine();
+        prime(&mut e);
+        let burst = capture_via_daemon_path(&mut e, &signal);
+        let _ = e.decode_burst(MODE, &burst);
+        assert_recorded("decode_burst", &e);
+    }
+
+    /// The on-air configuration's arm (`ota_enabled`): `server::run` calls `ota_decode_burst`.
+    #[test]
+    fn the_daemon_ota_arm_records_a_stand_down() {
+        let signal = signal_with_frame();
+        let (_backend, mut e) = engine();
+        e.start_ota_session(SessionProfile::hpx_hf());
+        assert!(e.ota_active(), "without a session this arm early-returns");
+        prime(&mut e);
+        let burst = capture_via_daemon_path(&mut e, &signal);
+        let outcome = e.ota_decode_burst(&burst, "stand-down", Some(MODE));
+        assert!(
+            !matches!(&outcome, Err(err) if err.to_string().contains("no OTA session active")),
+            "ota_decode_burst early-returned without decoding: {outcome:?}"
+        );
+        assert_recorded("ota_decode_burst", &e);
     }
 }
 

@@ -9,6 +9,72 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-11 — the correlation veto's stand-down is recorded on the daemon path too (#1342)
+
+- **Requirement/change:** REQ-RX-03 (CAP-76). #1157 specified the veto's stand-down as "latched with
+  hysteresis, logged". The daemon's phase-2 veto, added by #1168, decided stand-downs — the hysteresis
+  in `RhoCalibration` ran — but never updated the engine's announce latch `rho_stand_down`, its
+  `warn!`, or `rho_stand_down_settles`. So a stand-down there was neither reported nor logged. #1168
+  had wired only the accept/reject counters to that site, after its own gate caught the veto deciding
+  invisibly. (The #1062 entry below files this as "silent and counted as an accept"; the second half is
+  shared, intended behaviour and was withdrawn on #1342.)
+
+- **Design decision:** one private helper, `ModemEngine::decide_preamble_veto`, owns the whole
+  decide-and-record step for both paths: the calibration sample, the effective threshold, the
+  stand-down decision, the announce latch with its two `warn!` lines, and all three counters. It
+  returns a `VetoVerdict` (`Corroborated` / `StoodDown` / `Rejected { threshold }`), and each call site
+  keeps only its path-specific work. A stood-down settle counts as accepted — `rho_accepted_settles`
+  means "the gate passed this input", which it did — and also in `rho_stand_down_settles`, which is
+  what tells a stand-down apart from agreement. That was already the CLI's rule. A helper rather than
+  an inline patch because the two copies had drifted twice (#1168's counters, then this latch).
+  Reviewed before implementing: `docs/dev/reviews/artifacts/1342-stand-down-latch.md`.
+
+  **Declared behaviour changes.** On the daemon path, a stand-down now sets the engine's announce latch, logs at `warn` and counts. On the CLI path, three log-level details move: a rejection is now counted before its `debug!`
+  line rather than after; a stood-down settle's `debug!` line now reads "let through: the veto is
+  standing down" where it used to say "corroborated", which was false; and the accept test is unified
+  on the CLI's `rho < threshold` form — the daemon site used `rho >= threshold`, and the two differ only
+  on NaN, which the correlator never produces. The CLI's counters and control flow are unchanged.
+
+- **Implementation:** `VetoVerdict` and `decide_preamble_veto` (`crates/openpulse-modem/src/engine.rs`);
+  `acquire_at_onset` reduced to one call; the CLI veto block in `receive_with_timeout_fec_inner` moved
+  onto the helper. `rho_stand_down_settles`' doc records the daemon-path unit — one coarse-grid settle
+  query, the unit `rho_accepted_settles` already has there. The Observability section of
+  `docs/dev/design/bandwidth-aware-rho-threshold.md` now says what logs a stand-down, and on which path.
+
+- **Tests:** `engine::stand_down_is_recorded_on_every_path`, with three arms: the CLI path (the
+  instrument control — it recorded stand-downs before this change), and both daemon decode arms,
+  `decode_burst` and `ota_decode_burst`. It is a **recording** gate, not evidence that a real station
+  stands down on the daemon path: it primes the calibration directly — 64 samples at ρ 0.40, so the
+  derived level of 0.72 is above BPSK250's bound of 0.50 — which skips how a station's median would
+  get there. The fixture's geometry constants are copied from `tests/daemon_runs_acquisition_chain.rs`, because a
+  lib unit test cannot import an integration test's helpers: BPSK250 + `Rs`, shifted 200 Hz so phase 2
+  must run, fed through `accumulate_capture` at the daemon's tick. The payload differs; fidelity to that
+  fixture is not load-bearing, because the arms carry their own executable pins. Each arm asserts the AFC settle ran (phase 2, on the daemon arms), the announce latch is set, and
+  every query counted as both a stand-down and an accept with no rejects.
+
+- **Test results (run 2026-09-11 on the committed code):**
+  `cargo test -p openpulse-modem --no-default-features --lib stand_down_is_recorded_on_every_path` →
+  3 passed, 0 failed; `--test daemon_runs_acquisition_chain`, #1118's seam gate, whose call site this
+  change moves → 3 passed, 0 failed. **Sabotage-verified, both halves independently.** With the daemon
+  site's pre-fix inline code restored, the CLI arm passes and both daemon arms fail at the latch: *"the
+  veto stood down (derived 0.72 > bound 0.50) but the engine's announce latch reads false"*. With a
+  helper that stops counting a stand-down as an accept, all three arms fail at the counter — the CLI arm
+  with `stand_down_settles=1 accepted=0`, each daemon arm with `stand_down_settles=33 accepted=0` (one
+  query per coarse-grid onset, the daemon-path unit). The file was restored byte-identical after each.
+  **Workspace gate on this change: NOT RUN at time of writing;** to be amended after the run. Held out by
+  #1274 and not re-proven: `notch_rescues_interferer`, `ota_channel_adaptation`.
+
+- **Left open:**
+  - The `rho_*` getters still have no production consumer, and their `DORMANT(#1118)` note in
+    `reachability-baseline.txt` is stale. Filed as #1344.
+  - `acquire_at_onset` has a second caller, `scan_burst_onsets(.., settle = true)`, and no caller ever
+    passes `true` — a dead arm from #1118's first shape. It goes through the helper by construction;
+    deleting the parameter is separate work.
+  - One engine latch serves both paths and every mode. A second mode with a template but no
+    delivered-frame bound would reset the hysteresis between BPSK250 queries and flap the warning.
+    Unreachable today, since BPSK250 is the only template and carries a bound; the per-mode
+    `RhoCalibration` change would have to revisit it.
+
 ## 2026-09-11 — the correlation veto's frequency grid was `decim`x too coarse on the DDC arm (#1062)
 
 - **Requirement/change:** CAP-76 (REQ-RX-02/03). A latent defect in the decimated (DDC) arm of the

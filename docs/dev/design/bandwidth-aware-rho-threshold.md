@@ -88,8 +88,10 @@ so the daemon benefit this section deferred is now real.
 
 `rho_calibration_samples()`, `rho_effective_threshold(mode)` and `rho_stand_down()` on the engine, so
 a gate asserts the calibration ran rather than trusting it, and an operator can see which regime a
-station is in. Stand-down transitions are logged at `warn`; a control-plane event is deliberately not
-added here, because a new `EngineEvent` variant is a workspace-wide change (exhaustive matches in the
+station is in. Stand-down transitions are logged at `warn` — on both acquisition paths since
+#1342; before it the daemon's phase-2 veto decided stand-downs (the hysteresis in `RhoCalibration`
+ran) but never set the engine's announce latch, logged, or counted them, because #1168 wired only its
+accept/reject counters. A control-plane event is deliberately not added here, because a new `EngineEvent` variant is a workspace-wide change (exhaustive matches in the
 app crates) and does not belong in the same change as the mechanism.
 
 ## Alternatives considered
