@@ -57,6 +57,12 @@ done <<< "$changed"
 
 pkgs="$(printf '%s\n' $pkgs | sort -u | tr '\n' ' ')"
 
+# Re-homed doc / attribute lint (#1345). This hook is the only check that runs on EVERY push (#1144),
+# and the lint takes under a second. It lints what this push adds (the upstream, else origin/main);
+# the script prints the range, so an empty one is visible. It exits 2 on an unresolvable base, and
+# `set -e` then blocks the push rather than letting it through unlinted.
+scripts/check-rehomed-docs.sh --base "${upstream:-origin/main}"
+
 cargo clippy --workspace --no-default-features --all-targets -- -D warnings
 
 if [ -z "${pkgs// /}" ]; then

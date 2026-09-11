@@ -215,6 +215,47 @@ and the actually-observed results per change.
   The same command with the old name → **0 passed, 0 failed, 153 filtered out, exit 0**: the vacuous
   pass, measured rather than argued.
 
+## 2026-09-11 — a diff that re-homes a doc comment or an attribute now fails the gate (#1345)
+
+- **Requirement/change:** #1345. A diff can move a `///` doc, or an outer `#[...]`, onto the wrong
+  item without touching either, because rustdoc attaches every consecutive outer doc line (and an
+  outer attribute) to the next item. Nothing in the toolchain sees the contiguous form. The #1345 census found 29 live insertion steals under a green gate: 30 hits, one of them a false positive. The check's design review then found lost
+  summaries, orphaned field docs and re-homed `#[cfg]`s as well. (Those are repaired in a separate PR.)
+
+- **Design decision:** judge the new file, not the hunk shape. Three kinds of edit re-home a doc, and
+  all three are flagged:
+  - an item, field or variant added directly under an existing doc or attribute;
+  - an item, field or variant deleted from between a doc and what follows it;
+  - an unchanged item whose doc lost its head, when the remainder is non-empty and the lost lines
+    appear nowhere else in the new file.
+
+  Pure insertions are slid back into place first. The wrapper resolves the merge-base fail-closed,
+  with no fallback ref, and prints the range it linted. It is wired into `gate.sh`, `traceability.yml`
+  and the pre-push hook. The design went through two review rounds, both IMPLEMENT WITH CHANGES and
+  both applied: `docs/dev/design/rehomed-docs-check.md`, `docs/dev/reviews/artifacts/1345-rehomed-docs-check.md`.
+
+- **Implementation:** `scripts/lib/rehomed_docs.py` (the detector and its self-test),
+  `scripts/check-rehomed-docs.sh` (the wrapper), plus one step each in `scripts/gate.sh`,
+  `.github/workflows/traceability.yml` and `.cargo-husky/hooks/pre-push`.
+
+- **Tests:** `scripts/check-rehomed-docs.sh --self-test`.
+  - **Fixtures:** 23 of them. F1–F11 must flag. P1–P7 and P9–P12 must not. P9 is cut from the real
+    `acdb1a0d` region and must flag without normalisation, so the fixture proves the slide.
+  - **Base handling (P8):** the wrapper must fail on an unresolvable base.
+  - **Controls on real commits:** 8 defect commits flag, and 5 known false-positive commits do not.
+    - **Sabotage:** a steal planted on the branch made both the gate form and the hook form exit 1,
+    naming the owner.
+  - **Full first-parent replay:** 1201 commits, 44 hits in 39 commits (INS 32, MOD 1, ATTR 4,
+    DEL 4, OVR 3). Reconciled record by record, the 44 are:
+    - 33 census insertion pairs: all 34 except the `set_tx_attenuation_db` false positive;
+    - 3 insertion shapes the census could not see;
+        - 7 DEL/OVR, the design review's list;
+    - 1 `use` that took a `#[cfg]` (`5e80f296`), which the second post-implementation change catches.
+
+    The first replay's one false positive (`6790d298`) is removed by stopping the walk-up at an added
+    code line.
+
+- **Test results:** NOT RUN at time of writing.
 ## 2026-09-11 — docs re-homed by an edit are moved back to their items (#1345)
 
 - **Requirement/change:** #1345. An edit can move a doc onto the wrong item without touching the doc,

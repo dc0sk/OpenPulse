@@ -106,6 +106,14 @@ jobs:
           ./scripts/check-review.sh --message-file "$RUNNER_TEMP/pr-review-message.txt" \
                                     --base "origin/$BASE_REF"
 
+      # Re-homed doc / attribute lint (#1345): a diff that moves a `///` doc or an outer `#[...]` onto
+      # the wrong item. Same base discipline as the trailer lint above: the ref through `env:`, and
+      # the script exits 2 on an unresolvable base rather than reporting an empty, clean range.
+      - name: Re-homed docs lint (branch diff)
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: ./scripts/check-rehomed-docs.sh --base "origin/$BASE_REF"
+
       # R5's doc constitution (status: living legality + recursive frontmatter) is NOT enforced in CI
       # right now: it lives in docs.yml, which calls the same scripts/validate-doc-frontmatter.sh but
       # is `disabled_manually` (#1129). Run it by hand until that is resolved.

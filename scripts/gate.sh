@@ -222,6 +222,13 @@ if [ "$MODE" = "full" ]; then
     # to need an artifact BEFORE the PR is opened.
     drift_check
     run_step "review-trailer lint" scripts/check-review.sh --base "$(git merge-base HEAD origin/main 2>/dev/null || echo HEAD)" || rc_total=1
+    # Re-homed doc / attribute lint (#1345). A diff can move a `///` doc or an outer `#[...]` onto the
+    # wrong item without touching either, and clippy only sees the blank-line form; 29 live insertion
+    # steals sat under a green gate. The script resolves the merge-base itself and FAILS on an
+    # unresolvable base; there is no `|| echo HEAD` fallback, because that diffs HEAD against itself
+    # and passes vacuously.
+    drift_check
+    run_step "re-homed docs lint" scripts/check-rehomed-docs.sh || rc_total=1
 fi
 
 drift_check   # final boundary: nothing moved between the last step and the verdict
