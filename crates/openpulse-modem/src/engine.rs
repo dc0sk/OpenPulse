@@ -411,6 +411,18 @@ impl VetoCorrelator {
             Self::Ddc(f) => f.len(),
         }
     }
+
+    /// Input samples the template spans, which sets its duration and so its coherent bandwidth.
+    ///
+    /// Equal to [`Self::len`] on the passband arm and `decim` times larger on the DDC arm. The two
+    /// were one number while every template was passband, and a frequency-resolution derivation
+    /// written against `len()` then silently changed meaning the day a template was decimated.
+    fn input_span(&self) -> usize {
+        match self {
+            Self::Passband(f) => f.len(),
+            Self::Ddc(f) => f.input_span(),
+        }
+    }
 }
 
 impl PreambleVeto {
@@ -6893,10 +6905,9 @@ impl ModemEngine {
     /// has not finished buffering has not been measured, and treating "no measurement" as "no
     /// preamble" would gate out every frame that arrives one read at a time.
     ///
-    /// The grid step is derived from the template's own coherent bandwidth (`fs / tlen`) rather
-    /// than fixed. A matched filter's ρ falls off over roughly `1 / (template duration)`, so a step
-    /// chosen for one baud rate steps clean over the peak at another and reads noise — the same
-    /// class of error as a constant fitted to one artifact.
+    /// The grid step is derived from the template's own coherent bandwidth rather than fixed — see
+    /// [`Self::preamble_search_plan`], which owns that derivation and the reason it uses the
+    /// template's span rather than its sample count.
     /// Build the correlation veto for `mode`, or `None` if this mode gets the energy-only settle.
     ///
     /// Extracted so [`Self::preamble_veto_active`] can report the same answer the receive path
@@ -6975,10 +6986,19 @@ impl ModemEngine {
 
     /// The residual-frequency grid and timing bound for the correlation check.
     ///
-    /// The grid step is derived from the template's own coherent bandwidth (`fs / tlen`) rather
-    /// than fixed. A matched filter's ρ falls off over roughly `1 / (template duration)`, so a step
-    /// chosen for one baud rate steps clean over the peak at another and reads noise — the same
-    /// class of error as a constant fitted to one artifact.
+    /// The grid step is derived from the template's own coherent bandwidth rather than fixed. A
+    /// matched filter's ρ falls off over roughly `1 / (template duration)`, so a step chosen for one
+    /// baud rate steps clean over the peak at another and reads noise — the same class of error as a
+    /// constant fitted to one artifact.
+    ///
+    /// **Duration comes from the span, never from the sample count.** `fs / len` is the duration's
+    /// reciprocal only while the template is passband; on the DDC arm `len()` is the *decimated*
+    /// count, so `fs / len` reads `decim / duration` and the grid comes out `decim`x too coarse.
+    /// The engine's own grid is the only consumer of this, and the worst-case residual is half a
+    /// step, so the resulting coherent loss is `|sinc(decim / 8)|` — 0.974 at `decim = 1`, 0.637 at
+    /// 4, and an exact **null** at 8. It stayed invisible because `MODES_WITH_VETO` has only ever
+    /// held BPSK250, whose 992-sample template is passband; the first mode published on the DDC arm
+    /// would have activated it. Pinned by `the_grid_step_follows_the_template_span_not_its_decimated_length`.
     fn preamble_search_plan(
         &self,
         veto: &PreambleVeto,
@@ -6990,7 +7010,11 @@ impl ModemEngine {
             return None;
         }
         let fs = AudioConfig::default().sample_rate as f32;
-        let step = (0.25 * fs / tlen as f32).max(0.5);
+        // The 0.5 Hz floor bounds the hypothesis count for long templates. It does not bind for any
+        // passband mode (BPSK250 steps at 2.016 Hz) and DOES bind for a BPSK31-length template
+        // (0.256 Hz), leaving a worst case of |sinc(0.25)| = 0.900 — exactly the quarter-cycle
+        // criterion this derivation is built on, so the floor is kept rather than removed.
+        let step = (0.25 * fs / veto.filter.input_span() as f32).max(0.5);
         let n = (veto.rho_grid_hz / step).round() as i32;
         let freqs: Vec<f32> = (-n..=n).map(|k| settled_hz + k as f32 * step).collect();
         // The search bound is whatever timing slack the window leaves past the template — about two
@@ -8234,6 +8258,101 @@ mod ddc_veto_arm {
         assert!(
             rho >= 0.9,
             "the Ddc correlator scored {rho:.3} against its OWN template; anything short of              near-unity means the mix, decimation or normalisation is wrong, not that the signal is"
+        );
+    }
+
+    /// THE GATE: no residual inside the grid's reach may cost more coherence than the quarter-cycle
+    /// criterion the grid is derived from.
+    ///
+    /// `preamble_search_plan` sizes its step from the template's coherent bandwidth, and the
+    /// expression for that was `0.25 * fs / veto.filter.len()`. That is `1 / (4 * duration)` only
+    /// while the template is passband; on the Ddc arm `len()` is the **decimated** count, so it read
+    /// `decim / (4 * duration)` and the grid came out `decim`x too coarse. The worst-case residual is
+    /// half a step, so the loss is `|sinc(decim / 8)|` — 0.974 at 1, 0.900 at 2, **0.637 at 4**, and
+    /// an exact null at 8, which is the D a PN-63 preamble at this length would take.
+    ///
+    /// Invisible until now because the defect needs a template on the Ddc arm and
+    /// `tests/veto_membership_pin.rs` pins `MODES_WITH_VETO = ["BPSK250"]`, whose 992 samples are
+    /// passband (`decim = 1`, loss 0.974). The two things that looked like cover are not:
+    /// `ddc_correlation_equivalence::p1` compares the arms with `search_normalized`, over onsets at a
+    /// SINGLE frequency hypothesis, so "decimating it does not change the answer" is silent about
+    /// the grid; and the sibling test above scores at residual 0.0, where every grid contains the
+    /// answer exactly.
+    ///
+    /// **Swept rather than sampled at one residual.** A single worst-case point for the old grid is
+    /// also a near-best point for the new one (0.512 Hz sits mid-bin at the old 1.0246 Hz step and
+    /// 0.012 Hz from a hypothesis at 0.5), so a point test would overstate the fix by measuring two
+    /// different places. The minimum over a full step is the property the derivation actually
+    /// promises. The old step is 1.0246 Hz rather than `0.25 * 8000 / (7936 / 4)` = 1.008 because
+    /// `ddc_mix` keeps only the anti-alias FIR's valid region: the decimated template is 1952
+    /// samples, spanning 7808 input samples rather than 7936.
+    ///
+    /// The offset is applied by building the template at `fc + delta` — the repo's idiom
+    /// (`demod_parity.rs`, `carrier_offset_matrix.rs`, `ChannelSimHarness::route_with_cfo`).
+    /// Multiplying a finished frame by `cos(2*pi*delta*t)` is NOT this: it is amplitude modulation,
+    /// putting half-amplitude copies at `fc +/- delta`, which caps rho near `1/sqrt(2)` and makes it
+    /// nearly grid-INDEPENDENT — so it cannot measure a grid at all. That mistake is live in
+    /// `bpsk31_constant_derivation::r2` (#1062).
+    #[test]
+    fn the_grid_step_follows_the_template_span_not_its_decimated_length() {
+        let e = engine_with_long_template();
+        let veto = e.build_preamble_veto(MODE, FS).expect("veto");
+
+        // Structural half, so a failure localises to the derivation rather than to the correlator.
+        let (freqs, _) = e
+            .preamble_search_plan(&veto, &vec![0.0f32; 32_768], 0.0)
+            .expect("plan");
+        let step = freqs
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f32::INFINITY, f32::min);
+        // `by_span` uses the raw template length, while the correlator's true span is a little
+        // shorter — `ddc_mix` keeps only the anti-alias FIR's valid region, 7808 of 7936 samples
+        // here. So the comparison carries a tolerance, sized to sit above that trim (~1.6 %) and far
+        // below the smallest defect it exists for (a factor of `decim` >= 2). An exact comparison
+        // passes today only because the 0.5 Hz floor binds both sides, and would fail on CORRECT
+        // code the day the floor is removed.
+        let by_span = (0.25 * FS as f32 / TEMPLATE_SAMPLES as f32).max(0.5);
+        assert!(
+            step <= 1.25 * by_span,
+            "grid step {step:.4} Hz exceeds the {by_span:.4} Hz this template's time span allows by \
+             more than the 25 % FIR-trim tolerance — it is being derived from the decimated length, \
+             which is shorter by the decimation factor and so overstates the resolution by it"
+        );
+
+        // Behavioural half: sweep one full step of residual and take the worst.
+        let mut worst = f32::INFINITY;
+        let mut worst_at = 0.0f32;
+        let mut delta = 0.0f32;
+        while delta <= 0.55 {
+            let offset_cfg = ModulationConfig {
+                sample_rate: FS,
+                mode: MODE.into(),
+                center_frequency: FC + delta,
+                ..ModulationConfig::default()
+            };
+            // Sized to the sibling test's rule — above `tlen * decim + ntap` = 7936 + 129 — but no
+            // further: every extra sample is another lag at each of the 81 grid frequencies, and
+            // this sweep pays that twelve times.
+            let mut window = vec![0.0f32; 256];
+            window.extend_from_slice(&LongTemplatePlugin::template_samples(&offset_cfg));
+            window.extend(std::iter::repeat_n(0.0f32, 512));
+            let (rho, _) = e
+                .preamble_rho(&veto, &window, 0.0)
+                .expect("the Ddc arm did not measure this window");
+            if rho < worst {
+                worst = rho;
+                worst_at = delta;
+            }
+            delta += 0.05;
+        }
+
+        // |sinc(0.25)| = 0.900 is what a step at the 0.5 Hz floor promises; the pre-fix grid stepped
+        // at 1.0246 Hz and bottoms at |sinc(0.5)| = 0.637 at its 0.512 Hz mid-bin.
+        assert!(
+            worst >= 0.85,
+            "worst rho over one grid step is {worst:.3} at a {worst_at:.2} Hz residual. The              quarter-cycle criterion this grid is derived from promises 0.900; 0.637 is what a grid              {decim}x too coarse gives, and a real frame that far off frequency would be vetoed as              noise.",
+            decim = TEMPLATE_SAMPLES / veto.filter.len()
         );
     }
 }
