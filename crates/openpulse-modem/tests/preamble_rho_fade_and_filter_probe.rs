@@ -490,7 +490,6 @@ fn pn_template(mode: &str, chips: &[f32]) -> Option<Vec<f32>> {
     (full.len() >= start + span).then(|| full[start..start + span].to_vec())
 }
 
-/// Peak normalised correlation of `template` against `window`, engine-style.
 fn rho_of_on_grid(template: &[f32], window: &[f32], grid: &[f32]) -> Option<f32> {
     let mf = IqMatchedFilter::new(template.to_vec());
     if window.len() <= mf.len() {
@@ -500,6 +499,7 @@ fn rho_of_on_grid(template: &[f32], window: &[f32], grid: &[f32]) -> Option<f32>
         .map(|(r, _)| r.rho)
 }
 
+/// Peak normalised correlation of `template` against `window`, engine-style.
 fn rho_of(template: &[f32], window: &[f32], grid_hz: f32) -> Option<f32> {
     let grid = engine_grid(template.len(), grid_hz);
     let mf = IqMatchedFilter::new(template.to_vec());

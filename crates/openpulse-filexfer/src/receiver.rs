@@ -187,7 +187,6 @@ impl ReceiverSession {
         }
     }
 
-    /// Whether the session has reached a terminal state.
     /// Whether the transfer has been accepted and is actively receiving blocks.
     ///
     /// A caller must consult this **before** persisting peer bytes or acknowledging a block on air:
@@ -197,6 +196,7 @@ impl ReceiverSession {
         self.state == State::Receiving
     }
 
+    /// Whether the session has reached a terminal state.
     pub fn is_terminal(&self) -> bool {
         self.state == State::Terminal
     }

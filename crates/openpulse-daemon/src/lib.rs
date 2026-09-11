@@ -1586,30 +1586,7 @@ pub async fn process_received_bytes(
 #[cfg(not(target_arch = "wasm32"))]
 const HANDSHAKE_SAR_SESSION: &str = "handshake";
 
-/// SAR-fragment a signed handshake frame and transmit it. The receiver reassembles in
-/// [`try_reassemble_handshake`].
-///
-/// Since #1147 a classical CONREQ/CONACK is ONE fragment (241/244 B against 251 B), so this is a
-/// single frame in practice — the path stays SAR-based because the PQ frames (~5 kB) still need it,
-/// and because "one fragment" is a property of the caps rather than something this function should
-/// assume.
 #[cfg(not(target_arch = "wasm32"))]
-/// Run one keyed emission: key the transmitter, run `emit`, release on drop.
-///
-/// **Every** `engine.transmit*` in this crate goes through here — enforced by
-/// `every_daemon_transmit_is_keyed` in `tests/ptt_keys_every_daemon_transmit.rs`, which fails on a
-/// bare call and is validated against a planted one.
-///
-/// Three rules the shape enforces rather than documents (#1262):
-///
-/// * **One key per BURST, not per frame.** A multi-fragment handshake or filexfer burst is one
-///   keying; the peer cannot reply between fragments. Keying per frame would key/unkey ~20 times for
-///   one PQ CONREQ.
-/// * **The guard never crosses an `.await`.** It is owned by this synchronous frame and cannot
-///   escape it, so an async caller must finish its awaits (mode locks, etc.) *before* calling in.
-/// * **No `block_in_place` in here.** `lib.rs` has 49 `#[tokio::test]`s on the default
-///   current-thread flavor, where `block_in_place` panics. Callers that need it wrap the call.
-///
 /// Unix milliseconds now — the stamp on every signed QSY line.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -1690,16 +1667,6 @@ fn reap_finished_repeater(
     }
 }
 
-/// Spawn the cross-band repeater thread and record its handles; returns the mode it will relay at.
-///
-/// **One helper for both entry points on purpose.** The daemon starts the repeater at startup when
-/// `[repeater] enabled`, and `EnableRepeater` starts it on command. Those two drifted before: only
-/// the command arm ever spawned a thread, while startup set `repeater_enabled = true` on its own —
-/// so a config-enabled repeater was reported running, `EnableRepeater` answered "already enabled",
-/// and no sequence short of `DisableRepeater` first could start it. Sharing the spawn is what stops
-/// that from recurring; it is not a tidiness refactor.
-///
-/// Returns `None` when no repeater was built at startup (no usable `[radio.rig_b]`).
 /// Best-effort text of a panic payload, for reporting a repeater panic to the operator.
 fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -1711,6 +1678,16 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// Spawn the cross-band repeater thread and record its handles; returns the mode it will relay at.
+///
+/// **One helper for both entry points on purpose.** The daemon starts the repeater at startup when
+/// `[repeater] enabled`, and `EnableRepeater` starts it on command. Those two drifted before: only
+/// the command arm ever spawned a thread, while startup set `repeater_enabled = true` on its own —
+/// so a config-enabled repeater was reported running, `EnableRepeater` answered "already enabled",
+/// and no sequence short of `DisableRepeater` first could start it. Sharing the spawn is what stops
+/// that from recurring; it is not a tidiness refactor.
+///
+/// Returns `None` when no repeater was built at startup (no usable `[radio.rig_b]`).
 fn spawn_repeater(
     runtime_state: &mut RuntimeControlState,
     event_tx: &Arc<broadcast::Sender<ControlEvent>>,
@@ -1812,6 +1789,21 @@ pub(crate) fn start_repeater_if_configured(
     }
 }
 
+/// Run one keyed emission: key the transmitter, run `emit`, release on drop.
+///
+/// **Every** `engine.transmit*` in this crate goes through here — enforced by
+/// `every_daemon_transmit_is_keyed` in `tests/ptt_keys_every_daemon_transmit.rs`, which fails on a
+/// bare call and is validated against a planted one.
+///
+/// Three rules the shape enforces rather than documents (#1262):
+///
+/// * **One key per BURST, not per frame.** A multi-fragment handshake or filexfer burst is one
+///   keying; the peer cannot reply between fragments. Keying per frame would key/unkey ~20 times for
+///   one PQ CONREQ.
+/// * **The guard never crosses an `.await`.** It is owned by this synchronous frame and cannot
+///   escape it, so an async caller must finish its awaits (mode locks, etc.) *before* calling in.
+/// * **No `block_in_place` in here.** `lib.rs` has 49 `#[tokio::test]`s on the default
+///   current-thread flavor, where `block_in_place` panics. Callers that need it wrap the call.
 pub(crate) fn keyed_transmit<T>(
     ptt: &crate::ptt::SharedPtt,
     event_tx: Option<&broadcast::Sender<ControlEvent>>,
@@ -1841,6 +1833,13 @@ pub(crate) fn keyed_transmit<T>(
 ///
 /// Returns `false` when nothing went out. The caller must not record a verified peer on a CONACK
 /// that was never transmitted — see the F5 note at the call site.
+///
+/// The receiver reassembles in [`try_reassemble_handshake`].
+///
+/// Since #1147 a classical CONREQ/CONACK is ONE fragment (241/244 B against 251 B), so this is a
+/// single frame in practice — the path stays SAR-based because the PQ frames (~5 kB) still need it,
+/// and because "one fragment" is a property of the caps rather than something this function should
+/// assume.
 fn transmit_handshake_frame(
     engine: &mut ModemEngine,
     ptt: &crate::ptt::SharedPtt,
@@ -1866,9 +1865,6 @@ fn transmit_handshake_frame(
     .is_ok()
 }
 
-/// Feed a non-QSY, non-relay frame into the handshake SAR reassembler; on a completed segment,
-/// dispatch the reassembled CONREQ/CONACK (confirmed by its HSCQ/HSAK magic). Stray frames create
-/// at most a short-lived reassembly slot that the periodic [`expire_pending_handshake`] clears.
 #[cfg(not(target_arch = "wasm32"))]
 /// The SAR `segment_id` (big-endian bytes 0–1) of a fragment, or `None` if it's too short to be a
 /// well-formed SAR fragment. Used to route reassembly (handshake = 0, file transfer ≠ 0).
@@ -1878,6 +1874,9 @@ fn sar_segment_id(bytes: &[u8]) -> Option<u16> {
         .then(|| ((bytes[0] as u16) << 8) | bytes[1] as u16)
 }
 
+/// Feed a non-QSY, non-relay frame into the handshake SAR reassembler; on a completed segment,
+/// dispatch the reassembled CONREQ/CONACK (confirmed by its HSCQ/HSAK magic). Stray frames create
+/// at most a short-lived reassembly slot that the periodic [`expire_pending_handshake`] clears.
 #[cfg(not(target_arch = "wasm32"))]
 fn try_reassemble_handshake(
     bytes: &[u8],
@@ -2319,10 +2318,7 @@ fn maybe_relay_forward(
         Err(e) => tracing::info!(reason = ?e, "relay: dropping envelope"),
     }
 }
-///
-/// This complements [`dispatch_command`], which updates shared daemon state and
-/// forwards commands to the caller. Commands without runtime support emit a
-/// [`ControlEvent::CommandError`] instead of failing silently.
+
 #[cfg(not(target_arch = "wasm32"))]
 /// The QSY wire magic, taken from the signing registry rather than typed here (#1162).
 fn qsy_wire_magic() -> &'static str {
@@ -2330,6 +2326,11 @@ fn qsy_wire_magic() -> &'static str {
         .unwrap_or("OPQS")
 }
 
+/// Execute side-effectful control commands against the live modem engine.
+///
+/// This complements [`dispatch_command`], which updates shared daemon state and
+/// forwards commands to the caller. Commands without runtime support emit a
+/// [`ControlEvent::CommandError`] instead of failing silently.
 pub async fn apply_command_to_engine(
     cmd: &ControlCommand,
     engine: &mut ModemEngine,
@@ -6521,12 +6522,6 @@ mod handshake_rf_tests {
         );
     }
 
-    /// #1178 THROUGH THE TX PATH: a CONREQ addressed to another station is not answered.
-    ///
-    /// Asserted on the engine's transmit counter, not on the filter function, because the defect
-    /// being fixed is *spent RF* — a unit check on `is_addressed_to` would pass even if the daemon
-    /// went on to key up anyway. The positive control in the same test is what makes the negative
-    /// meaningful: the identical setup DOES transmit when the request is addressed to us.
     /// #1203: dialling the wildcard `"*"` must refuse, and must NOT key the transmitter.
     ///
     /// Asserted on the engine's transmit counter, like #1178, because the defect is *spent RF*: a
@@ -6719,6 +6714,12 @@ mod handshake_rf_tests {
         }
     }
 
+    /// #1178 THROUGH THE TX PATH: a CONREQ addressed to another station is not answered.
+    ///
+    /// Asserted on the engine's transmit counter, not on the filter function, because the defect
+    /// being fixed is *spent RF* — a unit check on `is_addressed_to` would pass even if the daemon
+    /// went on to key up anyway. The positive control in the same test is what makes the negative
+    /// meaningful: the identical setup DOES transmit when the request is addressed to us.
     #[tokio::test]
     async fn a_conreq_addressed_elsewhere_does_not_key_the_transmitter() {
         async fn transmits_for(dst: &str) -> u64 {

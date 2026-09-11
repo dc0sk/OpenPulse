@@ -1,4 +1,4 @@
-/// PTT and full CAT rig controller traits and implementations for OpenPulseHF.
+//! PTT and full CAT rig controller traits and implementations for OpenPulseHF.
 pub mod band_levels;
 pub mod cat_controller;
 pub mod cm108;

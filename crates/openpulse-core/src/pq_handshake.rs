@@ -140,7 +140,6 @@ pub struct PqConReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqConAck {
     pub station_id: String,
-    /// The initiator this answers.
     /// SHA-256 over the complete transmitted PQ CONREQ, replacing the session-id echo.
     pub conreq_hash: [u8; 32],
     /// Unix-ms creation time, signed, for replay freshness. See [`PqConReq::timestamp_ms`].
@@ -256,10 +255,6 @@ fn is_pq_only(modes: &[SigningMode]) -> bool {
 // Handshake creation
 // ------------------------------------------------------------------
 
-/// Build and sign a PqConReq.
-///
-/// Hybrid mode: signs with both Ed25519 and ML-DSA-44.
-/// Pq-only mode: signs with ML-DSA-44 only; `classical_signature` is empty.
 /// Parameters for a PQ CONREQ.
 ///
 /// DORMANT(#1147): the PQ path has zero production callers — nothing constructs or dispatches a PQ
@@ -440,14 +435,12 @@ fn split_pq_trailer(
     })
 }
 
-/// Build and sign a PqConAck; encapsulates the KEM key from `req_kem_ek`.
 /// Parameters for a PQ CONACK.
 ///
 /// DORMANT(#1147): see [`PqConReqParams`].
 pub struct PqConAckParams<'a> {
     /// Responder callsign (cap 12).
     pub station_id: &'a str,
-    /// The initiator this answers; never a wildcard.
     /// ML-DSA-44 signing seed.
     pub pq_signing_key: &'a [u8],
     /// The initiator's ML-KEM encapsulation key, from its CONREQ.
@@ -461,6 +454,8 @@ pub struct PqConAckParams<'a> {
 }
 
 /// Build and sign a PQ CONACK, returning `(frame_bytes, shared_secret)`.
+///
+/// Encapsulates the KEM key from `req_kem_ek`.
 pub fn create_pq_conack(
     params: &PqConAckParams<'_>,
     classical_seed: &[u8; 32],

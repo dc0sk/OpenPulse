@@ -322,7 +322,6 @@ pub fn scfdma_demodulate_soft_with_metrics(
     demodulate_soft_with_params(samples, &p)
 }
 
-/// Combine multiple LLR attempts using inverse-noise variance weighting.
 fn demodulate_with_params(samples: &[f32], p: &ScFdmaParams) -> Result<Vec<u8>, ModemError> {
     let sync = modulate_with_params(&preamble_payload(p), p);
     if samples.len() < sync.len() + SYM_LEN {

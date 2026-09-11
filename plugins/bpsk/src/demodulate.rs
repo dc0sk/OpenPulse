@@ -957,6 +957,7 @@ fn cancel_crossfade_isi(i_syms: &mut [f32], q_syms: &mut [f32]) {
 }
 
 // ── Differential phase detection (NRZI decode) ───────────────────────────────
+/// Decode bits from consecutive complex (I, Q) symbol pairs.
 ///
 /// `Re(z[k] * conj(z[k−1]))` is positive when the phase is the same
 /// ("0" bit / no flip) and negative when the phase has flipped ("1" bit).

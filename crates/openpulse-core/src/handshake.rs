@@ -375,7 +375,6 @@ pub struct ConAckParams<'a> {
 pub struct ConAck {
     /// Responder callsign.
     pub station_id: String,
-    /// The initiator this answers.
     /// Ed25519 verifying-key bytes (32).
     pub pubkey: Vec<u8>,
     /// Ephemeral X25519 public key (32).

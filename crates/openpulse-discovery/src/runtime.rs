@@ -131,7 +131,6 @@ pub enum DiscoveryOutcome {
     },
 }
 
-/// The RX-only discovery runtime.
 /// Minimum gap between rendezvous replies to the *same* peer.
 ///
 /// Answering a `Propose` costs a full JS8 over on the air. Without a floor, a peer that repeats its
@@ -145,6 +144,7 @@ pub const RESPONDER_COOLDOWN_MS: u64 = 120_000;
 /// itself a memory-exhaustion vector — the guard has to bound the thing that actually grows.
 const MAX_TRACKED_RESPONDERS: usize = 512;
 
+/// The RX-only discovery runtime.
 pub struct DiscoveryRuntime {
     params: DiscoveryParams,
     sm: DiscoverySm,
@@ -858,8 +858,6 @@ mod tests {
         rt
     }
 
-    /// Modulate `text` as a directed over `sender: to <text>` and clock its frames through the dwelling
-    /// runtime, one per slot from `start_ms`, collecting every outcome. `t` advances by one slot/frame.
     /// A Propose message as it goes on the air, built through the CODEC rather than typed.
     ///
     /// These fixtures used to hold the wire text literally, so #1163's version token had to be
@@ -873,6 +871,8 @@ mod tests {
         .encode()
     }
 
+    /// Modulate `text` as a directed over `sender: to <text>` and clock its frames through the dwelling
+    /// runtime, one per slot from `start_ms`, collecting every outcome. `t` advances by one slot/frame.
     fn feed_over(
         rt: &mut DiscoveryRuntime,
         sender: &str,
