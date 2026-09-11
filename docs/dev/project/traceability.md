@@ -61,7 +61,11 @@ and the actually-observed results per change.
   helper that stops counting a stand-down as an accept, all three arms fail at the counter — the CLI arm
   with `stand_down_settles=1 accepted=0`, each daemon arm with `stand_down_settles=33 accepted=0` (one
   query per coarse-grid onset, the daemon-path unit). The file was restored byte-identical after each.
-  **Workspace gate on this change: NOT RUN at time of writing;** to be amended after the run. Held out by
+  **Workspace gate:**
+  `GATE: PASS 9e2af985faa5021867f8b0fd02f758702e54adf9 clean 20260911T134213Z`
+  (`target/gate-verdict.json`; the gate log does not carry the `GATE:` line), on `9e2af985`, this
+  entry's first committed form — suites=332, tests_passed=2538, tests_failed=0. The delta from
+  `9e2af985` to the commit carrying this sentence is docs-only: this sentence. Held out by
   #1274 and not re-proven: `notch_rescues_interferer`, `ota_channel_adaptation`.
 
 - **Left open:**
