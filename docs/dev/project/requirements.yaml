@@ -1072,6 +1072,7 @@ capabilities:
   CAP-76:
     code:
     - crates/openpulse-modem/src/rho_calibration.rs
+    - crates/openpulse-modem/src/engine.rs
     name: Preamble-correlation veto and its runtime calibration
     satisfies:
     - REQ-RX-02

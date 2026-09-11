@@ -874,6 +874,21 @@ impl DdcMatchedFilter {
         self.template.len()
     }
 
+    /// Input samples the template SPANS, which is what its duration — and so its coherent
+    /// bandwidth — is set by. That is the anti-alias FIR's valid region times `decim`: a little
+    /// shorter than the raw template (7808 of 7936 samples for BPSK31's), because `ddc_mix` keeps
+    /// only the positions where the filter has full support.
+    ///
+    /// Distinct from [`Self::len`] on purpose. Decimation changes the sample *count* and not the
+    /// time *span*, so the two answer different questions and coincide only at `decim == 1`. A
+    /// caller deriving a frequency resolution wants this one: `1 / (span / sample_rate)`. Using
+    /// `len()` there understates the duration by `decim` and so overstates the resolution by the
+    /// same factor — a residual-frequency grid `decim`x too coarse, whose worst-case coherent loss
+    /// is `|sinc(decim / 8)|`: harmless at 1, and an exact null at 8.
+    pub fn input_span(&self) -> usize {
+        self.template.len() * self.decim
+    }
+
     /// Returns `true` if the decimated template is empty.
     pub fn is_empty(&self) -> bool {
         self.template.is_empty()

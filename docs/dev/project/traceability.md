@@ -9,6 +9,120 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-11 — the correlation veto's frequency grid was `decim`x too coarse on the DDC arm (#1062)
+
+- **Requirement/change:** CAP-76 (REQ-RX-02/03). A latent defect in the decimated (DDC) arm of the
+  preamble-correlation veto, found by the adversarial review of a design pass on #1062. **That design
+  pass was drafted against a stale record.** It proposed publishing BPSK31's own ρ constants ("route
+  A") from the 48-seed decode column in `bpsk31_constant_derivation.rs`'s R4 doc comment, where #1062's
+  thread had recorded the 150-seed result (weakest decodable 0.569) and closed route A on 2026-08-04: a
+  pre-registered rule admits no threshold, and BPSK31 publishes `None`. The pass's premise was moot;
+  the defect its review found is not, because it hits any template long enough to take the DDC arm.
+
+- **Design decision:** `preamble_search_plan` derives its residual-frequency grid step from the
+  template's coherent bandwidth, and its own doc names the target quantity as `1 / (template
+  duration)`. The expression was `0.25 * fs / veto.filter.len()`, which is that reciprocal only while
+  the template is passband: on the DDC arm `len()` is the DECIMATED count, so it reads
+  `decim / duration`. Worst-case residual is half a step, so the coherent loss closes to
+  `|sinc(decim / 8)|` — 0.974 at decim = 1, 0.900 at 2, **0.637 at 4**, and an exact **null** at 8.
+  Decimation changes a template's sample count and not its time span, so `len()` (budget) and
+  `input_span()` (duration) are now two methods rather than one number that happened to serve both.
+  `input_span()` is the anti-alias FIR's valid region times `decim` — 7808 of 7936 samples for a
+  BPSK31-length template, because `ddc_mix` keeps only the positions where the filter has full
+  support. The 0.5 Hz floor is kept deliberately: it does not bind for any passband mode (BPSK250
+  steps at 2.016 Hz) and does bind after the fix for a BPSK31-length template (0.256 Hz unfloored),
+  leaving |sinc(0.25)| = 0.900 — the quarter-cycle criterion the derivation is built on.
+
+- **Why it was invisible:** latent, and bit-identical for everything that ships.
+  `veto_membership_pin.rs` pins `MODES_WITH_VETO = ["BPSK250"]`, whose 992 samples take the passband
+  arm where `input_span() == len()`. Three things looked like cover and are not:
+  `ddc_correlation_equivalence::p1` compares the two arms with `search_normalized`, over onsets at a
+  SINGLE frequency hypothesis, so "decimating it does not change the answer" is silent about the grid;
+  `ddc_veto_arm`'s existing correlation test scores at residual 0.0, where every grid contains the
+  answer exactly; and `veto_membership_pin`'s "To add one" checklist names the threshold and the
+  grid HALF-WIDTH — the two constants that travel WITH the template — and omits the STEP, which the
+  engine derives. **The generalisable shape: a capability's membership pin guarded the parameters the
+  plugin publishes and not the one the consumer computes from them.** That checklist is NOT amended
+  here.
+
+- **Implementation:** `DdcMatchedFilter::input_span()` (`crates/openpulse-dsp/src/acquisition.rs`);
+  `VetoCorrelator::input_span()` and the `preamble_search_plan` derivation
+  (`crates/openpulse-modem/src/engine.rs`). CAP-76's `code:` list gained `engine.rs`, where the veto
+  itself lives — it had listed only `rho_calibration.rs`.
+
+- **Tests:** `engine::ddc_veto_arm::the_grid_step_follows_the_template_span_not_its_decimated_length`.
+  Swept over a full step of residual rather than sampled at one point, because 0.512 Hz is
+  simultaneously mid-bin for the old 1.0246 Hz step and 0.012 Hz from a hypothesis at the new one, so a
+  point test would measure two different places and overstate the fix. The structural half compares
+  the step against the raw-length derivation with a 25 % tolerance: the correlator's span is 1.6 %
+  shorter than the raw template, so an exact comparison passes only while the 0.5 Hz floor binds both
+  sides and would fail on correct code if the floor were removed; the smallest defect it exists for is
+  a factor of 2.
+
+- **Test results (run 2026-09-11 on the committed code):**
+  `cargo test -p openpulse-modem --no-default-features --lib ddc_veto_arm` → 3 passed, 0 failed.
+  Sabotage-verified, both halves independently. Reverting `input_span()` to `len()` fails the
+  structural half: *"grid step 1.0246 Hz exceeds the 0.5000 Hz this template's time span allows by
+  more than the 25 % FIR-trim tolerance"*. Because that half fires first the behavioural half would
+  never run, so it was disabled and the sabotage repeated: worst rho **0.667** at a 0.50 Hz residual,
+  against the 0.900 the criterion promises. The true worst case is 0.637 at the 0.512 Hz mid-bin. At the sampled 0.50 Hz — 0.012 Hz short of the
+  mid-bin — the derivation predicts |sinc(0.50 × 7808/8000)| = 0.652, so the sampling offset alone
+  accounts for 0.637 → 0.652; the remaining 0.015 is lag slack, modelled in review, not run.
+  **Workspace gate:** `GATE: PASS 83ceda3cba582cc2ce55d6c8674fe5a5ab76d683 clean 20260911T112854Z`
+  (`target/gate-verdict.json`; the gate log does not carry the `GATE:` line), on `83ceda3c`, this
+  entry's first committed form — suites=332, tests_passed=2535, tests_failed=0. The delta from
+  `83ceda3c` to the commit carrying this sentence is docs-only: this sentence. Held out by #1274 and
+  not re-proven: `notch_rescues_interferer`, `ota_channel_adaptation`. An earlier run,
+  `GATE: FAIL 93cf07583a740667694cc7c210c39dfdd54398c6 clean 20260911T062709Z`, failed on the
+  requirements-trailer lint alone, on an earlier form of these commits since re-made.
+
+  **Correction, recorded where the claim was made:** an earlier draft of this entry, committed locally
+  and never pushed, stated `GATE: PASS` with a test count. No gate had passed, and the SHA it cited was
+  never gated. The write-up review caught it before push.
+
+- **Apparatus defects found alongside, and NOT repaired:**
+  - `bpsk31_constant_derivation::r2` applies its "residual carrier offset" as `s * cos(2*pi*delta*t)`,
+    which is amplitude modulation: it leaves half-amplitude copies at `fc +/- delta`, capping rho near
+    `1/sqrt(2)` almost independently of the grid. At HEAD it reads 0.704 at 1 Hz residual, the
+    ±20/±4/±2 columns identical to three decimals while differing 9x in hypothesis count (159, 33 and
+    17 at the probe's 0.252 Hz step); at 0.3 Hz all five agree across a 32x range. **That number was posted:** #1062's 2026-08-04 comment gives the false-reject half of its ±2 Hz grid derivation
+    as "a real frame holding ρ ≥ 0.704 out to a 2 Hz residual" — and the fixture was already in the harness's first commit on the branch that
+    comment names (`22828192`, 2026-08-04T09:46Z). That half is withdrawn; R1's
+    false-accept half stands. Marked `#[ignore = "DEFECTIVE FIXTURE, see doc comment (#1062)"]`; repairing it needs BPSK31's
+    own settle residual, which has never been measured (the `<= 0.3 Hz` it cites is BPSK250's).
+  - R4's doc comment carried the 48-seed interim value (0.625, "a threshold near 0.51") since it
+    landed; it now records the thread's 150-seed result and its "no threshold" verdict first.
+  - `grid_for` computes the span form of the step with a 0.05 Hz floor, so R1–R4 were measured at
+    0.252 Hz where the engine, post-fix, steps at 0.5 Hz — a harness-fidelity gap. At least eleven
+    hand-rolled copies of the step formula exist in `tests/` (a grep-derived lower bound).
+
+- **Corrections to the review artifact, recorded there in full:** the Consumer section named the
+  right function and the wrong consequence — on the daemon path the veto gates phase-2 acquisition
+  only, not frame start; and one cited call site, the `build_preamble_veto` call inside
+  `scan_burst_onsets`, is unreachable (the function is live, but all three callers pass
+  `settle = false`). The "DDC closes #1053's receive-filter axis by construction" argument was a
+  property of the FIXTURE: `band_noise` renormalises each band to fixed RMS, so a ratio is identical by
+  construction. R4's rho is not the engine's rho — scored at the true onset on a zero-centred 0.252 Hz
+  grid. And the whole proposal's premise was stale, as above.
+
+- **Open:**
+  - **Reachable on the shipped daemon path (by reading; not run):** the OTA call site computes
+    `stands_down` but never updates the stand-down latch or its counter, so on the daemon a BPSK250
+    stand-down would be silent and counted as an accept. #1157 measured a stand-down at a 309 Hz filter
+    on the CLI path; the daemon path has never been driven to one. Filed as #1342.
+  - Phase 2 repeats a settle pass whenever two of its entries share a mode, and on BPSK250 keeps its
+    calibration samples twice. Filed as #1341.
+  - `RhoCalibration` is engine-wide, not per-mode, so a second published template would mix two noise
+    populations into one median. Reviewed; verdict: key it by the mode already in scope at both call
+    sites, and cover `MonitorRuntime::decode_all`; its review artifact is committed with this change
+    (`docs/dev/reviews/artifacts/1062-rho-calibration-per-mode.md`). Its
+    priority has dropped: the verdict assumed a second template was imminent via route A or B, and
+    neither is scheduled.
+  - The finer grid's cost is unmeasured. On the DDC arm the fix roughly doubles the hypothesis count
+    (the 0.5 Hz floor caps it: 41 → 81 at ±20 Hz for a BPSK31-length template), inside acquisition.
+    `bpsk31_constant_derivation::r8` measures correlation cost per settle and was not re-run. BPSK250's
+    count is unchanged, so nothing shipping is affected.
+
 ## 2026-09-10 — a panicking repeater is recovered, and does not come back keyed (#1324 follow-on)
 
 - **Requirement/change:** REQ-FUN-11 / §97.119. #1324 handed the repeater back on the clean and
