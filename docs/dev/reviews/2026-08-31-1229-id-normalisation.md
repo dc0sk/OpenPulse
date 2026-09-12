@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-31-1229-id-normalisation.md
+status: review
+last_updated: 2026-08-31
+---
+
 # Review — #1229: seven requirements the enforced registry could not hold
 
 Reviewer: Fable (adversarial), two rounds. Date: 2026-08-31. Reviewed **before** implementation, and

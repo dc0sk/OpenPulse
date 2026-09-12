@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/presentations/src/README.md
+status: archive
+last_updated: 2026-08-26
+---
+
 # Presentation source
 
 `../OpenPulseHF-Overview.odp` is **generated**, not hand-edited. Regenerate with:

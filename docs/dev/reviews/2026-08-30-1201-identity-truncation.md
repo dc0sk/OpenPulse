@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-30-1201-identity-truncation.md
+status: review
+last_updated: 2026-08-30
+---
+
 # Review — #1201: filexfer signed a truncated identity
 
 Reviewer: Fable (adversarial), two rounds. Date: 2026-08-30. Design reviewed **before**

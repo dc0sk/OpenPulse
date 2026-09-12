@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-09-05-1268-traceability-join.md
+status: review
+last_updated: 2026-09-05
+---
+
 # Review — #1268: the traceability matrix joins by membership, not by property
 
 Reviewer: Fable. Reviewed **before implementation**. The proposal was rejected; what survives is

@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-09-02-1177-ack-window-gate.md
+status: review
+last_updated: 2026-09-03
+---
+
 # Review — #1177: covering the FSK4-ACK chain, and the window gate it exposed
 
 Reviewer: Fable (adversarial). Date: 2026-09-02. Reviewed **before implementation**, then a second

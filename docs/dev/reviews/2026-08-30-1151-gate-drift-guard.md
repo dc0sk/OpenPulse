@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-30-1151-gate-drift-guard.md
+status: review
+last_updated: 2026-08-30
+---
+
 # Review — #1151: the gate's verdict named a state the run never had
 
 Reviewer: Fable (adversarial). Date: 2026-08-30. Design decision reviewed **before** implementation.

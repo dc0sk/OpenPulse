@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1324-panic-path-recovery.md
+status: review
+last_updated: 2026-09-10
+---
+
 # Recovering the cross-band repeater from a thread PANIC (follow-on to #1324)
 
 ## Where this sits

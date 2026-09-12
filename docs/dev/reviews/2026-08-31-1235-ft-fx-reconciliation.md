@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-31-1235-ft-fx-reconciliation.md
+status: review
+last_updated: 2026-08-31
+---
+
 # Review — #1235: reconciling the draft `REQ-FT-*` scheme, and two requirements I minted badly
 
 Reviewer: Fable (adversarial). Date: 2026-08-31. Reviewed after the first implementation and

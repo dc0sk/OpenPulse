@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-30-1158-traceability-default.md
+status: review
+last_updated: 2026-08-30
+---
+
 # Review — #1158: the `traceability` default the checker never implemented
 
 Reviewer: Fable (adversarial). Date: 2026-08-30. Subject: a design decision reviewed **before**
