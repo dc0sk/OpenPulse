@@ -54,19 +54,6 @@ pub struct SecureSessionParams {
     pub psk_validated: bool,
 }
 
-/// The modem engine.
-///
-/// # Example
-/// ```no_run
-/// use openpulse_modem::ModemEngine;
-/// use openpulse_audio::LoopbackBackend;
-/// use bpsk_plugin::BpskPlugin;
-///
-/// let mut engine = ModemEngine::new(Box::new(LoopbackBackend::new()));
-/// engine.register_plugin(Box::new(BpskPlugin::new()));
-/// engine.transmit(b"Hello", "BPSK100", None).unwrap();
-/// let received = engine.receive("BPSK100", None).unwrap();
-/// ```
 /// Scan/retry policy for [`ModemEngine::receive_with_timeout`], extracted as
 /// a pure state machine over (elapsed seconds, buffer length) so the policy is
 /// unit-testable without an audio backend.
@@ -235,29 +222,12 @@ impl ScanPlanner {
     }
 }
 
-/// Settled AFC corrections below this magnitude (Hz) are treated as measurement
-/// noise and snapped to zero.  A short data-aided/blind estimate on a zero-offset
-/// frame lands a few tenths of a Hz off; applying that spurious correction breaks
-/// modes that re-fit carrier phase from the (now over-corrected) preamble — 8PSK's
-/// `carrier_phase_correct` enters a fragile drift-fit branch at ≥0.5 Hz.  Real HF
-/// offsets are tens to hundreds of Hz (the carrier-offset regression uses 15 Hz;
-/// the measured inter-rig offset is ~400 Hz), so this never suppresses a real one.
 /// Buffering time above which the settled full-buffer retry starves the capture read loop.
 ///
 /// 120 000 samples is 15 s at 8 kHz. The retry re-scans the whole buffer every 2 s, which for a
 /// frame this long outruns the read cadence so the frame never finishes buffering.
 pub const LONG_FRAME_SAMPLES: usize = 120_000;
 
-/// Per-attempt slice length and long-frame classification for a mode's raw geometry under `fec`.
-///
-/// Returns `(max_frame_samples, long_frame)`.
-///
-/// **The widening and the classification live in one function on purpose.** A coded frame is 3x the
-/// raw geometry, and what starves the capture read loop is how long the frame actually takes to
-/// buffer. Classifying on the raw value — which is what this code did until 2026-07-20 — put three
-/// modes with ~28 s coded frames (`BPSK250`, `BPSK250-RRC`, `QPSK125`) on the wrong side, so they kept
-/// the retry that starves the capture and never finished buffering on a real audio path. Splitting
-/// these two steps apart is what allowed them to drift out of order; keep them together.
 /// How many times a mode's raw `max_frame_samples` a coded frame can actually reach.
 ///
 /// **Measured, not guessed** (`tests/fec_slice_expansion.rs`, BPSK250 @ 8 kHz, worst case over
@@ -288,6 +258,16 @@ fn fec_slice_factor(fec: FecMode) -> usize {
     }
 }
 
+/// Per-attempt slice length and long-frame classification for a mode's raw geometry under `fec`.
+///
+/// Returns `(max_frame_samples, long_frame)`.
+///
+/// **The widening and the classification live in one function on purpose.** A coded frame is 3x the
+/// raw geometry, and what starves the capture read loop is how long the frame actually takes to
+/// buffer. Classifying on the raw value — which is what this code did until 2026-07-20 — put three
+/// modes with ~28 s coded frames (`BPSK250`, `BPSK250-RRC`, `QPSK125`) on the wrong side, so they kept
+/// the retry that starves the capture and never finished buffering on a real audio path. Splitting
+/// these two steps apart is what allowed them to drift out of order; keep them together.
 pub fn frame_plan(raw_max_frame_samples: usize, fec: FecMode) -> (usize, bool) {
     let coded = raw_max_frame_samples.saturating_mul(fec_slice_factor(fec));
     (coded, coded > LONG_FRAME_SAMPLES)
@@ -322,7 +302,42 @@ fn openpulse_modem_descramble_soft(mut llrs: Vec<f32>) -> Vec<f32> {
     llrs
 }
 
+/// Settled AFC corrections below this magnitude (Hz) are treated as measurement
+/// noise and snapped to zero.  A short data-aided/blind estimate on a zero-offset
+/// frame lands a few tenths of a Hz off; applying that spurious correction breaks
+/// modes that re-fit carrier phase from the (now over-corrected) preamble — 8PSK's
+/// `carrier_phase_correct` enters a fragile drift-fit branch at ≥0.5 Hz.  Real HF
+/// offsets are tens to hundreds of Hz (the carrier-offset regression uses 15 Hz;
+/// the measured inter-rig offset is ~400 Hz), so this never suppresses a real one.
 const AFC_SETTLE_DEADBAND_HZ: f32 = 2.0;
+
+/// Onset-step multiplier for the #1118 acquisition pass.
+///
+/// The pass settles on a coarser grid than the decode scan uses, because a settle needs only to land
+/// on signal while a decode needs the onset to a symbol period. 4 keeps the whole scan span reachable
+/// — the real #1021 lead-in is 126 symbol periods — while cutting the settle count to a quarter.
+///
+/// Derived from the cost that forced it, not tuned: at every onset, the pass turned a Watterson
+/// fading test from minutes into 98+ minutes without finishing.
+const PHASE2_STEP_MULTIPLIER: usize = 4;
+
+/// Maximum AFC correction magnitude accepted after settling.
+///
+/// The Goertzel acquisition range is ±400 Hz (`range_hz = 800` in `estimate_carrier_hz_wide`), so
+/// this is that range plus a small margin. The convergence guard (`|change| > 5 Hz`) still rejects
+/// flat noise that produces a near-zero stable estimate.
+///
+/// **Corrected 2026-08-18**: this comment used to justify the bound with "on-air measurements show a
+/// consistent ~400 Hz carrier offset between the two rigs". That figure is unsupported — it traces to
+/// the two-station OTA notes, whose CFO readings are marked unreliable in the same paragraph (the
+/// spectral peak-picker was measuring dev-host birdies). The cleanly measured inter-rig offset is
+/// **−64 Hz** (`openpulse-channel/src/cfo.rs`). The bound itself is unchanged and is justified by the
+/// estimator's own range, which is what it was always really about.
+///
+/// Module-scoped rather than function-local since #1118: the daemon's burst scan applies the same
+/// guard, and a plausibility bound that two acquisition paths hold independently is one they can
+/// drift apart on.
+const AFC_MAX_CORRECTION_HZ: f32 = 450.0;
 
 /// Longest preamble template the correlation will use, in samples (256 ms at 8 kHz).
 ///
@@ -347,34 +362,6 @@ const AFC_SETTLE_DEADBAND_HZ: f32 = 2.0;
 /// dev, and only the shipped one has been fixed. What is machine-checked today is
 /// `openpulse_dsp::acquisition::tests::ddc_mix_keeps_the_first_sample_and_every_decim_th_one`;
 /// the four-decimal figure itself is not.
-/// Maximum AFC correction magnitude accepted after settling.
-///
-/// The Goertzel acquisition range is ±400 Hz (`range_hz = 800` in `estimate_carrier_hz_wide`), so
-/// this is that range plus a small margin. The convergence guard (`|change| > 5 Hz`) still rejects
-/// flat noise that produces a near-zero stable estimate.
-///
-/// **Corrected 2026-08-18**: this comment used to justify the bound with "on-air measurements show a
-/// consistent ~400 Hz carrier offset between the two rigs". That figure is unsupported — it traces to
-/// the two-station OTA notes, whose CFO readings are marked unreliable in the same paragraph (the
-/// spectral peak-picker was measuring dev-host birdies). The cleanly measured inter-rig offset is
-/// **−64 Hz** (`openpulse-channel/src/cfo.rs`). The bound itself is unchanged and is justified by the
-/// estimator's own range, which is what it was always really about.
-///
-/// Module-scoped rather than function-local since #1118: the daemon's burst scan applies the same
-/// guard, and a plausibility bound that two acquisition paths hold independently is one they can
-/// drift apart on.
-/// Onset-step multiplier for the #1118 acquisition pass.
-///
-/// The pass settles on a coarser grid than the decode scan uses, because a settle needs only to land
-/// on signal while a decode needs the onset to a symbol period. 4 keeps the whole scan span reachable
-/// — the real #1021 lead-in is 126 symbol periods — while cutting the settle count to a quarter.
-///
-/// Derived from the cost that forced it, not tuned: at every onset, the pass turned a Watterson
-/// fading test from minutes into 98+ minutes without finishing.
-const PHASE2_STEP_MULTIPLIER: usize = 4;
-
-const AFC_MAX_CORRECTION_HZ: f32 = 450.0;
-
 const MAX_PREAMBLE_CORRELATION_SAMPLES: usize = 2_048;
 
 /// A mode's preamble matched filter together with the ρ constants its plugin measured for it.
@@ -631,6 +618,19 @@ pub struct OtaRxResult {
     pub mode: Option<String>,
 }
 
+/// The modem engine.
+///
+/// # Example
+/// ```no_run
+/// use openpulse_modem::ModemEngine;
+/// use openpulse_audio::LoopbackBackend;
+/// use bpsk_plugin::BpskPlugin;
+///
+/// let mut engine = ModemEngine::new(Box::new(LoopbackBackend::new()));
+/// engine.register_plugin(Box::new(BpskPlugin::new()));
+/// engine.transmit(b"Hello", "BPSK100", None).unwrap();
+/// let received = engine.receive("BPSK100", None).unwrap();
+/// ```
 pub struct ModemEngine {
     audio: Box<dyn AudioBackend>,
     plugins: PluginRegistry,
@@ -896,15 +896,6 @@ const CESSB_CLIP_RATIO: f32 = 2.0;
 /// Peak-stretcher look-ahead window (samples) for CE-SSB TX conditioning.
 const CESSB_LOOKAHEAD: usize = 16;
 
-/// Floor for the [`ModemEngine::burst_cap_samples`] runaway guard (~30 s at 8 kHz), and the cap used
-/// when the receive mode is unknown or unregistered.
-///
-/// This was the *whole* cap until 2026-07-29, as a flat constant. It is far shorter than the frames
-/// the ladder's slow rungs emit — BPSK31 + Rs measures 532 480 samples (66.6 s) and BPSK63 + Rs
-/// 266 240 (33.3 s) — so on a streaming capture it force-flushed mid-frame on every normal
-/// transmission, splitting the burst into two preamble-less halves. SL2 (BPSK31) is `hpx_hf`'s
-/// `initial_level`, so this sat on the entry rung of every session. Gate:
-/// `tests/burst_cap_frame_length.rs`.
 /// How far above the tracked noise floor the channel counts as busy, as an RMS ratio.
 ///
 /// **Bracketed by measurement, not chosen.** On the recorded IC-9700 hot floor the spectral floor
@@ -923,7 +914,15 @@ const DCD_SQUELCH_MARGIN: f32 = 1.25;
 /// the FT-991A capture's floor is 0.0006 RMS, so this must stay well below anything real.
 const DCD_MIN_SQUELCH_THRESHOLD: f32 = 0.001;
 
-/// Floor for the per-mode cap, so a fast mode still accumulates a usable burst.
+/// Floor for the [`ModemEngine::burst_cap_samples`] runaway guard (~30 s at 8 kHz), so a fast mode
+/// still accumulates a usable burst, and the cap used when the receive mode is unknown or unregistered.
+///
+/// This was the *whole* cap until 2026-07-29, as a flat constant. It is far shorter than the frames
+/// the ladder's slow rungs emit — BPSK31 + Rs measures 532 480 samples (66.6 s) and BPSK63 + Rs
+/// 266 240 (33.3 s) — so on a streaming capture it force-flushed mid-frame on every normal
+/// transmission, splitting the burst into two preamble-less halves. SL2 (BPSK31) is `hpx_hf`'s
+/// `initial_level`, so this sat on the entry rung of every session. Gate:
+/// `tests/burst_cap_frame_length.rs`.
 ///
 /// Note what the per-mode figure alone did NOT fix (#1249): it is derived from whatever mode is
 /// passed in, and the daemon passes its *configured* mode, not the OTA rung the peer is sending at.
@@ -1134,11 +1133,6 @@ impl ModemEngine {
         self.settle_failure_limit = limit;
     }
 
-    /// How many candidate settles the preamble correlation refused (#1049).
-    ///
-    /// Zero has two meanings and a test must distinguish them: the gate ran and accepted
-    /// everything, or the mode publishes no preamble template and the gate never ran at all. Pair
-    /// this with a case that must reject.
     /// Times the AFC settle was entered — acquisition-chain tripwire (#1118). See the field docs.
     ///
     /// DORMANT(#1118): no production caller by design. It is an instrument, like its four siblings
@@ -1154,6 +1148,11 @@ impl ModemEngine {
         self.afc_settle_attempts
     }
 
+    /// How many candidate settles the preamble correlation refused (#1049).
+    ///
+    /// Zero has two meanings and a test must distinguish them: the gate ran and accepted
+    /// everything, or the mode publishes no preamble template and the gate never ran at all. Pair
+    /// this with a case that must reject.
     pub fn rho_rejected_settles(&self) -> u64 {
         self.rho_rejected_settles
     }
@@ -2233,9 +2232,6 @@ impl ModemEngine {
         }
     }
 
-    /// Onset-scan geometry for `mode`: (scan step, acquisition window, min frame
-    /// samples, max frame samples). Prefers the plugin's `frame_geometry`; falls back
-    /// to trailing-digit baud with a 32-symbol preamble for unregistered plugins.
     /// Onset-scan bounds for a gathered burst: `(step, scan_end, max_frame_samples)`.
     ///
     /// ONE definition, used by BOTH daemon decode arms. They had diverged — the uncoded arm scanned
@@ -2256,6 +2252,9 @@ impl ModemEngine {
         (step.max(1), scan_end, max_frame_samples)
     }
 
+    /// Onset-scan geometry for `mode`: (scan step, acquisition window, min frame
+    /// samples, max frame samples). Prefers the plugin's `frame_geometry`; falls back
+    /// to trailing-digit baud with a 32-symbol preamble for unregistered plugins.
     fn frame_scan_geometry(&self, mode: &str, sample_rate: u32) -> (usize, usize, usize, usize) {
         let geometry = self.plugins.get(mode).and_then(|p| {
             p.frame_geometry(&ModulationConfig {
@@ -4825,9 +4824,6 @@ impl ModemEngine {
         }
     }
 
-    /// Like [`transmit`](Self::transmit) but wraps the encoded frame bytes
-    /// with Reed-Solomon FEC before modulation.
-    ///
     /// Set the station callsign used in broadcast frame headers.
     pub fn set_callsign(&mut self, callsign: impl Into<String>) {
         self.callsign = callsign.into();
@@ -4956,6 +4952,8 @@ impl ModemEngine {
         self.tx_session_log.station_id = self.callsign.clone();
     }
 
+    /// Transmit a one-to-many broadcast frame.
+    ///
     /// Unlike [`transmit`](Self::transmit), this method bypasses the CSMA
     /// persistence check — broadcasts are short, and the sender is responsible
     /// for scheduling.  No ACK is expected; no session state is updated.
@@ -5022,6 +5020,9 @@ impl ModemEngine {
         Ok(())
     }
 
+    /// Like [`transmit`](Self::transmit) but wraps the encoded frame bytes
+    /// with Reed-Solomon FEC before modulation.
+    ///
     /// On a noisy channel the receiver can use [`receive_with_fec`](Self::receive_with_fec)
     /// to correct up to **16 byte errors per 255-byte RS block** after
     /// demodulation.
@@ -6240,7 +6241,6 @@ impl ModemEngine {
         self.stage_emit_output(device, "MFSK16-ACK", &samples)
     }
 
-    /// Demodulate FSK4-ACK, ShortFecCodec decode (13 → 5 bytes), return `AckFrame`.
     /// Receive an FSK4 short-FEC ACK, re-capturing until it decodes or `timeout_ms`
     /// elapses. `0` falls back to a single immediate read
     /// ([`receive_ack_with_short_fec`](Self::receive_ack_with_short_fec)).
@@ -6266,6 +6266,7 @@ impl ModemEngine {
         }
     }
 
+    /// Demodulate FSK4-ACK, ShortFecCodec decode (13 → 5 bytes), return `AckFrame`.
     pub fn receive_ack_with_short_fec(
         &mut self,
         device: Option<&str>,
@@ -6929,15 +6930,6 @@ impl ModemEngine {
         }
     }
 
-    /// Peak normalised preamble correlation in `window`, searched around the settled correction.
-    ///
-    /// `None` when the window is too short to hold the template — not a rejection: a candidate that
-    /// has not finished buffering has not been measured, and treating "no measurement" as "no
-    /// preamble" would gate out every frame that arrives one read at a time.
-    ///
-    /// The grid step is derived from the template's own coherent bandwidth rather than fixed — see
-    /// [`Self::preamble_search_plan`], which owns that derivation and the reason it uses the
-    /// template's span rather than its sample count.
     /// Build the correlation veto for `mode`, or `None` if this mode gets the energy-only settle.
     ///
     /// Extracted so [`Self::preamble_veto_active`] can report the same answer the receive path
@@ -6994,6 +6986,15 @@ impl ModemEngine {
             .is_some()
     }
 
+    /// Peak normalised preamble correlation in `window`, searched around the settled correction.
+    ///
+    /// `None` when the window is too short to hold the template — not a rejection: a candidate that
+    /// has not finished buffering has not been measured, and treating "no measurement" as "no
+    /// preamble" would gate out every frame that arrives one read at a time.
+    ///
+    /// The grid step is derived from the template's own coherent bandwidth rather than fixed — see
+    /// [`Self::preamble_search_plan`], which owns that derivation and the reason it uses the
+    /// template's span rather than its sample count.
     fn preamble_rho(
         &self,
         veto: &PreambleVeto,
@@ -7299,9 +7300,6 @@ fn nonce_from_seq(seq: u16) -> [u8; 12] {
     n
 }
 
-/// Decode one LDPC codeword from a soft-LLR stream, trimming to the codec's own
-/// codeword length so both the rate-1/2 and high-rate (rate ≈8/9) presets share
-/// one slice rule.
 /// Hard-decide an LLR stream into bytes: negative LLR → bit 1, positive → bit 0, LSB-first per byte —
 /// the order every plugin's `demodulate_soft` emits.
 fn hard_decide(llrs: &[f32]) -> Vec<u8> {
@@ -8116,37 +8114,6 @@ mod tests {
     }
 }
 
-/// #1060: does a real receive filter lift idle-noise ρ above the shipped veto threshold?
-///
-/// **This is the measurement that decides whether there is a defect at all**, and it is the one
-/// thing in the #1062 family that simulation cannot settle. Every band-limited figure in
-/// `preamble_rho_fade_and_filter_probe.rs` uses a brick-wall FFT mask, sharper than any real
-/// filter. #1060 records the true 500 Hz value as lying between **0.196** (SSB-shaped) and
-/// **0.441** (brick-wall), against a shipped threshold of **0.40**. Where it actually falls decides
-/// whether the deployed BPSK250 veto is silently inert for narrow-filter stations *today*.
-///
-/// It lives here, as a unit test, rather than in `tests/`, for a reason worth keeping: it calls the
-/// receive path's OWN `build_preamble_veto` + `preamble_rho` — both private — instead of
-/// reimplementing the correlation. A probe that rebuilds the correlation can drift from the shipped
-/// veto without either side changing visibly, which already cost this repo an inverted conclusion
-/// when a reproduction harness carried hand-transcribed parameters. An earlier draft exported a
-/// `pub fn` accessor to keep the probe in `tests/`; the reachability ratchet correctly rejected it
-/// as public API no production code calls, and being a unit test is the fix rather than the
-/// workaround — private access is exactly what an instrument measuring internals needs.
-///
-/// # Recording the capture
-///
-/// On the rig, with **the 500 Hz receive filter engaged**, no transmission anywhere, SDR stopped:
-///
-/// ```text
-/// DURATION=45 OUT=/tmp/idle-500hz.wav scripts/onair-rx-idle-floor.sh plughw:CARD=CODEC,DEV=0
-/// OPHF_IDLE_WAV=/tmp/idle-500hz.wav cargo test -p openpulse-modem --no-default-features \
-///   idle_rho_against_the_shipped_threshold -- --ignored --nocapture
-/// ```
-///
-/// Record the filter width and rig with the number: ρ is normalised and level-insensitive, but the
-/// filter is the variable under test, and a capture whose filter setting is unrecorded measures
-/// nothing.
 /// The DDC veto arm, built and exercised through the engine's own seams.
 ///
 /// `VetoCorrelator::Ddc` is chosen whenever a template exceeds `MAX_PREAMBLE_CORRELATION_SAMPLES`,
@@ -8571,6 +8538,37 @@ mod stand_down_is_recorded_on_every_path {
     }
 }
 
+/// #1060: does a real receive filter lift idle-noise ρ above the shipped veto threshold?
+///
+/// **This is the measurement that decides whether there is a defect at all**, and it is the one
+/// thing in the #1062 family that simulation cannot settle. Every band-limited figure in
+/// `preamble_rho_fade_and_filter_probe.rs` uses a brick-wall FFT mask, sharper than any real
+/// filter. #1060 records the true 500 Hz value as lying between **0.196** (SSB-shaped) and
+/// **0.441** (brick-wall), against a shipped threshold of **0.40**. Where it actually falls decides
+/// whether the deployed BPSK250 veto is silently inert for narrow-filter stations *today*.
+///
+/// It lives here, as a unit test, rather than in `tests/`, for a reason worth keeping: it calls the
+/// receive path's OWN `build_preamble_veto` + `preamble_rho` — both private — instead of
+/// reimplementing the correlation. A probe that rebuilds the correlation can drift from the shipped
+/// veto without either side changing visibly, which already cost this repo an inverted conclusion
+/// when a reproduction harness carried hand-transcribed parameters. An earlier draft exported a
+/// `pub fn` accessor to keep the probe in `tests/`; the reachability ratchet correctly rejected it
+/// as public API no production code calls, and being a unit test is the fix rather than the
+/// workaround — private access is exactly what an instrument measuring internals needs.
+///
+/// # Recording the capture
+///
+/// On the rig, with **the 500 Hz receive filter engaged**, no transmission anywhere, SDR stopped:
+///
+/// ```text
+/// DURATION=45 OUT=/tmp/idle-500hz.wav scripts/onair-rx-idle-floor.sh plughw:CARD=CODEC,DEV=0
+/// OPHF_IDLE_WAV=/tmp/idle-500hz.wav cargo test -p openpulse-modem --no-default-features \
+///   idle_rho_against_the_shipped_threshold -- --ignored --nocapture
+/// ```
+///
+/// Record the filter width and rig with the number: ρ is normalised and level-insensitive, but the
+/// filter is the variable under test, and a capture whose filter setting is unrecorded measures
+/// nothing.
 #[cfg(test)]
 mod idle_rho_probe {
     use super::*;

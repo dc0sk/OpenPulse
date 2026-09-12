@@ -1343,25 +1343,6 @@ pub async fn run(cfg: OpenpulseConfig, modem_backend: Box<dyn AudioBackend>) -> 
     }
 }
 
-/// Receiver-led OTA send with the real-radio half-duplex PTT turnaround.
-///
-/// For each of up to `1 + MAX_RETRIES` attempts: key PTT, transmit the data frame
-/// at the current OTA mode+FEC, **release PTT**, then listen for the peer's FSK4
-/// ACK (PTT down) and adopt its absolute `recommended_level` — which steps the
-/// rate ladder. Splitting the transmit from the ACK listen (vs the bundled
-/// `transmit_arq_ota`) is what lets PTT be keyed only for the TX, so the radio can
-/// hear the ACK. PTT is a no-op on the twin rig (NoOpPtt); on a real rig this is
-/// the correct turnaround. The long phases run under `block_in_place`, which on this call site
-/// frees NOTHING: `server::run`'s future is `!Send` and is polled by `#[tokio::main]`'s `block_on`
-/// on the main thread, where `block_in_place` has no core to hand off and runs the closure inline.
-/// It is here so the call cannot panic if this code is ever polled on a worker — not to keep the
-/// runtime responsive, which it does not do. The loop is unresponsive for the frame's duration
-/// (~8.5 s at BPSK250, ~68 s at BPSK31); that is #1301, and #1264 was filed on the belief that this
-/// comment was accurate.
-/// Drain queued file-transfer fragments to the air as one PTT-keyed burst (assert → transmit all →
-/// release), so the half-duplex peer can answer. Called after every command and receive tick; a no-op
-/// when the queue is empty. On a PTT-assert failure the burst is dropped and the session's stall/retry
-/// path recovers.
 /// Upper bound on fragments per keyed burst (the plan §5.3 clamp), independent of the airtime bound.
 const MAX_FRAGS_PER_BURST: usize = 64;
 
@@ -1397,6 +1378,9 @@ fn plan_bursts(
 /// Drain the file-transfer TX queue as one or more **airtime-bounded** PTT-keyed bursts: each burst is
 /// its own assert → transmit → release cycle, sized by [`plan_bursts`] so no single keying exceeds
 /// `burst_max_secs` (keeps a large transfer under the radio's PTT watchdog and yields between bursts).
+///
+/// Called after every command and receive tick; a no-op when the queue is empty. If a burst cannot be
+/// keyed or transmitted, the rest of the taken queue is dropped this pass.
 fn drain_filexfer_tx(
     engine: &mut ModemEngine,
     ptt: &crate::ptt::SharedPtt,
@@ -1526,15 +1510,15 @@ fn build_monitor_runtime(
     rt
 }
 
-/// Startup bandplan gate for the rendezvous channel table: log a warning for any configured working
-/// frequency the default bandplan flags (out of band / wrong segment). Advisory only — the operator's
-/// channels are honoured; this surfaces a likely misconfiguration before it is used on air.
 /// Whether the WebSocket control port must be disabled because control auth is required but the WS
 /// endpoint cannot authenticate: true if the TCP port needs auth, or the WS bind is itself non-loopback.
 fn ws_disabled_for_auth(tcp_require_auth: bool, ws_bind_addr: &str) -> bool {
     tcp_require_auth || openpulse_linksec::auth_required(ws_bind_addr, false)
 }
 
+/// Startup bandplan gate for the rendezvous channel table: log a warning for any configured working
+/// frequency the default bandplan flags (out of band / wrong segment). Advisory only — the operator's
+/// channels are honoured; this surfaces a likely misconfiguration before it is used on air.
 fn validate_rendezvous_channels(cfg: &openpulse_config::OpenpulseConfig) {
     let policy = openpulse_qsy::bandplan::BandplanPolicy::default();
     for (band, freqs) in &cfg.discovery.rendezvous_channels_hz {
@@ -1925,6 +1909,21 @@ fn run_ota_retry(mut attempt: impl FnMut() -> Option<OtaAttempt>) -> OtaSendStop
     OtaSendStop::RetriesExhausted
 }
 
+/// Receiver-led OTA send with the real-radio half-duplex PTT turnaround.
+///
+/// For each of up to `1 + MAX_RETRIES` attempts: key PTT, transmit the data frame
+/// at the current OTA mode+FEC, **release PTT**, then listen for the peer's FSK4
+/// ACK (PTT down) and adopt its absolute `recommended_level` — which steps the
+/// rate ladder. Splitting the transmit from the ACK listen (vs the bundled
+/// `transmit_arq_ota`) is what lets PTT be keyed only for the TX, so the radio can
+/// hear the ACK. PTT is a no-op on the twin rig (NoOpPtt); on a real rig this is
+/// the correct turnaround. The long phases run under `block_in_place`, which on this call site
+/// frees NOTHING: `server::run`'s future is `!Send` and is polled by `#[tokio::main]`'s `block_on`
+/// on the main thread, where `block_in_place` has no core to hand off and runs the closure inline.
+/// It is here so the call cannot panic if this code is ever polled on a worker — not to keep the
+/// runtime responsive, which it does not do. The loop is unresponsive for the frame's duration
+/// (~8.5 s at BPSK250, ~68 s at BPSK31); that is #1301, and #1264 was filed on the belief that this
+/// comment was accurate.
 fn ota_send_with_ptt(
     engine: &mut ModemEngine,
     ptt: &crate::ptt::SharedPtt,
@@ -2049,15 +2048,6 @@ fn ota_send_with_ptt(
     }
 }
 
-/// Select an audio backend based on the config string.
-///
-/// `"cpal"` and `"default"` use [`CpalBackend`] when the `cpal` feature is compiled in.
-/// All other values (and `"cpal"`/`"default"` without the feature) fall back to
-/// [`LoopbackBackend`].  Production builds should be compiled with `--features cpal`.
-/// Load the control-channel PSK from `OPENPULSE_CONTROL_PSK` (64 hex chars = 32 bytes).
-///
-/// This is the initial, testable source; keystore-backed loading (`openpulse-keystore`) is the
-/// production follow-up. Returns `Ok(None)` when the variable is unset.
 /// The startup warning owed to an operator who set `psk_key_id`, or `None` if they did not.
 ///
 /// `psk_key_id` is deserialized, defaulted, and written into the shipped config template — and
@@ -2078,6 +2068,10 @@ fn inert_psk_key_id_warning(cfg: &ControlSecurityConfig) -> Option<String> {
     ))
 }
 
+/// Load the control-channel PSK from `OPENPULSE_CONTROL_PSK` (64 hex chars = 32 bytes).
+///
+/// This is the initial, testable source; keystore-backed loading (`openpulse-keystore`) is the
+/// production follow-up. Returns `Ok(None)` when the variable is unset.
 fn load_control_psk() -> Result<Option<[u8; openpulse_linksec::PSK_LEN]>, String> {
     let hex = match std::env::var("OPENPULSE_CONTROL_PSK") {
         Ok(h) => h,
@@ -2098,6 +2092,11 @@ fn load_control_psk() -> Result<Option<[u8; openpulse_linksec::PSK_LEN]>, String
     Ok(Some(out))
 }
 
+/// Select an audio backend based on the config string.
+///
+/// `"cpal"` and `"default"` use [`CpalBackend`] when the `cpal` feature is compiled in.
+/// All other values (and `"cpal"`/`"default"` without the feature) fall back to
+/// [`LoopbackBackend`].  Production builds should be compiled with `--features cpal`.
 pub fn build_audio_backend(backend: &str) -> Box<dyn AudioBackend> {
     #[cfg(feature = "cpal")]
     {
@@ -2216,15 +2215,6 @@ fn front_end_state(
     }
 }
 
-/// Why `[radio.rig_b]` cannot drive a second transmitter, or `None` if it can (#1260).
-///
-/// Both `RigConfig::default()` and `RadioConfig::default()` carry `rigctld_addr = "127.0.0.1:4532"`,
-/// and `rig_b` is `#[serde(default)]`. So an operator who writes a `[radio.rig_b]` header without an
-/// address — or leaves the config template's commented-out line commented — gets rig_b pointed at
-/// the SAME rigctld as the main rig. Two `SharedPtt`s would then each be certain they own one
-/// transmitter: the daemon's guard drop sends `T 0` under the repeater's frame and vice versa, and
-/// neither watchdog can see the other's key. #1263's refusal rule protects only *within* one
-/// `SharedPtt`, so it cannot reach this — the construction site has to.
 /// Why `[repeater] tx_device` cannot be used, or `None` when it is fine.
 ///
 /// One sound card cannot carry two capture streams (#1007), and rig_b's engine captures as well as
@@ -2246,6 +2236,15 @@ fn repeater_tx_device_config_error(tx_device: &str, audio_device: &str) -> Optio
     ))
 }
 
+/// Why `[radio.rig_b]` cannot drive a second transmitter, or `None` if it can (#1260).
+///
+/// Both `RigConfig::default()` and `RadioConfig::default()` carry `rigctld_addr = "127.0.0.1:4532"`,
+/// and `rig_b` is `#[serde(default)]`. So an operator who writes a `[radio.rig_b]` header without an
+/// address — or leaves the config template's commented-out line commented — gets rig_b pointed at
+/// the SAME rigctld as the main rig. Two `SharedPtt`s would then each be certain they own one
+/// transmitter: the daemon's guard drop sends `T 0` under the repeater's frame and vice versa, and
+/// neither watchdog can see the other's key. #1263's refusal rule protects only *within* one
+/// `SharedPtt`, so it cannot reach this — the construction site has to.
 fn repeater_rig_b_config_error(
     rig_b_backend: &str,
     rig_b_addr: &str,

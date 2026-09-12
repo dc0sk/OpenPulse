@@ -9,6 +9,109 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-11 — docs re-homed by an edit are moved back to their items (#1345)
+
+- **Requirement/change:** #1345. An edit can move a doc onto the wrong item without touching the doc,
+  because rustdoc attaches every consecutive outer doc line to the next item. Three acts do it:
+  - an item, or its doc, inserted directly under another item's `///`;
+  - an item inserted on top of another item's summary line;
+  - an item or struct field deleted from under its own doc.
+
+  The contiguous forms are invisible to the gate: `GATE: PASS` on `9e2af985` had them present. No
+  requirement is affected; the defect is misattributed documentation. Examples:
+  - `panic_message`'s rustdoc opened with `spawn_repeater`'s summary;
+  - `ModemEngine` had no doc, while `ScanPlanner`'s began "The modem engine.";
+  - three structs carried the doc of a `dst_station` field that #1191 deleted.
+
+- **Design decision:** documentation only. Every attribute keeps the item it binds to today, so no
+  target compiles differently. This entry repairs **29** of the 30 live census hits, plus the lost
+  summaries and the deletion orphans below; the 30th hit, `set_tx_attenuation_db`, was never a merge. An orphaned doc goes back above its own item, ahead of that item's
+  attributes. Exceptions:
+  - **Superseded, so deleted:** `create_pq_conreq`'s doc from `9a038651`, superseded by #1147's;
+    `decode_ldpc_llrs`' one-codeword doc from `d708f853`; and the summary of `drain_filexfer_tx`'s
+    pre-#743 doc. That summary said "the burst is dropped", which was no longer accurate, because a
+    failure drops the rest of the queue. Its two still-true sentences (when it is called, and what
+    a failure drops) are kept, corrected.
+  - **Kept, reworded:** `create_pq_conack`'s old doc, orphaned over `PqConAckParams`, keeps its
+    still-true clause ("Encapsulates the KEM key from `req_kem_ek`").
+  - **Split, so rejoined:** `transmit_with_fec`'s head sentence, above its own tail.
+  - **Appended as extra paragraphs:** `transmit_handshake_frame`'s #1147 note.
+  - **Folded in:** `BURST_MIN_CAP_SAMPLES` gets its runaway-floor history as part of its own doc.
+  - **Written as the wrong comment form:** the radio crate's opening `///` (from `6312d3e8`, #129)
+    becomes `//!`.
+
+  **Summary lines lost to an edit are restored verbatim:**
+  - `apply_command_to_engine`, removed by `c03817dd` and restored from `e496fe26`;
+  - `broadcast`, removed by `19b5a986`;
+  - `differential_decode`, whose summary line `391bf87f` deleted, together with the blank line above
+    it; restored from `355b198c`.
+
+  **Docs a deletion left behind are removed:**
+  - scfdma's `combine_llrs_weighted` doc (the function moved to core in `dda5bbe8`);
+  - the `dst_station` field docs that #1191 (`eb662cdd`) left in the classical CONACK, in
+    `PqConAck` and in `PqConAckParams`.
+
+  **Never a merge:** `set_tx_attenuation_db` (`engine.rs`). `19b5a986` rewrote a doc block in place,
+  and under `-U0` the appended lines read as a pure insertion under a `///`, so the detector recorded
+  them. The item's doc is its own. What that commit did overwrite was `broadcast`'s summary, restored
+  above. This is a detector false-positive class that #1345 did not list: a modified doc block, not
+  only `//!`.
+
+  **Excluded:** `tone_reservation` (`ofdm_sim.rs`). Its doc has begun with a blank `///` since it was
+  introduced in `391bf87f`, so no summary was ever lost; it is not this shape.
+
+  **Found and not changed: attribute re-homing.** On `9341f110`:
+  - `apply_command_to_engine` has no `#[cfg(not(target_arch = "wasm32"))]`. The attribute under its
+    doc heads `qsy_wire_magic`, detached in `3a571769`.
+  - `ClientWriter` carries the cfg that was `handle_client`'s (`6139037b`).
+  - The cfg above `now_ms` sat under `transmit_handshake_frame`'s old doc.
+  - `sar_segment_id` carries the cfg twice.
+
+  **Consequence for a wasm32 build: it cannot compile today.** The daemon library would fail on
+  wasm32 as it stands, because `apply_command_to_engine` is no longer gated but takes
+  `&mut RuntimeControlState`, and that type is gated (`lib.rs:200`). The manifest says otherwise at
+  line 50: "compiles for all targets including WASM". Nothing builds wasm32 today:
+  `git grep -l wasm32 -- scripts .github docs` on `9341f110` finds 3 files, and none invokes a build.
+  As a control, the same command for `aarch64` finds 10 files and 34 lines, including 5
+  `--target aarch64` invocations.
+
+  Whether the crate compiled for wasm32 before `3a571769` is UNVERIFIED: this host has no wasm32
+  standard library. Moving attributes changes compilation, so it does not belong in a docs repair;
+  it is reported on #1345.
+
+- **Implementation:** the moves, deletions and restorations are in:
+  - `crates/openpulse-core/src/handshake.rs` and `crates/openpulse-core/src/pq_handshake.rs`;
+  - `crates/openpulse-daemon/src/lib.rs` and `crates/openpulse-daemon/src/server.rs`;
+  - `crates/openpulse-discovery/src/runtime.rs` and `crates/openpulse-filexfer/src/receiver.rs`;
+  - `crates/openpulse-modem/src/engine.rs` and
+    `crates/openpulse-modem/tests/preamble_rho_fade_and_filter_probe.rs`;
+  - `crates/openpulse-radio/src/lib.rs`, `plugins/bpsk/src/demodulate.rs` and
+    `plugins/scfdma/src/demodulate.rs`.
+
+  Each edit is guarded by an assertion on the exact text it replaces, and all guards are checked
+  before any file is written.
+
+- **Tests:** none added. A diff-time check that stops these shapes recurring is designed separately; its design has been through two rounds of design review, and it ships in its own PR. Verification:
+  - **Census.** The census of the 34 known insertion pairs, locating each by its inserted line, gives
+    30 live on `9341f110` and 2 on the repaired tree. Neither is a merge:
+    - `set_tx_attenuation_db` is covered above.
+    - `try_reassemble_handshake`'s doc sits correctly above its own `#[cfg]` and function; the
+      census's attribute-first branch cannot tell that shape from a merge.
+    - The issue's scripts report 33 pairs and 29 live, because their record parser accepts only
+      single-quoted doc lines. It drops the one record that `repr` double-quoted: `54552936`,
+      `ota_send_with_ptt`'s doc, which is repaired here.
+  - **Shapes the census cannot see.** The lost summaries and the deletions were located by the design review of the check and confirmed against history.
+  - **Doc-only, checked mechanically.** Per file, the sequence of non-doc, non-blank lines is
+    identical before and after.
+  - **Formatting:** `cargo fmt --check` is clean.
+
+- **Test results:** `scripts/gate.sh` on `8c2334c2`, stamp `20260911T181533Z`: **PASS**, tree clean,
+  332 suites, **2538 passed, 0 failed**, `cargo test --workspace --no-default-features --no-fail-fast`,
+  toolchain `rustc 1.98.0 (88d9e12ae 2026-08-18)`. Quoted from `target/gate-verdict.json`, which that run
+  wrote itself: the stdout `GATE:` line was lost when `/tmp` was cleared between sessions, and a
+  reconstructed one would not be a line any run printed. The delta from `8c2334c2` to this entry's commit
+  is docs-only.
+
 ## 2026-09-11 — the correlation veto's stand-down is recorded on the daemon path too (#1342)
 
 - **Requirement/change:** REQ-RX-03 (CAP-76). #1157 specified the veto's stand-down as "latched with
