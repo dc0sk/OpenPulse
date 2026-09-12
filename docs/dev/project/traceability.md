@@ -9,6 +9,27 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-12 — both held-out acceptance suites re-proven at `8837af80`
+
+- **Requirement/change:** REQ-QRM-01 and CAP-33 are the two acceptance suites `scripts/gate.sh` does
+  NOT run — held out since #1274 for runtime, ~83 min between them. A green gate therefore says nothing
+  about either, which `CLAUDE.md` states in both rows. Neither had been run at the current `main`.
+
+- **Design decision:** none. This is `scripts/slow-tests.sh` run verbatim and its output recorded, so
+  the two rows have dated evidence again.
+
+- **Implementation:** none — no file changed to produce this entry.
+
+- **Tests:** `scripts/slow-tests.sh notch` and `scripts/slow-tests.sh ota`, both on `8837af80` with a
+  clean tree, bounded to `CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4`.
+
+- **Test results:** both **PASS**.
+  - `notch_rescues_interferer` (REQ-QRM-01): 3 passed, 0 failed, 0 ignored, **1640.79 s**.
+  - `ota_channel_adaptation` (CAP-33): 3 passed, 0 failed, 0 ignored, **2255.74 s**.
+
+  Each run printed `SLOW-TESTS: PASS`. Note what this does not cover: the runs predate this branch's
+  own commits, which are frontmatter and ledger text only and touch no code either suite exercises.
+
 ## 2026-09-12 — the doc-frontmatter check had been failing since the day after its baseline
 
 - **Requirement/change:** `scripts/validate-doc-frontmatter.sh` exits 1. It is grandfathered — the
