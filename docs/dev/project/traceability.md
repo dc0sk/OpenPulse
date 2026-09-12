@@ -39,6 +39,70 @@ and the actually-observed results per change.
   skips it by that name, and a rename would have silently swept an assertion-free harness into the
   REQ-QRM-01 verdict. Grep for a bare `#[ignore]` across `crates plugins apps tools` → 0 (the same
   grep found 9 before the change).
+## 2026-09-12 — the binary-handshake design said "not yet implemented" about shipped work (#1147)
+
+- **Requirement/change:** `docs/dev/design/handshake-binary-encoding.md` carried
+  `status: approved-plan (design reviewed 2026-08-21; not yet implemented)` — an illegal value for the
+  frontmatter check AND false, since #1189 shipped it on 2026-08-23. It was the single remaining new
+  offender after #1350, split out because `docs/dev/design/**` is a decision site and the fix needed
+  adversarial review. The review then found the interesting half: the doc was overtaken in five
+  particulars, and the doc sweep it prescribed for itself was never finished.
+
+- **Design decision:** mark it `resolved` and add an **outcome note** rather than editing the design
+  field-for-field. A design doc is a record of what was decided; rewriting it to match what shipped
+  destroys the evidence of the decision. The note states where the spec and this doc disagree and
+  says the spec wins. The `file:line` anchors are explicitly declared as pre-`114f8e5d` — 24 unique
+  anchors, of which the spot-checked ones do not resolve, and re-pointing them would fake navigation
+  into v1 code that no longer exists.
+
+- **Implementation:** `docs/dev/design/handshake-binary-encoding.md` (status, `last_updated`, the
+  outcome note, finding F-1147-10). Plus the sweep the design promised and never ran:
+  `docs/dev/design/architecture.md` (three "canonical JSON" claims and the ≈6 700 B/27-fragment PQ
+  figure), `docs/openpulse-book.md` (§1.7's "canonical-JSON bodies" and all of §2B.7.3, which still
+  described PQ frames as JSON at ≈18 000 B / 72 fragments with randomised signing),
+  `docs/features.md` (241/244 → 236/237 B), `README.md` (two claims that compression is negotiated
+  in ConReq/ConAck, removed in #1166), and `docs/dev/design/protocol-wire-spec.md`, which
+  contradicted itself three ways: §3's prose said "version 0x01 is rejected outright" and its
+  container diagram said `0x02`, both against §3.2a's freeze at `0x01`, and its caps table still
+  capped `session_id` at 24 B where the field table below says `u64`. Same class in code comments:
+  `handshake_wire.rs`'s header still said "No domain-separation tags" (#1193 corrected four docs and
+  missed it — and kept the argument #1193 refuted), four "(cap 12)" doc comments where the cap is 18,
+  and two daemon comments carrying "241/244 B" and "a v2 CONREQ is 241 B". Every `.rs` edit here is
+  comment-only; no cargo target was built for this change.
+
+- **Tests:** `python3 scripts/lib/docfront.py`; `scripts/check-ledger-order.sh`; the claims in the
+  outcome note re-derived from the tree rather than from the review.
+
+- **Test results:** `DOCFRONT: PASS — 169 docs, 71 offenses (0 new, 71 grandfathered)`; before this
+  change it was `FAIL — NEW frontmatter offenses (1)`, so the ratchet is clean for the first time
+  since the baseline. `LEDGER-ORDER: PASS`. Verified in-tree, not taken on the review's word: the
+  maximal frames are **236/237 B** (`handshake_wire.rs` asserts both, with the message "do not adjust
+  this number to match"); `verify_conreq`/`verify_conack` take frame **bytes**; the PQ CONREQ is
+  pinned at **5 049 B** with a SHA-256, next to an assertion that ML-DSA signing is deterministic in
+  this build; `grep -c pq_pubkey crates/openpulse-core/src/trust.rs` → 0, so F-1147-06 is still
+  deferred.
+
+- **What the write-up review caught, after the conclusions had already been cleared:** the sweep was
+  **partial and presented as complete**. It stopped one section short in three of the files it
+  touched — the wire spec's own container diagram still said `0x02` eleven lines above the paragraph
+  I had rewritten to reconcile the version story; the book's §2B.3.1, its primary handshake section,
+  still carried the v1 diagram (`JSON body`, `4 B BE u32`), "any version other than `0x02`" and
+  241/244; and `architecture.md`'s compression section still opened "compression is negotiated during
+  the HPX handshake" two lines above the bullet I had edited. Four more claims were wrong as written,
+  two of them in the outcome-note text the reviewer itself supplied: #1189 does not close #1178 (it
+  lands the addressing; that issue closed 2026-09-01), and "false at merge … three hours earlier"
+  compared the wrong pair of commits. My own two: attributing the ≈6 700 B figure to the JSON
+  encoding (it matched neither — the measured JSON was ≈18 000 B), and a README claim that Zstd is
+  "selected locally" when it has **no** production selector at all. Also swept as a result:
+  `references.md` (finished on 08-23 and re-staled on 08-26 by #1204),
+  `docs/dev/project/traceability-matrix.md` CAP-01, and the book's §2B.7.2 claim that the PQ path
+  "adds a check the classical path lacks" — false since #1147 added `UnofferedSigningMode`.
+
+- **Correction to my own framing:** I opened the review claiming the version byte "stayed 0x01 rather
+  than the designed 0x02" under a "#1191 ruling". Both halves were wrong. #1189 shipped `0x02` **as
+  designed**; `eb662cdd` (PR #1204) **reset** it to `0x01`. And #1191 is the issue — the ruling is in
+  the PR. Met and then superseded by a documented decision is a different sentence from unmet, and
+  the note says the former.
 
 ## 2026-09-12 — the ledger-order self-test had stopped discriminating (and said so backwards)
 

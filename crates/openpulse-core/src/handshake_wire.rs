@@ -6,10 +6,18 @@
 //! v1 signed `serde_json::to_vec` of the body in serde declaration order with no key sorting, while
 //! the wire spec claimed keys were "sorted recursively": canonical was a label, not a property.
 //!
-//! No domain-separation tags. The obvious ones (`OPHF-CONREQ-v2`) begin with `OPHF`, the magic of
-//! `WireEnvelope`, which the SAME station key already signs — separation by whichever byte differs
-//! first, which is the property tags exist to remove. Signing the transmitted prefix separates by
-//! the magic itself (already unique per frame type) and binds the VERSION, which v1 did not do.
+//! The frame's own magic IS the domain. Since #1193 it is the REGISTERED tag —
+//! `SigningDomain::{ConReq, ConAck, PqConReq, PqConAck}` map to `HSCQ`/`HSAK`/`HPCQ`/`HPAK` —
+//! `sign_in_band` refuses a message that does not begin with it, and a raw Ed25519 call outside
+//! `signing.rs` fails the clippy wall. Signing the transmitted prefix also binds the VERSION, which
+//! v1 did not do. The ML-DSA signature in `pq_handshake.rs` signs the same prefix under a scoped
+//! `#[allow(clippy::disallowed_methods)]` and is OUTSIDE that wall, so on the PQ path the registry
+//! binds only the optional Ed25519 co-signature.
+//!
+//! This header used to argue that no tag was needed because a tag would separate "by whichever byte
+//! differs first, which is the property tags exist to remove". #1193 refuted that — ALL prefix
+//! separation is byte-differs-first; what a tag buys is guaranteed distinctness — and corrected the
+//! claim in four docs while missing this header.
 
 use crate::error::ModemError;
 
@@ -67,8 +75,8 @@ pub const FRAGMENT_CAPACITY: usize = 251;
 /// rather than of one example: `u8`-prefixed strings would otherwise admit a legal 300 B CONREQ.
 ///
 /// **A cap must be justified against the GENERATOR, not against an example.** `SESSION_ID` used to
-/// live here at 24 bytes, sized from a 6-character callsign — while `STATION_ID` allows 12. The
-/// daemon builds `"{callsign}-{unix_ms}"`, so an 11-character callsign (`3DA0/DL1ABC`, entirely
+/// live here at 24 bytes, sized from a 6-character callsign — while `STATION_ID` then allowed 12
+/// (18 since #1204). The daemon builds `"{callsign}-{unix_ms}"`, so an 11-character callsign (`3DA0/DL1ABC`, entirely
 /// legal) produced a 25-byte id, `ConReq::create` failed, and the daemon logged a warning and
 /// **carried on with no signed handshake** — a silent downgrade to unverified. The two rows
 /// contradicted each other adjacently in the design's own table. `session_id` is now a fixed `u64`,

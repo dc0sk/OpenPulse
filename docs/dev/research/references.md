@@ -373,10 +373,12 @@ proof carrying the identity signature over `(link_id, LKr)`); link keepalive 20 
 **Our numbers (measured 2026-08-10 at HEAD, scratch harness against `openpulse-core`).**
 
 > **SUPERSEDED for the classical frames 2026-08-23 by #1147 — kept because they are the MOTIVATION,
-> not an error.** The JSON handshake below is gone: a v2 CONREQ is **241 B** and a CONACK **244 B**,
+> not an error.** (Figures corrected 2026-09-12: this note was written on 08-23 and re-staled on
+> 08-26 by #1204, which raised the callsign cap to 18 and took `dst_station` off the CONACK.)
+> The JSON handshake below is gone: a v2 CONREQ is **236 B** and a CONACK **237 B**,
 > both inside one 251 B SAR fragment, so a handshake is one acquisition rather than three.
 > The estimate in the very next paragraph — "~200–250 B a binary layout of the same fields would
-> need" — was **right**: the built layout is 241 B, inside the predicted range. The 3.4× JSON
+> need" — was **right**: the built layout is 236 B, inside the predicted range. The 3.4× JSON
 > inflation identified here was the whole defect, and removing it recovered what this analysis said
 > it would.
 >

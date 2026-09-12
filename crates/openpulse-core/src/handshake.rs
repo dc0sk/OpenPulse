@@ -141,7 +141,7 @@ impl TrustStore for InMemoryTrustStore {
 /// Everything a CONREQ carries, so the constructor does not take eleven positional arguments.
 #[derive(Debug, Clone)]
 pub struct ConReqParams<'a> {
-    /// This station's callsign (cap 12).
+    /// This station's callsign (cap 18).
     pub station_id: &'a str,
     /// Who the request is addressed to; `"*"` is the explicit wildcard (#1178).
     ///
@@ -338,7 +338,7 @@ impl ConReq {
 /// Parameters for a CONACK.
 #[derive(Debug, Clone)]
 pub struct ConAckParams<'a> {
-    /// Responder callsign (cap 12).
+    /// Responder callsign (cap 18).
     pub station_id: &'a str,
     /// The mode chosen from those the CONREQ offered.
     pub selected_mode: SigningMode,

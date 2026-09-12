@@ -1836,7 +1836,7 @@ pub(crate) fn keyed_transmit<T>(
 ///
 /// The receiver reassembles in [`try_reassemble_handshake`].
 ///
-/// Since #1147 a classical CONREQ/CONACK is ONE fragment (241/244 B against 251 B), so this is a
+/// Since #1147 a classical CONREQ/CONACK is ONE fragment (236/237 B against 251 B), so this is a
 /// single frame in practice — the path stays SAR-based because the PQ frames (~5 kB) still need it,
 /// and because "one fragment" is a property of the caps rather than something this function should
 /// assume.
@@ -6979,7 +6979,7 @@ mod handshake_rf_tests {
     /// A CONREQ survives a real BPSK250 round trip — as ONE fragment.
     ///
     /// This asserted a full 255-byte fragment, because a v1 CONREQ was large enough that its first
-    /// fragment was always maximal. A v2 CONREQ is 241 B, so it is one sub-maximal fragment. Both
+    /// fragment was always maximal. A v2 CONREQ is 236 B, so it is one sub-maximal fragment. Both
     /// facts are asserted: the single-fragment property (the #1147 win) and that the frame actually
     /// crosses the modem, which is the thing the test was for.
     #[test]

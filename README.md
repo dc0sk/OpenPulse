@@ -91,7 +91,7 @@ Capabilities that are firsts or near-firsts among open-source amateur digital-mo
 | 5 | **LLR-accumulating Memory-ARQ** | Soft LLR values accumulated across retransmissions (PACTOR-style, `SoftCombiner` in `crates/openpulse-core/src/fec.rs`); HARQ retry/mode policy on sustained NACK (`crates/openpulse-modem/src/harq.rs`, `rate_policy.rs`) |
 | 6 | **GPU DSP across 5 modulation families** | 6 wgpu WGSL kernels (BPSK modulate/demodulate, timing search, RRC FIR, 256-pt FFT, soft demod) accelerating BPSK, QPSK, 8PSK, 64QAM, and SC-FDMA, each with CPU fallback — see [GPU-accelerated features](#gpu-accelerated-features) |
 | 7 | **Ed25519-signed QSY frequency agility** (verified against the handshake peer since #1252) | Full initiator + responder state machines wired into the daemon; SNR-ranked channel-list negotiation; rig CAT via rigctld (`crates/openpulse-qsy`) |
-| 8 | **Zstd pre-trained compression dictionary** | Dictionary trained on amateur/Winlink traffic patterns; negotiated at session setup and covered by handshake signature (`crates/openpulse-core/src/compression.rs`) |
+| 8 | **Zstd pre-trained compression dictionary** | Dictionary trained on amateur/Winlink traffic patterns; codec in `crates/openpulse-core/src/compression.rs`, exercised by the testmatrix/linksim harnesses — **not** negotiated in the handshake, whose negotiation fields were removed in #1166 because nothing consumed them |
 | 9 | **Trust-weighted multi-hop relay with query propagation** | `RelayForwarder` enforces hop limits and suppresses duplicates; `score_route` weights paths by trust level (Verified=4 … Reduced=1); `QueryForwarder` propagates route-discovery requests across nodes (`crates/openpulse-core/src/relay.rs`, `query_propagation.rs`) |
 | 10 | **Cross-band full-duplex repeater** | `CrossBandRepeater` runs in a daemon-managed thread; `EnableRepeater`/`DisableRepeater` control commands; trust-policy filtering on forwarded frames (`crates/openpulse-repeater`) |
 | 11 | **Mesh broadcast daemon with authenticated beacons** | TTL-limited re-broadcast; (session_id, nonce) duplicate suppression; beacon payloads carry signed peer descriptors where the peer ID *is* the Ed25519 verifying key (`crates/openpulse-mesh`) |
@@ -183,7 +183,7 @@ The mode/FEC selection ladder and which combinations are usable on HF is documen
 
 | Algorithm | Layer | Direction | Notes |
 |---|---|---|---|
-| **LZ4** | Session (in-band) | Both | `lz4_flex`; transparent negotiation in ConReq/ConAck; fast, good for structured text |
+| **LZ4** | Session (in-band) | Both | `lz4_flex`; applied above FEC, not negotiated in the handshake (#1166); fast, good for structured text |
 | **Zstd + HPX dictionary** | Session (in-band) | Both | Pre-trained dictionary on amateur/Winlink traffic; best compression ratio |
 | **None** | Session (in-band) | Both | Binary payloads that are already compressed |
 | **Gzip** | B2F wire (Type D) | Both | `flate2`; Winlink Type D proposal |

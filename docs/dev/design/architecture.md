@@ -339,7 +339,7 @@ For HPX, keep signal path adaptation logic and trust/signature logic as separate
 
 `PeerDescriptor` (`openpulse-core::peer_descriptor`) is a signed identity advertisement that a peer broadcasts during discovery.  The `peer_id` field IS the Ed25519 verifying-key bytes, so the descriptor is self-authenticating: `verify_peer_descriptor()` takes only the descriptor itself and performs no external key lookup.
 
-Signed fields: `peer_id`, `callsign`, `capability_mask`, `timestamp_ms`.  Signature is Ed25519 over canonical JSON of these fields (same pattern as CONREQ/CONACK/TransferManifest).
+Signed fields: `peer_id`, `callsign`, `capability_mask`, `timestamp_ms`.  Signature is Ed25519 over canonical JSON of these fields (same pattern as the file-transfer `TransferManifest`; the handshake frames moved to signing their transmitted bytes in #1147).
 
 ### PeerCache query API
 
@@ -447,14 +447,13 @@ On success: clones envelope with `hop_index += 1`; caller broadcasts to neighbou
 
 ## Session-layer compression (Phase 2.7)
 
-Payload compression is negotiated during the HPX handshake and applied above the FEC/modulation layer.
+Payload compression is applied above the FEC/modulation layer. It is **not** negotiated in the handshake — those fields were removed in #1166 because nothing consumed them (see *Negotiation* below).
 
 - **Algorithm**: LZ4 block format with a 4-byte little-endian decompressed-size prefix (`lz4_flex::compress_prepend_size` / `decompress_size_prepended`; pure Rust, no C bindings). This is **not** the standard LZ4 frame container format and is not interoperable with LZ4 frame readers. Chosen for speed and determinism on embedded targets.
 - **Negotiation**: none. **Removed in #1166** (the #1147 wire-format break): nothing consumed the selection — the daemon sent the lists empty and hardcoded `None`/`None` — so the field was a capability claim the station could not back. Session compression itself is unchanged; only the *handshake negotiation of it* is gone. The signing-mode analogue of that check does exist and was *added* in the same change (`HandshakeError::UnofferedSigningMode`).
 - **Compress-then-compare**: `compress_if_smaller(payload)` tries LZ4; if the compressed form is not smaller the original bytes and `CompressionAlgorithm::None` are returned. This prevents length inflation on already-compressed or short payloads.
 - **Decompression size guard**: before allocating, `decompress` reads the size prefix and rejects inputs whose claimed decompressed size exceeds `MAX_DECOMPRESSED_SIZE` (64 005 bytes, matching the SAR max-segment limit) to prevent OOM on malicious frames.
 - **Decompression error**: treated as a frame error; the frame is discarded at the session layer.
-- Both compression fields are included in the canonical JSON signed during handshake, so field injection after signing is detectable.
 
 ## Post-quantum in-band handshake (Phase 3.1)
 
@@ -472,13 +471,13 @@ Payload compression is negotiated during the HPX handshake and applied above the
 | `Pq` | ML-DSA-44 only | 4 |
 | `Hybrid` | Ed25519 + ML-DSA-44 | 5 (highest) |
 
-Canonical body for signing is the JSON of all frame fields excluding `classical_signature` and `pq_signature`, matching the pattern used in the classical `ConReq`/`ConAck` frames.
+The signed body is the **transmitted binary prefix** — `magic || version || length || body` — with the signatures trailing and unsigned, matching the classical `ConReq`/`ConAck` frames since #1147. There is no second representation to sign, so verification hashes what was received. (Before #1147 this was canonical JSON, which was a label rather than a property: the encoder emitted serde declaration order and sorted nothing.)
 
 ### SAR transport
 
-Post-quantum key material exceeds a single 255-byte frame.  `encode_pq_conreq` / `encode_pq_conack` serialize to JSON; the caller passes the bytes to `sar_encode` which fragments across up to 255 frames (max 64 005 bytes).  `SarReassembler` collects fragments and delivers the reassembled blob to `decode_pq_conreq` / `decode_pq_conack`.
+Post-quantum key material exceeds a single 255-byte frame.  `encode_pq_conreq` / `encode_pq_conack` emit the binary format (#1147); the caller passes the bytes to `sar_encode` which fragments across up to 255 frames (max 64 005 bytes).  `SarReassembler` collects fragments and delivers the reassembled blob to `decode_pq_conreq` / `decode_pq_conack`.
 
-Typical encoded `PqConReq` size: ≈ 6 700 bytes (27 SAR fragments at 251 bytes/fragment).
+Encoded `PqConReq` size: **5 049 bytes** (21 SAR fragments at 251 bytes/fragment), pinned as a known-answer vector in `crates/openpulse-core/tests/handshake_kat.rs`. The ≈ 6 700 B / 27-fragment figure this replaces was an estimate that matched neither the JSON encoding as measured (≈ 18 000 B) nor the binary one.
 
 ### Key exchange flow
 
