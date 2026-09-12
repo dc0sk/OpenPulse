@@ -24,7 +24,8 @@ and the actually-observed results per change.
   - three structs carried the doc of a `dst_station` field that #1191 deleted.
 
 - **Design decision:** documentation only. Every attribute keeps the item it binds to today, so no
-  target compiles differently. An orphaned doc goes back above its own item, ahead of that item's
+  target compiles differently. This entry repairs **29** of the 30 live census hits, plus the lost
+  summaries and the deletion orphans below; the 30th hit, `set_tx_attenuation_db`, was never a merge. An orphaned doc goes back above its own item, ahead of that item's
   attributes. Exceptions:
   - **Superseded, so deleted:** `create_pq_conreq`'s doc from `9a038651`, superseded by #1147's;
     `decode_ldpc_llrs`' one-codeword doc from `d708f853`; and the summary of `drain_filexfer_tx`'s
