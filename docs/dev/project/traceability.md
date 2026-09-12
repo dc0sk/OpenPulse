@@ -9,6 +9,32 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-12 — the ledger-order self-test had stopped discriminating (and said so backwards)
+
+- **Requirement/change:** `scripts/check-ledger-order.sh --self-test` reported
+  `FAIL — a swapped pair was ACCEPTED; the check cannot detect disorder`. The checker was fine. Its
+  probe 1 swapped the REAL ledger's first two entries and required a rejection, which only plants a
+  defect while those two entries carry DIFFERENT dates. Three entries landed on 2026-09-12, so the
+  swap left the sequence non-increasing, the check correctly passed, and the probe reported that the
+  checker was broken. A false alarm from a checker-of-the-checker is worse than none: it teaches the
+  reader to ignore the one probe that guards a gate step `scripts/gate.sh` runs on every branch.
+
+- **Design decision:** make the planted defect independent of the file under test. Probe 1 is now a
+  synthetic two-entry fixture in the wrong order, which must be rejected, and a new probe 1b feeds the
+  same two entries in the right order and requires acceptance — so probe 1 cannot pass by rejecting
+  everything. The checker itself is unchanged.
+
+- **Implementation:** `scripts/check-ledger-order.sh`, the `--self-test` block only.
+
+- **Tests:** `--self-test`, and a sabotage of the checker it guards.
+
+- **Test results:** repaired `--self-test` → **PASS** (out-of-order pair rejected, ordered pair
+  accepted, dateless heading rejected, real ledger accepted). With the ordering comparison neutered
+  (`entries[i][1] > entries[i-1][1]` → `False`), `--self-test` → **FAIL**, naming the out-of-order
+  probe — so the fixture discriminates. The neutered file was restored from a backup and verified
+  sha256-identical to the pre-sabotage file (`diff` and `cmp` are absent on this host and exit 0).
+  `scripts/check-ledger-order.sh` on the real ledger → `LEDGER-ORDER: PASS`.
+
 ## 2026-09-12 — both held-out acceptance suites re-proven at `8837af80`
 
 - **Requirement/change:** REQ-QRM-01 and CAP-33 are the two acceptance suites `scripts/gate.sh` does
