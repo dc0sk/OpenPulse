@@ -57,6 +57,19 @@ done <<< "$changed"
 
 pkgs="$(printf '%s\n' $pkgs | sort -u | tr '\n' ' ')"
 
+# Re-homed doc / attribute lint (#1345). This hook is the only check that runs on EVERY push (#1144),
+# and the lint takes under a second. It lints what this push adds (the upstream, else origin/main);
+# the script prints the range, so an empty one is visible. It exits 2 on an unresolvable base, and
+# `set -e` then blocks the push rather than letting it through unlinted.
+# AFTER A REBASE this range is wider than the branch. `merge-base(@{u}, HEAD)` falls back to the OLD
+# fork point while the upstream ref still names the pre-rebase commit, so the lint also covers the
+# commits `main` gained in between, and a hit in one of THOSE blocks a push that did not cause it.
+# Measured 2026-09-12 on this branch: upstream 27d2d37d, merge-base 8837af80, so the lint covered
+# five commits of which three were already merged (#1348, #1350, #1352). It passed, and `main` should
+# stay clean now that the lint runs on it — but if a push is ever blocked by a hit you did not write,
+# that is the mechanism, and the range printed above the failure says so.
+scripts/check-rehomed-docs.sh --base "${upstream:-origin/main}"
+
 cargo clippy --workspace --no-default-features --all-targets -- -D warnings
 
 if [ -z "${pkgs// /}" ]; then

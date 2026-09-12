@@ -215,6 +215,68 @@ and the actually-observed results per change.
   The same command with the old name → **0 passed, 0 failed, 153 filtered out, exit 0**: the vacuous
   pass, measured rather than argued.
 
+## 2026-09-11 — a diff that re-homes a doc comment or an attribute now fails the gate (#1345)
+
+- **Requirement/change:** #1345. A diff can move a `///` doc, or an outer `#[...]`, onto the wrong
+  item without touching either, because rustdoc attaches every consecutive outer doc line (and an
+  outer attribute) to the next item. Nothing in the toolchain sees the contiguous form. The #1345 census found 29 live insertion steals under a green gate: 30 hits, one of them a false positive. The check's design review then found lost
+  summaries, orphaned field docs and re-homed `#[cfg]`s as well. (Those are repaired in a separate PR.)
+
+- **Design decision:** judge the new file, not the hunk shape. Three kinds of edit re-home a doc, and
+  all three are flagged:
+  - an item, field or variant added directly under an existing doc or attribute;
+  - an item, field or variant deleted from between a doc and what follows it;
+  - an unchanged item whose doc lost its head, when the remainder is non-empty and the lost lines
+    appear nowhere else in the new file.
+
+  Pure insertions are slid back into place first. The wrapper resolves the merge-base fail-closed,
+  with no fallback ref, and prints the range it linted. It is wired into `gate.sh`, `traceability.yml`
+  and the pre-push hook. The design went through two review rounds, both IMPLEMENT WITH CHANGES and
+  both applied: `docs/dev/design/rehomed-docs-check.md`, `docs/dev/reviews/artifacts/1345-rehomed-docs-check.md`.
+
+- **Implementation:** `scripts/lib/rehomed_docs.py` (the detector and its self-test),
+  `scripts/check-rehomed-docs.sh` (the wrapper), plus one step each in `scripts/gate.sh`,
+  `.github/workflows/traceability.yml` and `.cargo-husky/hooks/pre-push`.
+
+- **Tests:** `scripts/check-rehomed-docs.sh --self-test` (fixtures + recall probe + base handling),
+  `python3 scripts/lib/rehomed_docs.py --recall 12`, an A/B replay over every first-parent commit,
+  and the dogfood against the repair this lint exists to protect.
+  - **Fixtures:** 30. F1–F15 must flag, P1–P7 and P9–P15 must not. Three of them carry their own
+    discriminator, re-run with the relevant guard OFF, so they cannot pass vacuously: P9 (the slide,
+    cut from the real `acdb1a0d` region), P13 (the OVR paragraph rule) and P14 (the DEL move rule,
+    cut to the shape of the `PHASE2_STEP_MULTIPLIER` move).
+  - **Recall probe:** plants the same steal at 12 real sites at HEAD in five shapes — plain, under a
+    `//` comment, with its own doc, under a wrapped attribute, under a `/* … */` block comment — and
+    carries a control requiring the pre-review walk-up to MISS some of them. The shape list is
+    derived from what the LEXER discards, not from the shapes that happened to come up.
+  - **Base handling (P8):** the wrapper must fail on an unresolvable base.
+  - **Controls on real commits:** 8 defect commits flag, and 5 known false-positive commits do not.
+  - **Sabotage:** a steal planted on the branch made both the gate form and the hook form exit 1,
+    naming the owner.
+
+- **Test results (run 2026-09-12 at `6b4e54a0`):**
+  - `scripts/check-rehomed-docs.sh --self-test` → **rc=0**: `SELF-TEST: PASS (30 fixtures, slide
+    fixture discriminates)`, `RECALL: PASS — every shape caught at all 12 real sites` (control: the
+    pre-review walk-up misses the `//`-comment, wrapped-attribute and block-comment shapes), `SELF-TEST: PASS —
+    covered forms, slide discrimination, fail-closed base`.
+  - **Full first-parent replay:** 1207 of 1208 commits linted (the root has no parent) — **44 hits
+    in 39 commits** (INS 32, ATTR 4, DEL 4, OVR 3, MOD 1), 0 errors.
+  - **A/B replay** against the pre-review module in one pass: **48 → 44 hits, 4 lost, 0 gained**, and
+    the four lost are exactly the false positives the repair PR provoked.
+  - **Dogfood** `rehomed_docs.py 9341f110 8837af80` (the repair's own range) → **0 hits, rc=0**;
+    before the review's rule changes it was 4 hits, rc=1. Control `5e80f296^..5e80f296` → 1 hit,
+    rc=1, so the tool still fires.
+
+  The 44 reconcile as: 33 census insertion pairs (all 34 except the `set_tx_attenuation_db` false
+  positive), 3 insertion shapes the census could not see, 7 DEL/OVR from the design review's list,
+  and 1 `use` that took a `#[cfg]` (`5e80f296`). Note these 44 span ALL of history, including steals
+  that were repaired before `9341f110` — they are not the census's 30 live instances, and an earlier
+  draft of this entry conflated the two populations.
+
+- **Honest limits:** the false-positive rate over history is zero **by construction** — every false
+  positive a replay found became a rule change — so the only out-of-sample figure is the dogfood,
+  which was 4 of 4 hits before the third review and 0 after. Two rules (OVR's paragraph/overwrite
+  test and the DEL move test) are fitted to six real instances plus planted probes.
 ## 2026-09-11 — docs re-homed by an edit are moved back to their items (#1345)
 
 - **Requirement/change:** #1345. An edit can move a doc onto the wrong item without touching the doc,
