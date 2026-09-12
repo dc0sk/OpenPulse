@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/design/rehomed-docs-check.md
+status: resolved
+last_updated: 2026-09-12
+---
+
 # Design — a diff-time check against re-homed docs and attributes (#1345)
 
 **Status:** revision 3, implemented in `scripts/lib/rehomed_docs.py` and `scripts/check-rehomed-docs.sh`. Design review has run twice:
@@ -42,9 +49,11 @@ The input is `git diff -U0 -M "$BASE"...HEAD -- '*.rs'` together with the old an
 each touched file.
 
 - **Insertion (cases 1 and 4).** For every added line that starts an item, a struct field, an enum
-  variant, a `use`, an `extern crate` or a macro invocation, walk upward through lines that are added doc, attribute or blank lines, or a *blank* `///`
-  context line; an added **code** line stops the walk. Look at the first line that is neither.
-  (Changed after implementation. The review of this change is recorded in
+  variant, a `use`, an `extern crate` or a macro invocation, walk upward through the lines **the
+  lexer discards** — added doc, attribute or blank lines, a *blank* `///` context line, a `//`
+  comment, or the continuation lines of a wrapped attribute; an added **code** line stops the walk.
+  Look at the first line that is neither. (Changed after implementation, twice; both rounds are
+  recorded under *Changed after implementation* below and reviewed in
   `docs/dev/reviews/artifacts/1345-rehomed-docs-check.md`.)
   - **Flag it** when it is a non-blank outer `///`, or an outer `#[…]` that existed before the
     change.
@@ -194,7 +203,7 @@ A doc attaches to the first item below it, never to one buried under new code, s
 attribute and blank lines may sit between a stolen doc and its thief. Fixture P12 pins this: it
 flags under the old rule and passes under the new one.
 
-**Full first-parent replay:** 1201 commits, 43 hits in 38 commits (INS 32, MOD 1, ATTR 3, DEL 4, OVR 3). Reconciled record by record:
+**Full first-parent replay (as of revision 3):** 1201 commits, 43 hits in 38 commits (INS 32, MOD 1, ATTR 3, DEL 4, OVR 3). Reconciled record by record:
 - 33 are the census's real insertion pairs: all 34 except the `set_tx_attenuation_db` false positive. `7eb36cae` is reported at its interposed cfg.
 - 3 are insertion shapes the census could not see: `PqConAckParams` (MOD), `ClientWriter` (ATTR) and `e83a69e8`'s `#[default]` (ATTR).
 - The 4 DEL and 3 OVR are the design review's list.
@@ -217,9 +226,84 @@ ever intended. The one attribute re-homing found outside the census was `e83a69e
 to `Info`. `94b405ca` put `#[default]` back on `Messages` the same day. So it was a true positive,
 the lint would have caught it, and no intended case was found in the replayed history.
 
+## Changed after the third review — the walk-up was unsound as a rule
+
+Revision 4 (the two changes above) was reviewed, and the first of them did not survive. **Stopping
+the walk at any added line that is not doc, attribute or blank makes the lint blind to the two things
+rustc's lexer discards**, so a doc that rustdoc really does re-home is not seen:
+
+- a `//` comment between the doc and the item;
+- a wrapped attribute (`#[cfg_attr(\n    test,\n    allow(dead_code)\n)]`), whose continuation lines
+  are not `#[`-shaped.
+
+The reviewer proved the attachment with `rustc -D missing_docs` (the doc still lands on the item
+below in both shapes) and then measured the lint at **0/150 recall** on each, by planting the same
+steal at 150 real sites. Both shapes exist here: at HEAD, **11** `//` lines sit directly under a
+`///` (the `// VERIFIES: REQ-…` convention on tests) and **16** outer attributes are wrapped (clap
+`#[arg(`/`#[command(`, thiserror `#[error(`) — one of them in `cli.rs`, where `acdb1a0d` happened.
+
+**The replay could not have found this**: with the walk restricted, history yields the same hits, so
+its silence was evidence about the corpus, not about the rule. That is the whole reason the recall
+probe below now exists.
+
+Four changes, each measured:
+
+1. **The walk-up follows the lexer.** Transparent: added doc/attribute/blank lines, blank `///`
+   context lines, `//` comments, and attribute continuation lines. An added **code** line still stops
+   it, which is what keeps `6790d298` (fixture P12) passing. Landing on a continuation reports the
+   attribute's opener.
+2. **`macro_rules!` is matched outside the `\b` alternation.** There is no word boundary between `!`
+   and the space after it, so `macro_rules! reg {` was never a start and a definition inserted under
+   a `#[cfg]` was missed. All 4 definitions in this tree sit under one. Fixture F14.
+3. **DEL does not fire on a MOVE.** Suppressed only when the deleted item reappears as an *added*
+   line whose new lead block is a non-empty **suffix** of the block above its old position: an item
+   that moves with its own doc leaves behind a head that was never its doc. The tempting rule — "the
+   deleted line reappears anywhere in the new file" — was **falsified**: it suppresses three real
+   hits, because `pub dst_station: String,` exists twice in `eb662cdd`'s new file and
+   `combine_llrs_weighted` came back as a `pub use`. Fixture P14, cut to the shape of the real move.
+4. **OVR requires a lost PARAGRAPH or an overwrite.** Fires only when the remainder now opens on a
+   blank `///`, or the hunk that removed the head also added lines. Deliberately dropping a
+   superseded head — which is what repairing a steal looks like — is not a re-homing. The
+   alternative "the remainder still reads as a summary" was measured and **misses 1 of 3** real
+   instances (`19b5a986`). Fixture P13.
+
+**Measured after the change** (the numbers a reader should be able to reproduce):
+
+- `--self-test`: **30 fixtures PASS**. P13 and P14 each carry a discriminator that re-runs them with
+  their new guard off and requires the hit to come back, so neither can pass vacuously.
+- `--recall 12`: **5/5 shapes caught at all 12 real sites**, with a control asserting the pre-review
+  walk-up misses shapes B, D and E. Wired into `check-rehomed-docs.sh --self-test` (~2.5 s), because
+  a probe with no runner is a gate that never runs.
+- Full first-parent replay at `6b4e54a0`: **1207 of 1208 commits linted** (the root has no parent),
+  **44 hits in 39 commits** (INS 32, ATTR 4, DEL 4, OVR 3, MOD 1) — the same set the earlier replay
+  found. Run A/B against the pre-change module in one pass: **48 → 44, four lost, none gained**, and
+  the four are exactly the repair's false positives.
+- The dogfood that blocked this branch, `rehomed_docs.py 9341f110 8837af80`: **0 hits, exit 0**
+  (was 4 hits, exit 1). The control `5e80f296^..5e80f296` still reports its 1 hit, exit 1.
+
+**A fifth shape, added from the spec rather than from a miss.** Reviewing the *lessons* of this work,
+the reviewer pointed out that the recall probe had the same defect one level up: it plants four
+**author-chosen** shapes at surroundings the author did not choose, so the shape list was still an
+enumeration by imagination. The lexer also discards `/* … */` block comments — a doc above
+`/* note */` above an item still attaches to the item — and `is_comment` did not treat that line as
+transparent. There are **zero** instances in this tree (the `//` form of the same filter finds its
+11, so the zero is real), which means no corpus and no replay could ever have reported it. Fixed by
+deriving the transparent set from what the lexer discards: `block_comment_lines` tracks nesting depth
+and deliberately leaves rustdoc's `/**` opaque, since that one means something. Fixtures F15 and P15;
+recall shape E. The A/B replay over history is unchanged by it — as it must be, with no instances to
+find.
+
+**Still fitted, and said so plainly**: rule (c) on OVR and the DEL move test are calibrated to six
+real instances plus planted probes. The false-positive rate on history is zero *by construction* —
+every false positive the replay ever found became a rule change — so the honest out-of-sample figure
+is the dogfood: 4 of 4 hits before these changes, 0 after.
+
 ## Review
 
 - Revision 1 → IMPLEMENT WITH CHANGES (C1–C5).
 - Revision 2 → IMPLEMENT WITH CHANGES (M1–M5). All of those are applied here; nothing further is open.
+- Revision 4 (the post-implementation changes) → SHIP, NOT THIS REVISION: four rule changes required,
+  all applied above, plus write-up corrections. Recorded in
+  `docs/dev/reviews/artifacts/1345-rehomed-docs-check.md`.
 - The reviewer's scripts are `doc_steal_v4.py`, `replay_v4.txt` and `census_v4.py` (session
   scratchpad). They are to be committed with the check as the prior-art replay, or reproduced.

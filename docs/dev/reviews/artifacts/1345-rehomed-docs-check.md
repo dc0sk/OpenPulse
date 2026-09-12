@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1345-rehomed-docs-check.md
+status: review
+last_updated: 2026-09-12
+---
+
 # Review — the re-homed docs lint (#1345)
 
 This is the design review of `scripts/check-rehomed-docs.sh` and `scripts/lib/rehomed_docs.py`.
@@ -132,7 +139,8 @@ lines as starts adds that one hit and no others: 44 instead of 43. Fixtures F10 
 shape) and F11 (a macro invocation) pin it. A doc above a macro invocation needs no rule of ours,
 because rustc's `unused_doc_comments` already catches it.
 
-**Changed after implementation, and pending review.** The full first-parent replay found one false
+**Changed after implementation; REVIEWED 2026-09-12, and the change did not survive — see
+*Third review* below.** The full first-parent replay found one false
 positive, `6790d298` (`qsy/bandplan.rs`). A rewritten `match` block's tail `Ok(warnings)` walked up
 over added *code* lines to an `#[allow(deprecated)]` that still belongs to the block's first arm.
 The walk-up now stops at an added code line. P12 reproduces the shape: it flags ATTR under the old
@@ -147,3 +155,56 @@ was found in the replayed history.
 **Sabotage.** On this branch, a function was planted between a doc and its item
 (`band_levels.rs:9`). Both wiring invocations exited 1, and the report named the stolen doc, the
 thief and the owner (`freq_hz_to_band`). A reset restored the branch, and the lint passed again.
+
+## Third review (2026-09-12) — the post-implementation changes
+
+Verdict: **SHIP, BUT NOT THIS REVISION.** Sent with the two post-design deviations, the replay as
+evidence, and the dogfood result. The reviewer's apparatus was an instrumented copy of the lint with
+switches for each rule, a replay driver, and a recall harness; it reproduced the 23-fixture self-test
+unchanged and showed the switches live before using them.
+
+**The finding that mattered — my walk-up was unsound as a rule.** Stopping at any added line that is
+not doc, attribute or blank makes the lint blind to what rustc's *lexer* discards. Proved with
+`rustc -D missing_docs` that a `///` still attaches to the item below across a `//` comment and
+across a wrapped `#[cfg_attr(…)]`, then measured the shipped rule at **0/150 recall** on each shape,
+planted at 150 real sites. Both shapes are live here: 11 `//` lines sit directly under a `///` at
+HEAD, and 16 outer attributes are wrapped. **The replay was silent because history contains no such
+steal — that is a fact about the corpus, not about the rule**, which is the "corpus of one regime"
+trap this project has paid for before (#1053).
+
+**Four required changes, all applied** (walk the lexer's discards; match `macro_rules!` outside the
+`\b` alternation; suppress DEL only on a move that took a *suffix* of its own block; require OVR to
+have lost a paragraph or been overwritten). Two of my proposed fixes were **falsified with
+measurements** before I could build them:
+
+- the DEL fix I proposed on #1345 ("the deleted start does not reappear in the new file") suppresses
+  **three real hits** — `dst_station` exists twice in `eb662cdd`'s new file, and
+  `combine_llrs_weighted` returned as a `pub use`;
+- "the remainder still reads like a summary" as the OVR test **misses 1 of 3** true positives
+  (`19b5a986`).
+
+My "possibly not decidable from the diff text alone" for OVR was called what it was — a premature
+elimination — and a rule separating all six known instances was given instead. A suppression
+annotation was rejected outright: a lint with a bypass is a lint people bypass.
+
+**It also caught a defect in my implementation of its own verdict.** My first cut of the OVR
+overwrite test was off by one in the old-file line arithmetic and silently dropped `19b5a986`, a true
+positive. The A/B replay is what surfaced it — the self-test and the dogfood were both green.
+
+**Write-up corrections required and applied:** the ledger entry said "Test results: NOT RUN at time
+of writing", which is a blocker under this repo's own traceability rule; the design doc claimed the
+post-implementation change's review "is recorded in" this artifact while this artifact said "pending
+review" (the same sentence, opposite claims — the hedge-hardening shape); the commit message's first
+bullet omitted the `use`/`extern crate`/macro starts it later relies on; and "of the census's 30 live
+instances, the kind breakdown across the replay was {…}" conflated two populations, since the 44 span
+all history including steals repaired before `9341f110`.
+
+**Recommended and adopted:** commit the recall harness rather than leave it in a scratchpad. It is
+`rehomed_docs.py --recall N`, wired into `check-rehomed-docs.sh --self-test`, and it carries a
+control that requires the pre-review walk-up to miss shapes B and D — otherwise a pass proves
+nothing about the rule.
+
+**Noted, not fixed:** `owner_of` returns the first old-file line equal to the stolen text, so a
+duplicated doc line can name the wrong owner (`/// true to enable, false to disable.` recurs in
+`cli.rs`); and after a rebase the hook's `merge-base(@{u}, HEAD)` falls back to the old fork point,
+so the lint covers main's intervening commits.

@@ -26,6 +26,12 @@ SELF="$REPO_ROOT/scripts/check-rehomed-docs.sh"
 
 if [ "${1:-}" = "--self-test" ]; then
     python3 "$PY" --self-test || exit 1
+    # RECALL, not just the fixture table. The fixtures test shapes the author thought of, and that is
+    # exactly how the walk-up shipped blind to `//` comments and wrapped attributes — absent from
+    # history AND from the fixtures, so the replay and the self-test agreed with each other and with
+    # nothing else. This plants the same steal at real sites at HEAD, in four shapes, and carries its
+    # own control: the pre-review walk-up must MISS some of them.
+    python3 "$PY" --recall 12 || exit 1
     # P8 — base handling. A well-formed 40-hex object NAME satisfies `rev-parse --verify`, so the
     # wrapper must test `^{commit}`; both bad forms must FAIL, and a resolvable base must still lint.
     if "$SELF" --base "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" >/dev/null 2>&1; then
