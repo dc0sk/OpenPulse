@@ -79,7 +79,7 @@ fn mean_estimate(snr_db: f32, trials: u32) -> (f32, u32) {
 
 /// Print the raw estimate vs truth across the sweep — used to fit `SNR_CAL_OFFSET_DB`.
 #[test]
-#[ignore]
+#[ignore = "characterization: prints estimate vs truth, used to fit SNR_CAL_OFFSET_DB; run with --ignored --nocapture"]
 fn characterize() {
     println!("  true(dB)   est(dB)  err(dB)  decodes");
     for &snr in &[-18.0f32, -15.0, -12.0, -9.0, -6.0, -3.0, 0.0, 3.0, 6.0, 9.0] {

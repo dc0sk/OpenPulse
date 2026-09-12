@@ -9,6 +9,37 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-12 — every `#[ignore]` now says why
+
+- **Requirement/change:** 9 of the 114 `#[ignore]` attributes in the workspace carried no reason,
+  against 105 that did. An ignored test is invisible in every green run, so the attribute's string is
+  the only place the reader learns whether it is a slow gate held out on purpose (#1274), a research
+  harness that asserts nothing, or a test that has quietly rotted. `scripts/slow-tests.sh` already
+  depends on that distinction — it skips `probe_band_sweep` BY NAME because that probe sits in the
+  notch gate's binary and is ignored for an unrelated reason.
+
+- **Design decision:** no new text. Each reason is taken from the test's (or its module's) own doc
+  comment, which in all 9 cases already said what the test is for; the annotation only moves that
+  statement to where `cargo test` prints it. Each file's existing house style is matched rather than
+  unified — `snr_floor_calibration.rs` says "calibration sweep; run manually with …", and its two
+  bare siblings now say the same.
+
+- **Implementation:** `crates/openpulse-modem/tests/{ldpc_ladder_rungs,snr_floor_calibration,
+  ofdm_scfdma_bakeoff,scfdma_plateau_ablation,notch_rescues_interferer}.rs`,
+  `plugins/js8/tests/{snr_sweep,snr_estimate}.rs` — attribute strings only.
+
+- **Tests:** `cargo fmt --all -- --check`; each affected test binary compiled and listed with
+  `-- --ignored --list`.
+
+- **Test results:** `fmt rc=0`. All 7 binaries compiled (rc=0) and the 9 edited tests are still
+  ignored under unchanged names — `measure_ofdm_floors`, `calibrate_pilot_gap_candidate`,
+  `calibrate_ladder_gap_fillers`, `bakeoff_benign`, `bakeoff`,
+  `ablation_noiseless_moderate_f1_scfdma_vs_ofdm`, `probe_band_sweep`, `characterize_decode_floor`,
+  `characterize`. `probe_band_sweep` surviving verbatim is the one that matters: `slow-tests.sh`
+  skips it by that name, and a rename would have silently swept an assertion-free harness into the
+  REQ-QRM-01 verdict. Grep for a bare `#[ignore]` across `crates plugins apps tools` → 0 (the same
+  grep found 9 before the change).
+
 ## 2026-09-12 — the ledger-order self-test had stopped discriminating (and said so backwards)
 
 - **Requirement/change:** `scripts/check-ledger-order.sh --self-test` reported

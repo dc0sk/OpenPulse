@@ -124,7 +124,7 @@ fn reseated_sl12_decodes_on_moderate_f1() {
 /// good_f1 fading) if we re-seat them to OFDM. If SC-FDMA meaningfully beat OFDM here, a blanket
 /// re-seat would cost benign-channel throughput.
 #[test]
-#[ignore]
+#[ignore = "bake-off measurement (minutes of decode work); run with --ignored --nocapture"]
 fn bakeoff_benign() {
     let constellations = ["16QAM", "64QAM"];
     let snrs = [14.0f32, 18.0, 22.0, 26.0];
@@ -187,7 +187,7 @@ fn bakeoff_benign() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "bake-off measurement (minutes of decode work); run with --ignored --nocapture"]
 fn bakeoff() {
     let constellations = ["16QAM", "64QAM"];
     let profiles = ["moderate_f1", "moderate_f2"];

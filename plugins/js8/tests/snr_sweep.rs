@@ -84,7 +84,7 @@ fn gate_at_minus_18_db() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "characterization: prints the decode rate across the SNR sweep; the gate is gate_at_minus_18_db. Run with --ignored --nocapture"]
 fn characterize_decode_floor() {
     println!("SNR(dB)  decode_rate");
     for snr in [0.0, -3.0, -6.0, -9.0, -12.0, -15.0, -18.0, -21.0] {
