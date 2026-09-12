@@ -91,7 +91,7 @@ const MEASURED_AWGN_FLOOR_DB: [(SpeedLevel, f32); 3] = [
 /// to recalibrate the floors after the SC-FDMA→OFDM re-seat. Run:
 ///   cargo test -p openpulse-modem --no-default-features --test ldpc_ladder_rungs measure_ofdm_floors -- --ignored --nocapture
 #[test]
-#[ignore]
+#[ignore = "calibration probe for the SC-FDMA→OFDM re-seat; run with --ignored --nocapture"]
 fn measure_ofdm_floors() {
     let rungs: [(&str, FecMode); 7] = [
         ("OFDM52-8PSK", FecMode::SoftConcatenated),

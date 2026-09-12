@@ -336,7 +336,7 @@ fn the_notch_costs_nothing_when_there_is_nothing_to_notch() {
 /// REVIEW PROBE (#1148 gate triage): sweep the (notch, amplitude) grid from the env so the
 /// operating band can be re-located without recompiling. AMPS="0.25,0.30,0.35" NOTCH="on,off".
 #[test]
-#[ignore]
+#[ignore = "review probe (#1148 gate triage), asserts nothing — NOT part of the notch gate; scripts/slow-tests.sh skips it by name. Run with --ignored --nocapture"]
 fn probe_band_sweep() {
     let amps: Vec<f32> = std::env::var("AMPS")
         .unwrap_or_else(|_| "0.30".into())

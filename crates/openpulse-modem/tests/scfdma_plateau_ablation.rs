@@ -64,7 +64,7 @@ fn decode_rate(waveform: &str, mode: &str, doppler_hz: f32) -> f32 {
 }
 
 #[test]
-#[ignore]
+#[ignore = "recorded ablation, not a gate (SC-FDMA is retired from the ladder); run with --ignored --nocapture"]
 fn ablation_noiseless_moderate_f1_scfdma_vs_ofdm() {
     println!("\n=== noiseless (60 dB) moderate_f1 decode: SC-FDMA vs OFDM, {DRAWS} draws ===");
     println!("{:<16} {:>10} {:>10}", "mode", "1Hz-dopp", "0Hz(frozen)");

@@ -301,7 +301,7 @@ fn calibrate_candidate_fec_rungs() {
 /// `8PSK500` fails at any SNR? If so it is the more robust occupant of the slot. AWGN uses 90 %;
 /// fading uses 50 % (irreducible outage — see the module notes).
 #[test]
-#[ignore]
+#[ignore = "SL7 gap-filler calibration; run with --ignored --nocapture"]
 fn calibrate_pilot_gap_candidate() {
     const FRAMES: u32 = 20;
     let candidates = [("8PSK500", FecMode::Rs), ("PILOT-8PSK500", FecMode::Rs)];
@@ -333,7 +333,7 @@ fn calibrate_pilot_gap_candidate() {
 /// Run: `cargo test -p openpulse-modem --no-default-features --test snr_floor_calibration \
 ///   -- --ignored --nocapture calibrate_ladder_gap_fillers`
 #[test]
-#[ignore]
+#[ignore = "gap-filler calibration sweep; run with --ignored --nocapture"]
 fn calibrate_ladder_gap_fillers() {
     println!("\n=== hpx_hf gap-filler candidates (AWGN, ≥90% of 16 frames) ===");
     let candidates: &[(&str, FecMode, f32, f32)] = &[
