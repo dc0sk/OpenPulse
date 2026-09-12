@@ -133,7 +133,7 @@ Both frames share one binary container. **v2 (#1147)** — v1's JSON body is gon
 ```
 ┌────────┬─────────┬──────────────────┬───────────────┬────────────────┐
 │ magic  │ version │ length (u16 BE)  │ body          │ signature      │
-│ 4 B    │  0x02   │    2 bytes       │ `length` B    │ 64 B (Ed25519) │
+│ 4 B    │  0x01   │    2 bytes       │ `length` B    │ 64 B (Ed25519) │
 └────────┴─────────┴──────────────────┴───────────────┴────────────────┘
    CONREQ magic = "HSCQ"      CONACK magic = "HSAK"
 ```
@@ -148,9 +148,14 @@ v1 did not.
 typical frame. v1 was ~752 B on the wire = 3 fragments = three preambles and three acquisitions,
 decoding at roughly p³ on a fading channel.
 
-**Version 0x01 is rejected outright.** There is no dual decode: there is no compatibility mode for
-the data plane, and inventing one for the handshake alone would carry a second wire format in
-production source.
+**A frame whose version byte is not `WIRE_VERSION` is rejected outright.** There is no dual decode:
+there is no compatibility mode for the data plane, and inventing one for the handshake alone would
+carry a second wire format in production source.
+
+**Corrected 2026-09-12** — this said "version 0x01 is rejected outright", and the container diagram
+above said `0x02`, both contradicting the freeze in §3.2a. The design specified a bump to `0x02`,
+#1189 shipped it, and #1204 reset the byte to `0x01` and froze it until 1.0; the normative rule is
+and always was "not `WIRE_VERSION` → reject".
 
 ### 3.0a Decoder caps
 
@@ -161,7 +166,6 @@ failure surfaces at the sender where it is actionable.
 | field | cap (bytes) |
 |---|---|
 | `station_id`, `dst_station` | 18 |
-| `session_id` | 24 |
 | `station_grid` | 8 |
 | `profile_name` | 24 |
 | `signing_modes` | 4 entries |

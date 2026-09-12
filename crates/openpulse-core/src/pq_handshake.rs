@@ -262,7 +262,7 @@ fn is_pq_only(modes: &[SigningMode]) -> bool {
 /// (~2.7 min at BPSK250) a PQ handshake is not deployable on this link, so what the work buys is a
 /// FINISHED format, so that wiring PQ later is not a second wire break.
 pub struct PqConReqParams<'a> {
-    /// This station's callsign (cap 12).
+    /// This station's callsign (cap 18).
     pub station_id: &'a str,
     /// Addressee, or `"*"` (#1178). Empty is invalid.
     pub dst_station: &'a str,
@@ -439,7 +439,7 @@ fn split_pq_trailer(
 ///
 /// DORMANT(#1147): see [`PqConReqParams`].
 pub struct PqConAckParams<'a> {
-    /// Responder callsign (cap 12).
+    /// Responder callsign (cap 18).
     pub station_id: &'a str,
     /// ML-DSA-44 signing seed.
     pub pq_signing_key: &'a [u8],

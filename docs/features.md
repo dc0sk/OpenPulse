@@ -454,7 +454,7 @@ i.e. exactly the bytes on the air minus the trailing signature. There is no sepa
 "canonical" representation to disagree with the wire, which is what makes malleability a
 non-question rather than something to defend against.
 
-Both frames fit **one SAR fragment** by construction (maximal CONREQ 241 B, CONACK 244 B,
+Both frames fit **one SAR fragment** by construction (maximal CONREQ 236 B, CONACK 237 B,
 against 251 B) — a handshake costs one acquisition instead of the three the previous
 ~752 B JSON format needed.
 

@@ -1,11 +1,37 @@
 ---
 project: openpulsehf
 doc: docs/dev/design/handshake-binary-encoding.md
-status: approved-plan (design reviewed 2026-08-21; not yet implemented)
-last_updated: 2026-08-21
+status: resolved
+last_updated: 2026-09-12
 ---
 
 # Binary handshake encoding (#1147)
+
+> **Outcome (added 2026-09-12).** Shipped in `114f8e5d` (#1189, closes #1147/#1166 and lands the
+> #1178 `dst_station` addressing — that issue closed 2026-09-01), then
+> corrected by its adversarial review in `6dbcafe6` (#1190) and by the #1191 budget decision in
+> `eb662cdd` (PR #1204). The live specification is `protocol-wire-spec.md` §3; this doc is the design
+> record and is **not** updated field-for-field. Where the two differ, the spec is right:
+>
+> - `WIRE_VERSION` shipped at `0x02` as specified below, and was **reset to `0x01` and frozen until
+>   1.0** by maintainer decision in #1204 (overriding the review's bump; rationale and cost in
+>   `handshake_wire.rs` and the ledger entry of 2026-08-26). The "0x01 is rejected" rule below is
+>   void until 1.0.
+> - `session_id` is a fixed `u64`, not a ≤24 B string (#1190 F1 — the old cap failed open on an
+>   11-character callsign). `caps::STATION_ID` is 18, not 12 (#1204). `dst_station` is **not** on the
+>   CONACK (#1204; the design's 244 B budget included it). Maximal frames are **236 / 237 B**, not
+>   241 / 244 — asserted in `handshake_wire.rs`, not budgeted here.
+> - Unknown *offered* signing modes are skipped, not fatal; an unknown *selected* mode still fails
+>   (#1190 F2).
+> - The PQ determinism caveat in *Gates* is resolved: ML-DSA-44 signing is deterministic in this
+>   build (`pq_signing_is_deterministic_in_this_build`); the PQ CONREQ is pinned as a digest at
+>   5 049 B, the PQ CONACK cannot be pinned (randomised KEM).
+> - F-1147-06 (no PQ key column in the trust store) remains deferred.
+> - The "#1148 precedent not yet on `main`" note was already false when **this design** merged
+>   (`59e6ff5a`, 2026-08-22 17:17): `3c710d7c` had landed at 14:40 the same day.
+>
+> All `file:line` anchors below refer to the tree **before** `114f8e5d`; they locate v1 code that no
+> longer exists and are left as the design's evidence, not as navigation.
 
 Design for re-laying CONREQ/CONACK — classical **and** PQ — as a binary format, in the decided
 pre-1.0 wire-format break window. Reviewed adversarially twice before implementation; the
@@ -171,6 +197,7 @@ and is **not yet on `main`** — if this lands first, the reference is forward-l
 
 | ID | Finding | State |
 |---|---|---|
+| F-1147-10 | Design overtaken in five particulars by #1190/#1204 without the doc moving, and edited by #1193 (`f5a43514`) without its date moving, so `last_updated` was already stale from 2026-08-24 while the status still said "not yet implemented" for shipped work. | fixed — outcome note above |
 | F-1147-09 | A CONACK that echoes `session_id` is 269 B worst-case and does not fit one SAR fragment. | fixed — the echo is dropped; `conreq_hash` subsumes it |
 | F-1147-08 | This doc claimed the CONACK compression/FEC membership check was missing. It exists (`handshake.rs:703-713`); the **signing-mode** check is the missing one. | fixed — corrected here |
 | F-1147-07 | This doc carried 646 B / 20.7 s from a compact-JSON model of my own, contradicting the recorded 710 B while claiming to have corrected exactly that error. | fixed — recorded figures used |

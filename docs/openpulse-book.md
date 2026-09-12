@@ -741,8 +741,8 @@ discovery (`EnableDiscovery`, `ListStations`, `RendezvousWith`).
 
 The stack secures two distinct links, at different layers (`docs/osi-layer-map.md`):
 
-- **The on-air peer link** (L5–L6): a signed handshake — CONREQ/CONACK frames whose canonical-JSON
-  bodies are Ed25519-signed and evaluated against a trust store — plus an optional in-band
+- **The on-air peer link** (L5–L6): a signed handshake — CONREQ/CONACK frames whose transmitted
+  bytes are Ed25519-signed and evaluated against a trust store — plus an optional in-band
   post-quantum handshake (`pq_handshake.rs`): ML-DSA-44 signatures (1 312-byte public keys,
   2 420-byte signatures) and ML-KEM-768 key encapsulation, transported over SAR because the frames
   outgrow a single 255-byte payload. `SigningMode::Hybrid` signs with Ed25519 *and* ML-DSA-44
@@ -2393,19 +2393,21 @@ Both handshake frames share one outer envelope (`crates/openpulse-core/src/hands
 
 ```text
 ┌────────┬──────────┬──────────────┬──────────────┐
-│ magic  │ version  │ body length  │ JSON body    │
-│ 4 B    │ 1 B (=1) │ 4 B BE u32   │ variable     │
+│ magic  │ version  │ body length  │ binary body  │
+│ 4 B    │ 1 B      │ 2 B BE u16   │ variable     │
 └────────┴──────────┴──────────────┴──────────────┘
   CONREQ magic = "HSCQ"      CONACK magic = "HSAK"
 ```
 
 `decode` rejects a buffer shorter than the header plus signature, a wrong magic, any version other
-than `0x02`, and any length field that does not *exactly* account for the frame — trailing garbage is
-a decode error, not silently ignored.
+than `WIRE_VERSION`, and any length field that does not *exactly* account for the frame — trailing
+garbage is a decode error, not silently ignored. `WIRE_VERSION` shipped as `0x02` and was reset to
+`0x01` and frozen until 1.0 by #1204.
 
 **A CONREQ is one SAR fragment, and that is the whole point of the v2 format (#1147).** The maximal
-*legal* CONREQ is **241 bytes** and the maximal CONACK **244**, against the **251** bytes a fragment
-carries. That is a property of the worst case — every string at its decoder-enforced cap, four signing
+*legal* CONREQ is **236 bytes** and the maximal CONACK **237**, against the **251** bytes a fragment
+carries (both asserted in `handshake_wire.rs`; they were 241/244 until #1204 raised the callsign cap
+to 18 and took `dst_station` off the CONACK). That is a property of the worst case — every string at its decoder-enforced cap, four signing
 modes — not of a typical frame, which is what makes it a guarantee rather than an observation.
 
 The v1 JSON format was **~752 bytes on the wire**: three fragments, three preambles, three
@@ -2417,7 +2419,8 @@ length varied run to run with the actual key and signature values.
 The signed CONREQ body carries: `station_id`, `dst_station`, the 32-byte Ed25519 `pubkey`, the
 ephemeral X25519 `kex_pubkey` (§2B.5), offered `signing_modes`, the cleartext `session_id`,
 `station_grid`, the OTA-ladder `profile_name`/`profile_fingerprint`, and a mandatory replay-freshness
-`timestamp_ms`. The CONACK mirrors it, minus `session_id` and plus `conreq_hash`. Every field except
+`timestamp_ms`. The CONACK mirrors it, minus `session_id` and `dst_station` (#1204 — a CONACK
+self-selects by `conreq_hash`, and nobody transmits in response to one) and plus `conreq_hash`. Every field except
 the trailing 64-byte `signature` is inside the signed region — and so are the magic, the version and
 the length.
 
@@ -2825,8 +2828,8 @@ encapsulation key, and up to two signatures over the same canonical bytes. A Pq-
 always requires the ML-DSA-44 signature, requires the Ed25519 signature unless Pq-only, binds the
 classical key against the trust store (the F1 lesson, present here from the start), and
 *syntactically* validates the KEM key — it must parse as a well-formed `EncapsulationKey<MlKem768>`,
-a structural check, not proof of possession. `verify_pq_conack` adds a check the classical path
-lacks: the responder's `selected_mode` must be one of the modes the initiator offered, else
+a structural check, not proof of possession. `verify_pq_conack` checks that the responder's
+`selected_mode` is one of the modes the initiator offered, else
 `UnauthorizedMode` — a signing-mode downgrade guard.
 
 The KEM flow: the responder encapsulates against the initiator's KEM key and returns the 1088-byte
@@ -2840,25 +2843,32 @@ use on the air".
 
 #### 2B.7.3 What post-quantum costs on an HF channel
 
-The PQ frames travel as JSON via `encode_pq_conreq`/`encode_pq_conack`, and `serde_json` serialises
-`Vec<u8>` as an array of decimal numbers — roughly 3–4 wire bytes per key byte. Measured in-process
-(these numbers are this book's measurements; the repo does not record them):
+The PQ frames are **binary** since #1147 (`encode_pq_conreq`/`encode_pq_conack`), so the cost is now
+the crypto material plus a few tens of bytes of framing — not the 3.6× the JSON encoding used to add.
 
-| Frame | Raw crypto material | JSON bytes | 251-byte SAR fragments |
+| Frame | Raw crypto material | Encoded | 251-byte SAR fragments |
 |---|---|---|---|
-| `PqConReq` (Hybrid, `W1AW`) | 5012 B (Ed25519 key 32 + ML-DSA key 1312 + KEM ek 1184 + Ed25519 sig 64 + ML-DSA sig 2420) | ≈ 18 000 | 72 |
-| `PqConAck` (Hybrid) | 4916 B (32 + 1312 + KEM ct 1088 + 64 + 2420) | ≈ 17 700 | 71 |
+| `PqConReq` (Hybrid, `W1AW`) | 5 012 B (Ed25519 key 32 + ML-DSA key 1 312 + KEM ek 1 184 + Ed25519 sig 64 + ML-DSA sig 2 420) | **5 049 B**, pinned | 21 |
+| `PqConAck` (Hybrid) | 4 916 B (32 + 1 312 + KEM ct 1 088 + 64 + 2 420) | no pinned vector; **4 970 B** derived | 20 |
 
-The JSON figures are approximate on purpose: a single measured run gave 18 044 and 17 683 bytes,
-but ML-DSA signing is randomised and every key byte is rendered as a one-, two- or three-digit
-decimal, so the encoded length moves by a few hundred bytes between runs. The encoding costs
-roughly 3.6× over the raw material, which is itself ~8.5× a classical CONREQ. At the working rates
-of the `hpx_hf` ladder that is a long transmission — the book does not quote a duration, because
-the repo records no measured PQ-handshake airtime. The gate
-test `pq_conreq_serialized_size_fits_in_sar_capacity` asserts only that the frame fits the
-64 005-byte SAR ceiling (255 fragments × 251 bytes) — transportability, not efficiency. The honest
-status: post-quantum authentication over HF is *possible* here and *expensive*, and the encoding is
-the first place a future change would claw bytes back.
+The CONREQ figure is not this book's own measurement: it is the known-answer vector in
+`crates/openpulse-core/tests/handshake_kat.rs`, which asserts both the length and a SHA-256 of the
+whole frame. That is only possible because ML-DSA-44 signing is **deterministic** in this build —
+itself asserted, by `pq_signing_is_deterministic_in_this_build`, rather than assumed. The CONACK
+deliberately has no vector: it carries a randomised ML-KEM encapsulation, so no fixed byte string
+exists to pin. Its *length* is fixed for a given callsign, though, and the 4 970 B above is derived
+from the encoder's field layout (`pq_handshake.rs`) rather than measured — a length-only KAT would
+turn it into a pinned number.
+
+**This is still expensive, and the binary format did not change that.** A PQ CONREQ *would be* ~21
+acquisitions where a classical one is 1 — would, because no production path transmits a PQ frame at
+all: the daemon's reassembly dispatches `HSCQ`/`HSAK` only, so the figure is a projection through the
+classical sender's per-fragment loop, and the book quotes no duration because the repo records no
+measured PQ-handshake airtime. `the_pq_vector_is_not_evidence_that_pq_is_deployable` states the same
+thing as an executable note: it fails, and tells the reader to re-derive this claim, if the frame
+ever shrinks to four fragments or fewer. The honest status: post-quantum authentication over HF is
+*possible* here and *expensive* — the encoding is no longer where a future change would claw bytes
+back, the key and signature sizes are.
 
 ### 2B.8 Key management
 
