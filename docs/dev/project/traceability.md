@@ -104,7 +104,12 @@ and the actually-observed results per change.
     identical before and after.
   - **Formatting:** `cargo fmt --check` is clean.
 
-- **Test results:** NOT RUN at time of writing.
+- **Test results:** `scripts/gate.sh` on `8c2334c2`, stamp `20260911T181533Z`: **PASS**, tree clean,
+  332 suites, **2538 passed, 0 failed**, `cargo test --workspace --no-default-features --no-fail-fast`,
+  toolchain `rustc 1.98.0 (88d9e12ae 2026-08-18)`. Quoted from `target/gate-verdict.json`, which that run
+  wrote itself: the stdout `GATE:` line was lost when `/tmp` was cleared between sessions, and a
+  reconstructed one would not be a line any run printed. The delta from `8c2334c2` to this entry's commit
+  is docs-only.
 
 ## 2026-09-11 — the correlation veto's stand-down is recorded on the daemon path too (#1342)
 
