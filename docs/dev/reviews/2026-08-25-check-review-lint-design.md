@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-25-check-review-lint-design.md
+status: review
+last_updated: 2026-08-25
+---
+
 # Adversarial review — `check-review.sh` design (PR #1196)
 
 **Reviewer:** Fable · **Date:** 2026-08-25 · **Covers:** the design of the review-trailer lint,

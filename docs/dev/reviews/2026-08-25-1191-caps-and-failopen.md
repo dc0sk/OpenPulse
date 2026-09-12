@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-25-1191-caps-and-failopen.md
+status: review
+last_updated: 2026-08-25
+---
+
 # Adversarial review — #1191 handshake caps, and a fail-open finding (#1199)
 
 **Reviewer:** Fable · **Date:** 2026-08-25 · **Covers:** a FINDING and a DESIGN DECISION, both

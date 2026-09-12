@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1062-bpsk31-veto-constants.md
+status: review
+last_updated: 2026-09-11
+---
+
 # #1062 design pass — can BPSK31 publish its own ρ constants today, and what does the PN column need?
 
 **Status:** proposal, unimplemented. Sent for adversarial review before any code is written.

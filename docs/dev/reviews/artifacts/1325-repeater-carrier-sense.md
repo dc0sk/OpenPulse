@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1325-repeater-carrier-sense.md
+status: review
+last_updated: 2026-09-09
+---
+
 # #1325 — the repeater keys rig_b with no carrier sense on rig_b's band
 
 ## The established facts

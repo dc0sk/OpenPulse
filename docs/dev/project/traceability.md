@@ -9,6 +9,39 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-12 — the doc-frontmatter check had been failing since the day after its baseline
+
+- **Requirement/change:** `scripts/validate-doc-frontmatter.sh` exits 1. It is grandfathered — the
+  2026-08-15 baseline holds 71 offenses and `check` fails only on NEW ones — so every failure is a doc
+  written since then. There were **40**: 39 with no frontmatter block at all (37 review records, the
+  archived CLAUDE.md phase history, and the presentations source README), and one with an illegal
+  `status`. Nothing caught it because `docs.yml` is `disabled_manually` and is the only workflow that calls the
+  script, which `CLAUDE.md` records with the instruction to run the check by hand. The enforcement hole
+  itself is #1349; #1129 is closed and was a different symptom of the same disabled workflow. Three of the 39 are review artifacts this
+  session committed, so the omission is current, not only historical.
+
+- **Design decision:** add the block the checker requires — `project`, `doc` equal to the path, a legal
+  `status`, and `last_updated` — taking each file's own last-commit date rather than stamping today, so
+  the field states when the doc last changed. Status follows house style: `review` for review records,
+  `archive` for the finished phase history and for the presentations README, which is hand-written and
+  maintained by nobody, so `living` would be a false claim.
+
+  **The 40th is held back, and it is the worst of them.**
+  `docs/dev/design/handshake-binary-encoding.md` carries
+  `status: approved-plan (design reviewed 2026-08-21; not yet implemented)` — not one of the five legal
+  values, and untrue since `114f8e5d` (2026-08-23) shipped the design under #1147. It lives under
+  `docs/dev/design/`, which `check-review.sh` classifies as a decision site, so a `Review: none` change
+  there fails the review lint and a named review artifact is required. Adversarial review is
+  unavailable, so it waits rather than being relabelled unreviewed.
+
+- **Implementation:** 39 docs under `docs/`, frontmatter only; no prose changed.
+
+- **Tests:** `scripts/validate-doc-frontmatter.sh` and its `--self-test`.
+
+- **Test results:** new offenses **40 → 1**. `DOCFRONT` still FAILS, on the one held-back design doc
+  and nothing else. `--self-test` → PASS: a newly planted invalid-status doc is still caught, so what
+  remains is a real offense and not a blunted checker.
+
 ## 2026-09-12 — an acceptance row cited a test name that never existed (#1308)
 
 - **Requirement/change:** the #1308 burst-cap row cited

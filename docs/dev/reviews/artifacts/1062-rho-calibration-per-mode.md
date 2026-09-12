@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1062-rho-calibration-per-mode.md
+status: review
+last_updated: 2026-09-11
+---
+
 # Should `RhoCalibration` be per-mode? (#1062, step 3 of the agreed order)
 
 **Status (2026-09-11 evening): reviewed, then DEPRIORITISED.** The verdict below says "proceed now",

@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-09-04-1251-mesh-no-real-audio.md
+status: review
+last_updated: 2026-09-04
+---
+
 # Review — #1251: openpulse-mesh beacons and relays with no station ID, PTT or carrier sense
 
 Reviewer: Fable (adversarial). Date: 2026-09-04. Reviewed **before implementation**. Verdict: *do not wire it — remove its ability to reach real audio instead.* The review corrected three claims in the issue itself and rejected the fix I was leaning toward.

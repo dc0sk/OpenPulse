@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1324-repeater-single-use.md
+status: review
+last_updated: 2026-09-10
+---
+
 # #1324 — the repeater is single-use: `DisableRepeater` consumes it
 
 ## The defect

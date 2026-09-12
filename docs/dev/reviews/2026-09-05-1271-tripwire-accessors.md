@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-09-05-1271-tripwire-accessors.md
+status: review
+last_updated: 2026-09-05
+---
+
 # Review — #1271: the tripwire-accessor collision
 
 Reviewer: Fable. Reviewed **before implementation**, per the standing rule. The design that shipped

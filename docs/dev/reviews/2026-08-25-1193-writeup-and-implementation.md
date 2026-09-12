@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-25-1193-writeup-and-implementation.md
+status: review
+last_updated: 2026-08-25
+---
+
 # Adversarial review — #1193 implementation and write-up (PR #1194)
 
 **Reviewer:** Fable · **Date:** 2026-08-25 · **Covers:** the implementation and ALL prose for the

@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1308-repeater-startup-unreachable.md
+status: review
+last_updated: 2026-09-09
+---
+
 # #1308 PR2 — the repeater cannot be started through `server::run` at all
 
 ## Context

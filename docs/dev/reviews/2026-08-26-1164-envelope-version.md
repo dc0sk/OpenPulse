@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-26-1164-envelope-version.md
+status: review
+last_updated: 2026-08-26
+---
+
 # Adversarial review — making `WireEnvelope`'s version authoritative (#1164)
 
 **Reviewer:** Fable · **Date:** 2026-08-26 · **Covers:** a wire-format design decision, reviewed

@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1345-doc-merge-issue.md
+status: review
+last_updated: 2026-09-12
+---
+
 # Review — #1345 issue text (doc-comment merge census)
 
 Written while the review happened (2026-09-11) and posted as the first comment on #1345. It is

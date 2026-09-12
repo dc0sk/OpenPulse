@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-25-reachability-comment-stripping.md
+status: review
+last_updated: 2026-08-25
+---
+
 # Adversarial review — reachability comment/string stripping (#1192)
 
 **Reviewer:** Fable · **Date:** 2026-08-25 · **Covers:** the lexer design and the measurement,

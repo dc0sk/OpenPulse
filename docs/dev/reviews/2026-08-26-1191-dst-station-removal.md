@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-26-1191-dst-station-removal.md
+status: review
+last_updated: 2026-08-26
+---
+
 # Adversarial review — removing `dst_station` from the CONACK, and cap 18 (#1191)
 
 **Reviewer:** Fable · **Date:** 2026-08-26 · **Covers:** a wire-format design decision, reviewed

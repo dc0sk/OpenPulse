@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1342-stand-down-latch.md
+status: review
+last_updated: 2026-09-11
+---
+
 # #1342 — record the correlation veto's stand-down on the daemon path
 
 **Status:** reviewed 2026-09-11; the verdict (below) is applied in the change carrying this artifact.

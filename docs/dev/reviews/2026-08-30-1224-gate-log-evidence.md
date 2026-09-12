@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-30-1224-gate-log-evidence.md
+status: review
+last_updated: 2026-08-30
+---
+
 # Review — #1224: the checker read a half-written gate log as evidence
 
 Reviewer: Fable (adversarial). Date: 2026-08-30. Subject: a design decision reviewed **before**

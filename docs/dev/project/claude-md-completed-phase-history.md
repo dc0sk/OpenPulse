@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/project/claude-md-completed-phase-history.md
+status: archive
+last_updated: 2026-08-29
+---
+
 # CLAUDE.md — archived completed-phase history
 
 Moved out of `CLAUDE.md` by #1169. Every block below describes work that is **finished**; it was

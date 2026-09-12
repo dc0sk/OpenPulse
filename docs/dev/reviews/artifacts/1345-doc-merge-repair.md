@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/artifacts/1345-doc-merge-repair.md
+status: review
+last_updated: 2026-09-12
+---
+
 # Review — #1345 repair (docs re-homed by an edit)
 
 These are write-up reviews of the repair on branch `fix/1345-doc-merge-repair`: its ledger entry,

@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-30-1226-delete-generated-matrix.md
+status: review
+last_updated: 2026-08-30
+---
+
 # Review — #1226: a generated matrix nobody read, whose only self-claim was false
 
 Reviewer: Fable (adversarial). Date: 2026-08-30. Design decision reviewed **before** implementation.

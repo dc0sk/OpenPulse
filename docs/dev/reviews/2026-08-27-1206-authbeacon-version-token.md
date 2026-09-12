@@ -1,3 +1,10 @@
+---
+project: openpulsehf
+doc: docs/dev/reviews/2026-08-27-1206-authbeacon-version-token.md
+status: review
+last_updated: 2026-08-27
+---
+
 # Review — #1206: give the FreeDV auth beacon a magic and version token
 
 Reviewer: Fable (adversarial second opinion), 2026-08-27, **before implementation**.
