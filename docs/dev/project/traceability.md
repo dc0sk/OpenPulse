@@ -9,6 +9,37 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-12 — an acceptance row cited a test name that never existed (#1308)
+
+- **Requirement/change:** the #1308 burst-cap row cited
+  `cargo test -p openpulse-daemon --no-default-features --lib enabling_the_repeater_declares_its_rung_to_the_engine`.
+  That name exists nowhere in the repo. `git log -S` finds it only in `a3ea95af`, the commit that added
+  both the row and the real test, so it never named anything. A cargo test filter that matches nothing
+  runs zero tests and still exits 0, so the row has read as proven since the day it was written — the
+  "a cited gate that cannot run is indistinguishable from no gate" shape.
+
+- **Design decision:** repoint the row, do not write a test. The behaviour was covered all along by
+  `enabling_the_repeater_widens_the_burst_cap_to_its_rung` (`crates/openpulse-daemon/src/lib.rs`), which
+  asserts what the row claims and carries its own positive control: with the repeater's rung declared a
+  310 000-sample carrier must NOT flush, and without it must. Only the citation was wrong.
+
+- **How it was found:** a static sweep of every `cargo test` invocation cited in `CLAUDE.md`'s tables.
+  126 invocations: every crate resolves, and every `--test` file exists. 69 test-name filters: this was
+  the only one matching no `fn`/`mod` identifier in its crate, with cargo's substring semantics applied
+  (an exact-match check reported 15, of which 14 were the checker's own false positives). The same sweep
+  over the ledger's newest 40 entries, and over the 40 backticked identifiers cited in those tables,
+  found nothing else.
+
+- **Implementation:** `CLAUDE.md`, one row.
+
+- **Tests:** the cited command itself, which is the point of the change, plus the stale name as the
+  control.
+
+- **Test results:** on `8837af80`, `cargo test -p openpulse-daemon --no-default-features --lib
+  enabling_the_repeater_widens_the_burst_cap_to_its_rung` → **1 passed, 0 failed** (152 filtered out).
+  The same command with the old name → **0 passed, 0 failed, 153 filtered out, exit 0**: the vacuous
+  pass, measured rather than argued.
+
 ## 2026-09-11 — docs re-homed by an edit are moved back to their items (#1345)
 
 - **Requirement/change:** #1345. An edit can move a doc onto the wrong item without touching the doc,
