@@ -83,18 +83,24 @@ if [ "${1:-}" = "--self-test" ]; then
     tmp=$(mktemp) || exit 2
     trap 'rm -f "$tmp"' EXIT
 
-    # 1. a swapped pair must be rejected
-    python3 - "$LEDGER" "$tmp" <<'PY'
-import re, sys
-lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
-idx = [i for i, l in enumerate(lines) if l.startswith("## ")]
-a, b = idx[0], idx[1]
-c = idx[2] if len(idx) > 2 else len(lines)
-swapped = lines[:a] + lines[b:c] + lines[a:b] + lines[c:]
-open(sys.argv[2], "w", encoding="utf-8").write("\n".join(swapped))
-PY
+    # 1. an out-of-order pair must be rejected.
+    #
+    # The fixture is synthetic on purpose. This probe used to swap the real ledger's first two
+    # entries, which stops discriminating the moment those two share a date: swapping equal dates
+    # leaves the sequence non-increasing, the check correctly passes, and the probe then reports
+    # "the check cannot detect disorder" about a checker that is fine. That fired on 2026-09-12,
+    # when three entries landed on one day. A fixture whose planted defect depends on what the
+    # real file happens to contain is not a fixture.
+    printf '## 2026-01-01 older, wrongly first\n\nbody\n\n## 2026-02-02 newer\n\nbody\n' > "$tmp"
     if check_file "$tmp" > /dev/null 2>&1; then
-        echo "SELF-TEST: FAIL — a swapped pair was ACCEPTED; the check cannot detect disorder"; exit 1
+        echo "SELF-TEST: FAIL - an out-of-order pair was ACCEPTED; the check cannot detect disorder"; exit 1
+    fi
+
+    # 1b. the same two entries in the right order must PASS, or probe 1 shows only that the check
+    # rejects everything.
+    printf '## 2026-02-02 newer\n\nbody\n\n## 2026-01-01 older\n\nbody\n' > "$tmp"
+    if ! check_file "$tmp" > /dev/null 2>&1; then
+        echo "SELF-TEST: FAIL - a correctly ordered pair was REJECTED; the check fails everything"; exit 1
     fi
 
     # 2. a dateless heading must be rejected
@@ -107,7 +113,7 @@ PY
     if ! check_file "$LEDGER" > /dev/null 2>&1; then
         echo "SELF-TEST: FAIL — the real ledger does not pass; fix it before wiring this in"; exit 1
     fi
-    echo "SELF-TEST: PASS — swapped pair rejected, dateless heading rejected, real ledger accepted"
+    echo "SELF-TEST: PASS — out-of-order pair rejected, ordered pair accepted, dateless heading rejected, real ledger accepted"
     exit 0
 fi
 
