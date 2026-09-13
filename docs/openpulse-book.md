@@ -1670,7 +1670,7 @@ false-positive risk.
 
 The codebase-wide convention, declared in `constellation.rs`, `turbo.rs`, and each soft
 demodulator: **positive LLR = bit more likely 0**, enforced by the gate
-`llr_convention_conformance.rs`. The core primitive is max-log-MAP over the constellation:
+`soft_demod_conformance.rs`. The core primitive is max-log-MAP over the constellation:
 
 ```rust
 pub fn symbol_llrs(symbol, bits_per_sc, noise_var, points) -> Vec<f32> {
@@ -3111,7 +3111,7 @@ Three design decisions carry weight:
 
 **The soft path has a written contract.** The trait doc (`plugin.rs:131-154`) specifies the LLR convention in three clauses, each with a named enforcing test:
 
-1. *Sign*: positive means "bit more likely 0"; hard-slicing every LLR (`bit = llr <= 0`, LSB-first per byte) must reproduce `demodulate()`'s bytes exactly — enforced by `crates/openpulse-modem/tests/llr_convention_conformance.rs`.
+1. *Sign*: positive means "bit more likely 0"; hard-slicing every LLR with `fec::hard_decide` (`is_sign_negative`, LSB-first per byte) must reproduce `demodulate()`'s bytes exactly — enforced for **every mode of every registered plugin** by `crates/openpulse-modem/tests/soft_demod_conformance.rs`. This book said `bit = llr <= 0` until 2026-09-13; that is a fourth convention, disagreeing with the engine's slicer at `+0.0` and with `ldpc.rs`/`turbo.rs`'s `l < 0.0` as well. The sweep also fails on any exactly-zero LLR, which has no convention-independent decision.
 2. *Scale*: per-plugin, deliberately not normalised across plugins; cross-mode combining must weight per frame (`combine_llrs_weighted`), never add raw LLRs from different plugins.
 3. *Calibration*: a calibrated plugin divides distances by its estimated σ², so repeated observations of the same bits combine by summing (`combine_llrs_map`) — never by re-weighting with 1/σ², which would apply σ⁻² twice. `crates/openpulse-modem/tests/llr_calibration.rs` fails any plugin whose `mean(|LLR|)` stops growing with SNR.
 
@@ -3178,7 +3178,7 @@ impl ModulationPlugin for Fsk4Plugin {
 
    Note what FSK4 deliberately does *not* override: `demodulate_soft` stays at the ±1.0 default, and the doc comment explains why that is acceptable (the ACK channel always uses hard-decision short-block FEC and never carries LDPC/turbo payloads) — and that `supports_soft_demod() == false` lets the engine warn on an accidental soft-FEC pairing.
 4. **Register it** wherever it should be usable: `engine.register_plugin(Box::new(MyPlugin::new()))` in the daemon (`server.rs:108-127`), the CLI, and the testmatrix, as applicable.
-5. **Tests**: an in-crate loopback round-trip (every plugin has one), and — if the plugin claims soft output — it will automatically face `llr_convention_conformance` and `llr_calibration` in `openpulse-modem`. If the mode is meant for HF use, it must also face a fading test; §3.5 explains why an AWGN-only validation is not accepted for ladder rungs.
+5. **Tests**: an in-crate loopback round-trip (every plugin has one), and — if the plugin claims soft output — it will automatically face `soft_demod_conformance` and `llr_calibration` in `openpulse-modem`. "Automatically" became true on 2026-09-13: the conformance test swept a hand-written list of 14 (plugin, mode) pairs until then, so a new mode faced it only if somebody added it. If the mode is meant for HF use, it must also face a fading test; §3.5 explains why an AWGN-only validation is not accepted for ladder rungs.
 
 Before touching a demodulator, read the "DSP acquisition & carrier-recovery playbook" in CLAUDE.md — blind acquisition is the most-churned area of the modem, and the playbook's first rule (diagnose an "AFC" failure with a swept-applied-correction experiment before blaming the estimator) has repeatedly relocated bugs from the accused component to the real one.
 
