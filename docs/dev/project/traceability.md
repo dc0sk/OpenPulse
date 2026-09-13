@@ -9,6 +9,76 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-13 — a calibration hunt that retracted two of its three findings
+
+- **Requirement/change:** the soft-demod sweep (#1360) closed convention coverage; review ranked LLR
+  **magnitude** calibration higher, because a miscalibrated LLR is invisible to every frame-success
+  metric (the decoders are scale-invariant) and bpsk/qpsk/psk8 have no `llr_reliability` bin test.
+  This is the measurement pass that followed. It found no calibration defect. It found something
+  else, and it retracted most of what it first appeared to find.
+
+- **Apparatus:** the `llr_reliability` method — bin `|L|`, compare the empirical bit-error rate
+  against `1/(1+e^{|L|})` — as scratch probes, each deleted in the command that read it. Controls
+  first, and they are the reason anything here is quotable: a **synthetic source calibrated by
+  construction** read 1.30, and two plugins already held to a 4× bound by their own committed tests
+  read 0.50–1.95 through the same estimator. An **alignment control** compared
+  `fec::hard_decide(demodulate_soft(rx))` against `demodulate(rx)` per draw, to rule out a shifted
+  frame masquerading as over-confidence.
+
+- **Retracted — QPSK250's "24.9×".** An artefact of my own binning. I binned by quintile and
+  predicted the error rate from `p(mean|L|)`; the bottom quintile spanned `|L| ∈ [0.01, 9.99]` and
+  held all 71 errors, and because `p` is convex in `|L|`, `p(mean|L|)` is not the mean of `p_i`
+  (Jensen). With the bin-mean of `p_i` and random payloads the ratio is **1.28**. QPSK250 is inside
+  the 4× bound at every SNR that produces errors. **The reference `llr_reliability.rs` tests share
+  this flaw** — they too predict from `p(mean|L|)`, overstating over-confidence by up to ~7× in their
+  `[8,16)` bin. Conservative, so not a false pass, but worth knowing before quoting a 3.9×.
+
+- **Retracted — 8PSK500's "52 576×".** An artefact of frame-level mixing. Per-draw BER at 4 dB was
+  `0.034 0.045 0.032 0.039 0.043 0.256 0.039 0.033`: **one draw of eight carried 522 of the 1063
+  errors.** Its erroneous high-`|L|` symbols are 99 % adjacent to another erroneous symbol, two wrong
+  Gray bits dominant — 90° rotations landing cleanly on the wrong constellation point, in runs. That
+  is a decision-directed carrier tracker losing lock below its cliff, not a σ² model error: inside a
+  slipped run the orthogonal residual is *small*, so no noise estimator can see it. Above the cliff
+  8PSK500 is calibrated — global ratio 1.23 at 6 dB and 1.00 at 8 dB, under-confident above that.
+  Eight draws of one payload is a sample of eight frames, not of 16 320 bits.
+
+- **Kept, and it was the finding I had ranked last (#1361):** BPSK's soft path deliberately skips the
+  crossfade-ISI cancellation its hard path applies (#832). Measured: at 0 dB the two paths agree in
+  **0 of 8 draws** and the soft path's BER is 15× the hard path's, with a **4× asymmetry toward flip
+  bits on the soft path and none on the hard path** — the fingerprint of the uncancelled `+β`, whose
+  cost the hard path's own comment states as "eroding the flip-bit margin by several dB". Because the
+  bias is a deterministic function of the transmitted sequence it is identical in every
+  retransmission, so `combine_llrs_map` reproduces it exactly while the noise shrinks by √N. On the
+  shipped path: `engine.rs` admits `FecMode::Rs` to the soft-combine arm and `hpx_hf` SL2–SL5 are
+  BPSK + `Rs`. #832 made the choice deliberately with a gate behind it; what is missing is the other
+  half of the trade, which it never measured.
+
+- **Premise correction, mine and the reviewer's:** we had both said bpsk/qpsk/psk8 carry `hpx_hf`
+  SL2–SL9. False (`profile.rs:379-393`): SL2–SL5 are BPSK + `Rs`, **SL6 is `QPSK250-D`, which has no
+  soft path at all**, and SL7–SL14 are OFDM. Plain 8PSK500 sits on no coded rung in any profile, and
+  the profiles carrying `8PSK1000`/`2000-RRC`/`9600-RRC` are all `fec_modes: [None; 21]` — so **no
+  shipped session ever sums a psk8 LLR**. The calibration question, on the deployed ladder, is a
+  BPSK question.
+
+- **Implementation:** doc corrections only. `plugin.rs` — the Sign contract now states that it is
+  scoped to a noiseless input and why (#1361), and the Calibration paragraph separates the two bars
+  that shared the word "calibrated". `constellation.rs` — "saturates … the safe direction" was wrong
+  at the low end: once symbol errors are common the residual is measured against the wrong decision,
+  which under-reads σ² and makes LLRs OVER-confident. `engine.rs` — "opens the plain-RS mid-ladder
+  rungs (`hpx_hf` SL6/SL9)" was stale and never true. `CLAUDE.md` and the book carried the same
+  one-bar reading of PR #687.
+
+- **Tests:** `cargo clippy --workspace --no-default-features --all-targets -- -D warnings` → rc=0;
+  `cargo fmt --all -- --check` → rc=0; `DOCFRONT: PASS`; full gate below. No behaviour changed — every
+  edit here is a comment or a doc.
+
+- **Method note worth keeping:** my first probe reported ratio 0.00 for every mode, because at
+  ofdm's fixed bin edges most bins held no samples and the raw BER was 0.0000. Zero errors is not
+  evidence of calibration, and a probe that cannot produce an error cannot measure over-confidence.
+
+Review: `docs/dev/reviews/artifacts/llr-calibration-measurement.md` — the measurement and all three
+findings were sent for falsification before any of this was written; two were falsified. Filed: #1361.
+
 ## 2026-09-13 — the LLR contract was pinned for 14 of 70 soft-capable modes, and by the wrong slicer
 
 - **Requirement/change:** the maintainer's priority is modem core / modes / modulations

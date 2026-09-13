@@ -261,6 +261,12 @@ pub trait ModulationPlugin: Send + Sync {
     ///   convention-independent decision and no plugin should emit one.  Enforced
     ///   for every mode of every registered plugin by `soft_demod_conformance` in
     ///   `openpulse-modem`, which also fails on a zero-valued LLR.
+    ///
+    ///   **Scoped to a noiseless input, and that scope is real.** BPSK's soft path deliberately
+    ///   skips the crossfade-ISI cancellation its hard path applies (#832), so under noise the two
+    ///   disagree — 0.27 % of bits at 0 dB, asymmetrically on flip bits. Tracked in #1361. Read this
+    ///   as "the two paths agree on what a clean symbol means", not as "they make the same decisions
+    ///   on air".
     /// - **Scale**: per-plugin and NOT normalised across plugins — BPSK emits
     ///   raw differential dot products, OFDM emits |H|²-weighted projections,
     ///   8PSK emits max-log-MAP distance differences.  Within one plugin the
@@ -273,10 +279,16 @@ pub trait ModulationPlugin: Send + Sync {
     ///   by its estimated σ² (SC-FDMA and OFDM do; `symbol_llrs`' `noise_var` argument).  Repeated
     ///   observations of the same bits in the same mode are then combined by summing —
     ///   `combine_llrs_map` — never by weighting again with `1/σ²`, which would apply σ⁻² twice.
-    ///   Every shipped plugin has been calibrated (PR #687) — 64QAM, BPSK and QPSK included — so a
-    ///   plugin reaching this trait default is the only remaining noise-blind case: it emits ±1.0,
-    ///   its `mean(|LLR|)` is flat in SNR, and a weight derived from it conveys nothing.
-    ///   `crates/openpulse-modem/tests/llr_calibration.rs` fails any plugin that regresses to that.
+    ///   **Two different bars wear the word "calibrated", and only one is checked everywhere.**
+    ///   `llr_calibration.rs` checks the weak one for 7 modes: that `mean(|LLR|)` GROWS with SNR by a
+    ///   per-plugin floor (BPSK ≥ 8×, QPSK ≥ 1.1×, 8PSK ≥ 1.4×, against an ideal 15.8×) — i.e. that a
+    ///   σ² is divided by at all. The strong one, that a bit carrying `|L|` is wrong about
+    ///   `1/(1+e^{|L|})` of the time within 4×, is checked only by the five `llr_reliability.rs`
+    ///   files (64QAM, MFSK16, OFDM, PILOT, SC-FDMA). bpsk, qpsk and psk8 meet the weak bar and are
+    ///   untested against the strong one. PR #687 calibrated every shipped plugin in the weak sense;
+    ///   do not read it as the strong one. A plugin reaching this trait default is the noise-blind
+    ///   case: it emits ±1.0, its `mean(|LLR|)` is flat in SNR, and a weight derived from it conveys
+    ///   nothing — which is what `llr_calibration.rs` fails a plugin for regressing to.
     ///
     /// Plugins that know their internal soft values (BPSK I-channel
     /// correlation, QPSK I/Q projections) should override this for maximum

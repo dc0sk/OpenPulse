@@ -2953,7 +2953,10 @@ impl ModemEngine {
                 // under RS(255,223)'s 16-byte-per-block capacity. This is what puts HARQ on the MFSK16
                 // sub-floor rung (SL1), worth ~2.5 dB there — 0.117 → 0.750 at -4 dB on `moderate_f1`,
                 // and it decodes at -6 dB where no single burst ever does. It also opens the plain-RS
-                // mid-ladder rungs (`hpx_hf` SL6/SL9).
+                // rungs `hpx_hf` SL2-SL5 (BPSK31/63/100/250 + Rs). This said "SL6/SL9" until
+                // 2026-09-13, and neither was ever reached: SL6 is `QPSK250-D`, which has no soft
+                // path at all (`supports_soft_demod` is false, so the condition above excludes it),
+                // and SL9 is OFDM52-16QAM + SoftConcatenated, which is not a plain-RS rung.
                 //
                 // MFSK16 was held out until now because every one of its frames is one fixed 255-byte
                 // block, so nothing could separate an abandoned message's retained LLRs from a
