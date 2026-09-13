@@ -302,7 +302,15 @@ pub fn symbol_llrs(
 /// output stops tracking SNR; the orthogonal component does not.
 ///
 /// Returns `(amplitude, noise_var_per_dimension)`. The 2-D noise variance is `2 ×` the second value.
-/// Decision-directed, so it saturates once symbol errors are common — the safe direction.
+///
+/// Decision-directed, so it saturates at the residual-EVM floor once the channel is clean: LLRs come
+/// out UNDER-confident, which is safe for same-mode summing. **The saturation is not safe in both
+/// directions, and this said it was until 2026-09-13.** Once symbol errors are common the residual is
+/// measured against the WRONG decision, which folds error energy out of the estimate, under-reads σ²
+/// and makes the LLRs OVER-confident — the dangerous direction, because `combine_llrs_map` treats
+/// magnitudes as probabilities. Measured on 8PSK500: calibrated to within 1.25× at 6–8 dB,
+/// over-confident below its carrier-tracking cliff at 4 dB. No σ² estimator can represent a lost
+/// lock, which is a separate failure from a mis-estimated variance.
 pub fn psk_symbol_noise_var(symbols: &[Complex32], bits_per_sc: usize) -> (f32, f32) {
     if symbols.is_empty() {
         return (1.0, 1e-6);
