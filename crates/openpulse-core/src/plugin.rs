@@ -252,11 +252,15 @@ pub trait ModulationPlugin: Send + Sync {
     /// # LLR convention
     ///
     /// - **Sign**: positive = bit more likely 0, negative = bit more likely 1.
-    ///   Hard-slicing every LLR (`bit = llr <= 0`) MUST reproduce exactly the
-    ///   byte stream returned by [`demodulate`](Self::demodulate) on the same
-    ///   input (bit order LSB-first within each byte).  This is enforced by
-    ///   the cross-plugin conformance test `llr_convention_conformance` in
-    ///   `openpulse-modem`.
+    ///   Hard-slicing every LLR with [`fec::hard_decide`](crate::fec::hard_decide)
+    ///   (`is_sign_negative`, LSB-first within each byte) MUST reproduce exactly
+    ///   the byte stream returned by [`demodulate`](Self::demodulate) on the same
+    ///   input.  Slice with that function, not with a re-implementation: this doc
+    ///   said `bit = llr <= 0` until 2026-09-13, which disagrees with it at `+0.0`
+    ///   — as does `ldpc.rs`/`turbo.rs`'s `l < 0.0`.  An LLR of exactly zero has no
+    ///   convention-independent decision and no plugin should emit one.  Enforced
+    ///   for every mode of every registered plugin by `soft_demod_conformance` in
+    ///   `openpulse-modem`, which also fails on a zero-valued LLR.
     /// - **Scale**: per-plugin and NOT normalised across plugins — BPSK emits
     ///   raw differential dot products, OFDM emits |H|²-weighted projections,
     ///   8PSK emits max-log-MAP distance differences.  Within one plugin the
@@ -631,22 +635,16 @@ mod tests {
 
     #[test]
     fn default_demodulate_soft_hard_slices_back_to_demodulate() {
-        // The default soft path maps each bit to ±1.0; hard-slicing (bit = llr <= 0,
-        // LSB-first) must reproduce the demodulate() byte stream exactly.
+        // The default soft path maps each bit to ±1.0; hard-slicing must reproduce the
+        // demodulate() byte stream exactly. Sliced with the PRODUCT's function rather than a
+        // re-implementation — this test open-coded `llr <= 0.0`, which is not what the engine
+        // uses and would not have noticed the engine's slicer changing.
         let p = FakePlugin::new("BPSK", &["BPSK31"], "1.0");
         let cfg = ModulationConfig::default();
         let hard = p.demodulate(&[], &cfg).unwrap();
         let llrs = p.demodulate_soft(&[], &cfg).unwrap();
         assert_eq!(llrs.len(), hard.len() * 8);
-        let resliced: Vec<u8> = llrs
-            .chunks(8)
-            .map(|byte| {
-                byte.iter()
-                    .enumerate()
-                    .fold(0u8, |acc, (i, &llr)| acc | (u8::from(llr <= 0.0) << i))
-            })
-            .collect();
-        assert_eq!(resliced, hard);
+        assert_eq!(crate::fec::hard_decide(&llrs), hard);
         // Defaults for the opt-in trait hooks.
         assert!(!p.supports_soft_demod("BPSK31"));
         assert!(p.frame_geometry(&cfg).is_none());

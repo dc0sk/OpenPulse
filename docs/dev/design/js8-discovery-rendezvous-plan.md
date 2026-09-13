@@ -548,7 +548,7 @@ Hard rule: everything passes `cargo test --workspace --no-default-features`; no 
 - `js8_loopback.rs`: encode → `openpulse-channel` (AWGN sweep, Watterson good/moderate F1) → `decode_window`; gates: 100% at −10 dB AWGN, ≥90% at −18 dB AWGN (MVP), stretch −22 dB tracked as an `--ignored` sweep like `scfdma_ce_sweep`; multi-signal test: 3 stations at distinct offsets in one window, all decoded.
 - `llr_reliability.rs`: binned |LLR| vs empirical error rate (the scfdma gate, per CLAUDE.md LLR contract).
 - Decode CPU budget test (`--ignored`, informational): NORMAL window decode wall-time printed; `cross check` target covers Pi builds.
-- Trait conformance: hard/soft slice equivalence via the existing `llr_convention_conformance` harness; `ChannelSimHarness` single-frame round trip (engine-level registration works).
+- Trait conformance: hard/soft slice equivalence via the existing `soft_demod_conformance` harness (js8 is not engine-registered, so the sweep does not reach it — see that file's header); `ChannelSimHarness` single-frame round trip (engine-level registration works).
 
 ### 10.3 Protocol/service tests (all pure, no I/O)
 

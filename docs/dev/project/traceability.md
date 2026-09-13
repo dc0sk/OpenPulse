@@ -9,6 +9,67 @@ and the actually-observed results per change.
 
 ---
 
+## 2026-09-13 — the LLR contract was pinned for 14 of 70 soft-capable modes, and by the wrong slicer
+
+- **Requirement/change:** the maintainer's priority is modem core / modes / modulations
+  bullet-proof. `llr_convention_conformance` asserts that hard-slicing `demodulate_soft`'s LLRs
+  reproduces `demodulate()`'s bytes — the sign convention and bit order every FEC decoder and all
+  HARQ combining depend on. It ran over a **hand-written list of 14 (plugin, mode) pairs** while the
+  registered plugins declare **70 soft-capable modes**: every `-RRC` variant, all four `OFDM52-*`
+  higher-order modes, all nine `SCFDMA*` modes and 8 of 12 `PILOT-*` were unpinned. The
+  hardcoded-mirror archetype, next to a sibling test that already derives its list.
+
+- **Design decision:** sweep every mode of every registered plugin, and assert **two implications
+  rather than an equality** — (A) a mode advertising `supports_soft_demod` must return `Ok`, because
+  `receive_from_samples` treats a soft refusal on an advertised mode as a terminal decode failure and
+  never falls back; (B) whenever `demodulate_soft` returns `Ok`, `fec::hard_decide` of those LLRs must
+  equal `demodulate()`'s bytes. The reverse of (A) is deliberately not asserted: the trait documents
+  the default `false` as "the ±1.0 fallback", so fsk4 and js8 legitimately advertise `false` and
+  return `Ok`. **(B) binds unadvertised modes too**, because the engine's LDPC, turbo and
+  soft-concatenated arms call `demodulate_soft` unconditionally and only warn.
+
+- **Implementation:** `crates/openpulse-modem/tests/soft_demod_conformance.rs` (new; retires
+  `llr_convention_conformance.rs`), `crates/openpulse-core/src/plugin.rs` (the trait's LLR contract,
+  and its unit test now slices through `fec::hard_decide` instead of open-coding one),
+  `crates/openpulse-modem/src/engine.rs` (a byte-identical private `hard_decide` removed in favour of
+  `fec::hard_decide`), plus the citations in `requirements.yaml`, `traceability-matrix.md`,
+  `openpulse-book.md` (three sites) and the JS8 plan.
+
+- **Tests:** the sweep itself, three committed discriminators, and the workspace gate.
+
+- **Test results:** `cargo test -p openpulse-modem --no-default-features --test
+  soft_demod_conformance` → **5 passed, 0 failed** in 6.6 s. The sweep checks **68 modes** (every mode
+  the nine production-registered plugins declare, less five undrivable), asserts
+  `checked + undrivable == declared` so no mode can leave the loop without a verdict, and pins the
+  undrivable five by name. `cargo clippy --workspace --no-default-features --all-targets -D warnings`
+  → rc=0. `cargo test -p openpulse-core --lib plugin::` → 7 passed. Full gate below.
+
+- **What the review changed, and it was the substance:** my proposal would have measured the wrong
+  thing twice. The retired harness sliced with `bit = llr <= 0` — a **fourth** convention. Production
+  uses `fec::hard_decide` (`is_sign_negative`) and `ldpc.rs`/`turbo.rs` use `l < 0.0`; the harness's
+  `<= 0` disagrees with **both** at `+0.0`. A harness that re-implements the decision it checks cannot
+  see the real one change. And my quantifier ("modes advertising true") would have exempted precisely
+  the class the engine calls anyway. Both fixed before implementation. I also had to correct a claim
+  of my own: the qpsk test did not *catch* #923 — it landed in the same commit as the fix (`34c1c751`,
+  PR #996), and the rig found the defect.
+
+- **Discriminators, committed rather than run once:** a `Sabotaged` wrapper delegates to a real
+  plugin and breaks the contract three ways — negated LLRs, per-byte bit reversal (the #1084 shape,
+  where the psk8 GPU demodulator emitted reversed LLRs while every frame-success metric stayed green),
+  and advertise-then-refuse (the #996 shape). Each asserts the checker **rejects** it, and each first
+  asserts the unsabotaged plugin passes, so a checker that rejected everything would fail too.
+
+- **Stated limits rather than implied coverage:** the sweep runs the CPU constructors, so it cannot
+  see the GPU soft paths — #1084's own axis — and the `--no-default-features` gate cannot build them;
+  `gpu_cpu_equivalence.rs` owns that arm. It says nothing about LLR *magnitude* calibration, which is
+  the higher-value gap: `llr_reliability.rs` covers five plugins and bpsk/qpsk/psk8 have no
+  bin-calibration test at all, though they are `hpx_hf` SL2–SL9. Two findings were filed rather than
+  folded in: **#1358** (three slicer conventions still disagree at ±0.0 — the 2026-07-16 audit's
+  finding 8, only partly applied) and **#1359** (five modes advertised in `supported_modes` that no
+  shipping binary can modulate, since the engine only ever builds 8 kHz configs).
+
+Review: `docs/dev/reviews/artifacts/soft-demod-conformance.md`.
+
 ## 2026-09-12 — every `#[ignore]` now says why
 
 - **Requirement/change:** 9 of the 114 `#[ignore]` attributes in the workspace carried no reason,

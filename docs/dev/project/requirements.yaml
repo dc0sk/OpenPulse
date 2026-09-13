@@ -374,7 +374,7 @@ capabilities:
     tests:
     - crates/openpulse-modem/tests/ldpc_engine_loopback.rs
     - crates/openpulse-modem/tests/llr_combining_gain.rs
-    - crates/openpulse-modem/tests/llr_convention_conformance.rs
+    - crates/openpulse-modem/tests/soft_demod_conformance.rs
     traceability: baseline
   CAP-29:
     code:

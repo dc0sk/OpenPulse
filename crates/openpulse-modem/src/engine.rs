@@ -15,8 +15,8 @@ use openpulse_core::dcd::DcdState;
 use openpulse_core::error::{ModemError, PluginError};
 use openpulse_core::fec::{
     apply_window_retransmit, combine_llrs_map, combine_llrs_map_in_ranges,
-    encode_window_retransmit, FecCodec, FecMode, Interleaver, ShortFecCodec, SoftCombiner,
-    WindowArqFeedback, DEFAULT_INTERLEAVER_DEPTH,
+    encode_window_retransmit, hard_decide, FecCodec, FecMode, Interleaver, ShortFecCodec,
+    SoftCombiner, WindowArqFeedback, DEFAULT_INTERLEAVER_DEPTH,
 };
 use openpulse_core::frame::Frame;
 use openpulse_core::hpx::{HpxEvent, HpxSession, HpxState, HpxTransition};
@@ -7298,18 +7298,6 @@ fn nonce_from_seq(seq: u16) -> [u8; 12] {
     let mut n = [0u8; 12];
     n[..2].copy_from_slice(&seq.to_le_bytes());
     n
-}
-
-/// Hard-decide an LLR stream into bytes: negative LLR → bit 1, positive → bit 0, LSB-first per byte —
-/// the order every plugin's `demodulate_soft` emits.
-fn hard_decide(llrs: &[f32]) -> Vec<u8> {
-    llrs.chunks(8)
-        .map(|chunk| {
-            chunk.iter().enumerate().fold(0u8, |acc, (i, &llr)| {
-                acc | ((llr.is_sign_negative() as u8) << i)
-            })
-        })
-        .collect()
 }
 
 /// Encode `info` as a sequence of independent LDPC blocks, zero-padding the last one.
